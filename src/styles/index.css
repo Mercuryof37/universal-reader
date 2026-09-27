@@ -1,0 +1,187 @@
+@import 'tailwindcss';
+
+/*
+ * 主题令牌。
+ *
+ * 用 CSS 变量而不是 Tailwind 的 dark: 变体来切换主题：
+ * 我们的主题是"阅读器配色"（宣纸 / 米黄 / 夜读），颜色值来自设计稿，
+ * 而且需要同时影响正文、译文、批注底色等大量自定义样式。
+ * 用变量只需改一处 :root 属性，所有自定义 CSS 自动跟随。
+ */
+:root {
+  --reader-bg: #f6f1e4;
+  --reader-fg: #2b2620;
+  --reader-muted: #857a68;
+  --reader-border: #ddd2bd;
+  --reader-panel: #efe8d6;
+  --reader-accent: #8a5a2b;
+  --reader-shadow: rgba(60, 45, 25, 0.08);
+
+  --translation-fg: #5d5344;
+  --code-bg: #eae2cf;
+}
+
+[data-theme='sepia'] {
+  --reader-bg: #efe3cc;
+  --reader-fg: #3a2f22;
+  --reader-muted: #7d6f58;
+  --reader-border: #d8c7a6;
+  --reader-panel: #e7d9bd;
+  --reader-accent: #7a4d1f;
+  --translation-fg: #6b5c44;
+  --code-bg: #e0d2b4;
+}
+
+[data-theme='dark'] {
+  --reader-bg: #1b1a17;
+  --reader-fg: #ded7c9;
+  --reader-muted: #948b7c;
+  --reader-border: #35322c;
+  --reader-panel: #232119;
+  --reader-accent: #d8a86a;
+  --reader-shadow: rgba(0, 0, 0, 0.35);
+  --translation-fg: #a89e8c;
+  --code-bg: #26241f;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--reader-bg);
+  color: var(--reader-fg);
+  font-family:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    'Microsoft YaHei',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 阅读正文使用衬线体，贴近纸质书卷的观感 */
+.reader-prose {
+  font-family:
+    'Iowan Old Style',
+    'Source Han Serif SC',
+    'Noto Serif SC',
+    'Songti SC',
+    'SimSun',
+    'Georgia',
+    serif;
+  /* 中英混排时中文字符标点挤压，避免行内出现过大空隙 */
+  text-spacing-trim: space-first;
+}
+
+.reader-prose[data-font='sans'] {
+  font-family:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    'Microsoft YaHei',
+    sans-serif;
+}
+
+/* 每个内容块的排版规则：这里集中管理，避免在 JSX 里堆叠大量条件类名 */
+.block-heading {
+  font-weight: 600;
+  margin-top: 1.8em;
+  margin-bottom: 0.6em;
+  line-height: 1.4;
+}
+
+.block-quote {
+  border-left: 3px solid var(--reader-accent);
+  padding-left: 1rem;
+  color: var(--translation-fg);
+  font-style: italic;
+}
+
+.block-code {
+  background: var(--code-bg);
+  border-radius: 6px;
+  padding: 0.9rem 1rem;
+  overflow-x: auto;
+  font-family: 'Cascadia Code', Consolas, 'JetBrains Mono', monospace;
+  font-size: 0.88em;
+  line-height: 1.6;
+}
+
+.block-list {
+  padding-left: 1.2rem;
+}
+
+/* 批注高亮：用 box-shadow 铺底色而不是 background，
+   这样跨行折行时高亮不会出现断裂的方块边角 */
+.annotation-highlight {
+  border-radius: 2px;
+  cursor: pointer;
+  box-shadow: inset 0 -0.5em 0 var(--hl-color, rgba(216, 168, 74, 0.35));
+  transition: box-shadow 120ms ease;
+}
+
+.annotation-highlight[data-active='true'] {
+  box-shadow: inset 0 -1em 0 var(--hl-color, rgba(216, 168, 74, 0.6));
+}
+
+[data-color='amber'] {
+  --hl-color: rgba(233, 186, 74, 0.42);
+}
+[data-color='rose'] {
+  --hl-color: rgba(226, 122, 122, 0.35);
+}
+[data-color='sky'] {
+  --hl-color: rgba(106, 168, 226, 0.35);
+}
+[data-color='emerald'] {
+  --hl-color: rgba(104, 190, 140, 0.35);
+}
+[data-color='violet'] {
+  --hl-color: rgba(160, 130, 220, 0.35);
+}
+
+/* 正在朗读的段落 */
+.block-speaking {
+  background: var(--reader-panel);
+  border-radius: 6px;
+  box-shadow: 0 0 0 8px var(--reader-panel);
+}
+
+/* 译文与原文的对照关系：左侧细线 + 稍小的字号，避免抢原文视觉重心 */
+.translation-text {
+  color: var(--translation-fg);
+  font-size: 0.92em;
+  line-height: 1.8;
+  border-left: 2px solid var(--reader-border);
+  padding-left: 0.85rem;
+  margin-top: 0.55rem;
+}
+
+/* 滚动条：默认样式在浅色主题下非常突兀 */
+.reader-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--reader-border) transparent;
+}
+.reader-scroll::-webkit-scrollbar {
+  width: 10px;
+}
+.reader-scroll::-webkit-scrollbar-thumb {
+  background: var(--reader-border);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  .reader-scroll {
+    overflow: visible !important;
+    height: auto !important;
+  }
+}

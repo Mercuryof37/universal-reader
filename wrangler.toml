@@ -1,0 +1,14 @@
+# Worker 名称与入口
+name = "universal-reader-api"
+main = "worker/api-proxy.ts"
+compatibility_date = "2025-09-01"
+
+# 免费额度足够个人使用；如需限流可改用 Cloudflare 控制台的 Rate Limiting 规则
+# [vars]
+# ALLOWED_ORIGIN = "https://reader.example.com"
+
+# 密钥不要写在这里，用命令写入加密环境变量：
+#   npx wrangler secret put DEEPL_API_KEY
+#   npx wrangler secret put OPENAI_API_KEY
+#   npx wrangler secret put AZURE_SPEECH_KEY
+#   npx wrangler secret put AZURE_SPEECH_REGION

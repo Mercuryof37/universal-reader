@@ -1,0 +1,47 @@
+name: CI
+
+# 门禁原则：类型错、测试挂、构建失败、产物校验不过，四者任一不通过就不允许合并。
+# 这些检查本地都能跑，但人总会忘记，交给 CI 才是可靠的。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # 用 ci 而不是 install：严格按 package-lock.json 安装，保证与本地一致
+      - run: npm ci
+
+      - name: 类型检查（前端 + Worker）
+        run: npx tsc -b
+
+      - name: 单元测试
+        run: npx vitest run
+
+      # ⚠️ 必须用 `npm run build`，不能用 `npx vite build`。
+      #
+      # 本项目在 package.json 里挂了两个钩子：
+      #   prebuild  → scripts/copy-pdfjs-wasm.mjs  复制 pdf.js 的 WASM 解码器
+      #   postbuild → scripts/verify-dist.mjs      校验产物
+      # 直接调用 vite build 会跳过这两个钩子，产出的 dist 缺少解码器 ——
+      # 而缺解码器的表现是"扫描版 PDF 全部渲染成白页且不报错"，
+      # 极易被当成无关问题忽略。Cloudflare Pages 的构建命令同理。
+      - name: 生产构建（含 WASM 复制与产物校验）
+        run: npm run build
+
+      - name: 上传构建产物供预览
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist
+          retention-days: 7
