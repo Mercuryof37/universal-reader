@@ -3,9 +3,25 @@ name = "universal-reader-api"
 main = "worker/api-proxy.ts"
 compatibility_date = "2025-09-01"
 
-# 免费额度足够个人使用；如需限流可改用 Cloudflare 控制台的 Rate Limiting 规则
-# [vars]
-# ALLOWED_ORIGIN = "https://reader.example.com"
+# ═══════════════════════════════════════════════════════════════
+# ⚠️ ALLOWED_ORIGIN 必须配置，否则 Worker 拒绝一切跨域请求
+# ═══════════════════════════════════════════════════════════════
+#
+# 这个 Worker 里放着 DeepL / OpenAI / Azure 的付费密钥，
+# 因此它只应服务于你自己的站点。
+#
+# 行为（fail-closed，默认拒绝）：
+#   未配置       → 不发放 CORS 头 → 浏览器拒绝跨域（云端功能静默失效）
+#   已配置且匹配  → 正常放行
+#   已配置不匹配  → 不发放 CORS 头 → 拒绝
+#
+# 填什么：你的 **Pages 站点地址**，不是 Worker 地址（两者极易混淆）
+#   形如 https://universal-reader.pages.dev
+#   绑了自定义域名就填自定义域名，例如 https://reader.example.com
+#
+# 改完必须重新部署才生效：npx wrangler deploy
+[vars]
+ALLOWED_ORIGIN = "https://REPLACE-WITH-YOUR-PAGES-DOMAIN.pages.dev"
 
 # 密钥不要写在这里，用命令写入加密环境变量：
 #   npx wrangler secret put DEEPL_API_KEY

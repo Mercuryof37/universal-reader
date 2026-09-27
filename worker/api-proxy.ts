@@ -253,19 +253,53 @@ function normalizeDeepLTarget(lang: string): string {
   return map[upper.split('-')[0] ?? upper] ?? upper;
 }
 
+/**
+ * 构造 CORS 响应头。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 安全要点：未配置 ALLOWED_ORIGIN 时**拒绝一切跨域请求**
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 这个函数的初版有个危险的默认行为：未配置 ALLOWED_ORIGIN 时
+ * **反射请求方的 Origin**，也就是"允许任何人调用"。
+ *
+ * 后果很实际：这个 Worker 里放着 DeepL / OpenAI / Azure 的付费密钥，
+ * 一旦部署就成了**公开的免费翻译接口** —— 任何知道地址的人都能消耗你的额度，
+ * 而且是按量计费。部署后忘记配置 ALLOWED_ORIGIN 是很容易发生的事。
+ *
+ * 现在的策略是 fail-closed（默认拒绝）：
+ *
+ * | ALLOWED_ORIGIN | 行为 |
+ * |---|---|
+ * | 未配置 | **不返回任何 CORS 头** → 浏览器拒绝跨域请求 |
+ * | 已配置且匹配 | 回显该来源 |
+ * | 已配置但不匹配 | **不返回任何 CORS 头** → 浏览器拒绝 |
+ *
+ * 为什么用"省略头部"而不是返回 `'null'`：`Access-Control-Allow-Origin: null`
+ * 并非合法取值（`null` 是给沙箱 iframe 与 data: URL 用的特殊来源），
+ * 某些浏览器会因此报出难以理解的 CORS 错误。省略头部是标准做法。
+ *
+ * 注意：CORS 只约束**浏览器**。直接发起的服务端请求不受影响，
+ * 因此它防的是"别人网页白嫖"，不能替代限流。
+ * 生产环境建议同时启用 Cloudflare 的 Rate Limiting。
+ */
 function corsHeaders(request: Request, env: Env): Record<string, string> {
-  const origin = request.headers.get('Origin') ?? '';
-  const allowed = env.ALLOWED_ORIGIN ?? '';
-  // 未配置 ALLOWED_ORIGIN 时拒绝跨域，避免误部署成公开代理
-  const allowOrigin = allowed && origin === allowed ? origin : allowed ? 'null' : origin;
+  const origin = request.headers.get('Origin');
+  const allowed = env.ALLOWED_ORIGIN?.trim();
 
-  return {
-    'Access-Control-Allow-Origin': allowOrigin,
+  const base: Record<string, string> = {
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin',
   };
+
+  // 未配置来源白名单，或来源不匹配 → 不发放 CORS 许可
+  if (!allowed || !origin || origin !== allowed) {
+    return base;
+  }
+
+  return { ...base, 'Access-Control-Allow-Origin': origin };
 }
 
 function json(data: unknown, status: number, cors: Record<string, string>): Response {
