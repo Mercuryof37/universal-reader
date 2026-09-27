@@ -21,7 +21,7 @@ compatibility_date = "2025-09-01"
 #
 # 改完必须重新部署才生效：npx wrangler deploy
 [vars]
-ALLOWED_ORIGIN = "https://REPLACE-WITH-YOUR-PAGES-DOMAIN.pages.dev"
+ALLOWED_ORIGIN = "https://1955a0bc.universal-reader.pages.dev"
 
 # 密钥不要写在这里，用命令写入加密环境变量：
 #   npx wrangler secret put DEEPL_API_KEY

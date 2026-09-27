@@ -94,7 +94,42 @@ check(pdfChunk !== undefined, '找不到独立的 pdfParser chunk —— PDF 解
 const workerChunk = readdirSync(assets).find((f) => /^pdfWorkerEntry-.*\.js$/.test(f));
 check(workerChunk !== undefined, '找不到 pdfWorkerEntry chunk —— pdf.js 的 Worker 入口缺失');
 
-// ── 5. 单个 chunk 体积 ──────────────────────────────────────
+// ── 5. PWA 产物 ─────────────────────────────────────────────
+// 离线能力同样是"产物对了才算对"：Service Worker 缺失时应用照常能跑，
+// 只是断网后打不开 —— 而这一点在开发机上几乎永远不会被发现。
+const swPath = join(dist, 'sw.js');
+if (check(existsSync(swPath), 'dist/sw.js 缺失 —— PWA 插件未生效，离线功能不可用')) {
+  const sw = readFileSync(swPath, 'utf8');
+
+  // 导航回退是"断网后还能打开网站"的关键：没有它，离线访问首页会 404
+  check(
+    sw.includes('createHandlerBoundToURL("/index.html")') || sw.includes('index.html'),
+    'sw.js 里没有 index.html 的导航回退 —— 离线时打不开网站',
+  );
+
+  // 入口 chunk 必须在预缓存清单里，否则离线时页面骨架不完整
+  const entryInPrecache = entries.some((f) => sw.includes(f));
+  check(entryInPrecache, 'sw.js 的预缓存清单里没有入口 chunk —— 离线时页面无法启动');
+
+  // 应用壳之外，图标与 manifest 也应预缓存（否则"添加到主屏幕"后图标缺失）
+  check(existsSync(join(dist, 'manifest.webmanifest')), 'dist/manifest.webmanifest 缺失');
+  check(existsSync(join(dist, 'icons', 'icon-192.png')), 'dist/icons/icon-192.png 缺失');
+  check(existsSync(join(dist, 'icons', 'icon-512.png')), 'dist/icons/icon-512.png 缺失');
+  check(
+    existsSync(join(dist, 'icons', 'icon-maskable-512.png')),
+    'dist/icons/icon-maskable-512.png 缺失 —— Android 上图标会被裁切',
+  );
+
+  // 不该预缓存用不到的解码器：它们合计约 1MB，会让首访安装体积白白翻倍
+  check(
+    !sw.includes('quickjs-eval') && !sw.includes('nowasm_fallback'),
+    'sw.js 预缓存了本项目不会请求的解码器（quickjs-eval / *_nowasm_fallback），白占约 1MB',
+  );
+
+  notes.push('Service Worker 已生成并包含导航回退');
+}
+
+// ── 6. 单个 chunk 体积 ──────────────────────────────────────
 for (const name of readdirSync(assets)) {
   const size = statSync(join(assets, name)).size;
   if (size > MAX_CHUNK_BYTES && !/^pdfWorkerEntry-/.test(name)) {
