@@ -40,6 +40,54 @@ const HEADING_MAX_CHARS = 80;
 const PARAGRAPH_BREAK_RATIO = 1.35;
 
 /**
+ * 判定"文字层只是残渣"的两个阈值（均为每页均值，须**同时**满足）。
+ *
+ * 依据一份真实习题 PDF：6 道题全是图片，文字层只有标题与页脚的
+ * "单周周一下午2点前交作业概率论与数理统计习题5"，合计 23 字、6 处图像。
+ * 即 **23 字/页、6 图/页**，明显落在下面两条阈值之内。
+ *
+ * ── 为什么要求同时满足，而不是任一满足 ──
+ *
+ * 单看"文字少"会误伤：一页只写两行字的封面、一张示意图配一句说明，
+ * 都属于正常文档。单看"图片多"也会误伤：图文并茂的教材每页都有插图。
+ * 只有**两者同时成立**才说明文字层是残渣 —— 图片才是内容的载体。
+ *
+ * 误判的代价是不对称的：误判为图片型只是多跑一次 OCR（慢，但结果正确）；
+ * 漏判则让用户拿到残缺内容却毫不知情（本次故障）。
+ * 因此宁可偏严。
+ */
+const MIN_CHARS_PER_PAGE = 50;
+const MIN_IMAGES_PER_PAGE = 3;
+
+/**
+ * 统计一页里的图像绘制指令数。
+ *
+ * 必须传 `intent: 'display'`：默认的 `'print'` 不会展开 Form XObject 内部的指令，
+ * 而扫描件与"题目截图"恰恰把图片放在 Form XObject 里。
+ * 用默认参数会得出"这页没有图片"的错误结论 —— 这个坑在
+ * `scripts/diagnose-pdf.mjs` 里也踩过一次（见 docs/03 误判 A）。
+ *
+ * 只遍历操作符列表、不解码图像，因此开销远小于真正渲染一页。
+ */
+async function countImageOps(page: {
+  getOperatorList: (opts: { intent: string }) => Promise<{ fnArray: number[] }>;
+}): Promise<number> {
+  try {
+    const ops = await page.getOperatorList({ intent: 'display' });
+    const imageOps = new Set<number>([
+      pdfjsLib.OPS.paintImageXObject,
+      pdfjsLib.OPS.paintInlineImageXObject,
+      pdfjsLib.OPS.paintImageMaskXObject,
+      pdfjsLib.OPS.paintImageXObjectRepeat,
+    ]);
+    return ops.fnArray.filter((fn) => imageOps.has(fn)).length;
+  } catch {
+    // 拿不到操作符列表不应影响正文提取 —— 最坏情况是漏判一次"图片型 PDF"
+    return 0;
+  }
+}
+
+/**
  * 为 pdf.js 准备文档数据。
  *
  * ═══════════════════════════════════════════════════════════════
@@ -223,6 +271,8 @@ export class PdfParser implements FileParser {
 
     let textCharCount = 0;
     let pagesWithText = 0;
+    /** 全文档的图像绘制指令总数，用于识别"文字少但图片多"的混合型 PDF */
+    let imageOpCount = 0;
 
     for (let pageNum = 1; pageNum <= doc.numPages; pageNum++) {
       const page = await doc.getPage(pageNum);
@@ -233,6 +283,12 @@ export class PdfParser implements FileParser {
       const pageChars = paragraphs.reduce((n, p) => n + p.text.replace(/\s/g, '').length, 0);
       textCharCount += pageChars;
       if (pageChars > 0) pagesWithText++;
+
+      // 统计该页画了多少张图。
+      // 用 intent: 'display' 才会展开 Form XObject 内部的指令 ——
+      // 扫描件与"题目截图"恰恰把图片放在 Form XObject 里（见 docs/03 误判 A）。
+      // 注意这里只遍历操作符列表，不解码图像，开销远小于渲染。
+      imageOpCount += await countImageOps(page);
 
       for (const para of paragraphs) {
         const body = para.text.replace(/\s+/g, ' ').trim();
@@ -264,7 +320,37 @@ export class PdfParser implements FileParser {
     const totalPages = doc.numPages;
     await doc.destroy();
 
-    if (!textCharCount) {
+    /**
+     * ══════════════════════════════════════════════════════════════
+     * 判断"文字层是否只是残渣"—— 一个真实故障换来的规则
+     * ══════════════════════════════════════════════════════════════
+     *
+     * 故障现场：一份习题 PDF，6 道题全是图片，只有页脚的
+     * "单周周一下午2点前交作业"和标题"概率论与数理统计习题5"有文字层，
+     * 合计 23 个字。解析器如实提取了这 23 字，用户看到的就是"只有标题"。
+     *
+     * 原实现的判断是 `if (!textCharCount) 抛扫描件错误` ——
+     * **只看"有没有文字"，不看"文字够不够"**。23 个字足以绕过这个检查，
+     * 于是既不提示是图片型 PDF，也不提供 OCR，用户只能自己猜为什么内容不全。
+     *
+     * 现在的判断加上"图片远多于文字"这一维度：
+     * - 平均每页文字很少（< MIN_CHARS_PER_PAGE），且图片不少 → 文字层是残渣
+     * - 此时抛 ScannedPdfError，让界面提供 OCR —— 与"整本无文字"同等处置，
+     *   因为它们对用户的含义相同：**你要的内容不在文字层里**。
+     */
+    const charsPerPage = textCharCount / Math.max(1, totalPages);
+    const imagesPerPage = imageOpCount / Math.max(1, totalPages);
+    const textLayerIsResidue =
+      charsPerPage < MIN_CHARS_PER_PAGE && imagesPerPage >= MIN_IMAGES_PER_PAGE;
+
+    if (!textCharCount || textLayerIsResidue) {
+      if (textLayerIsResidue) {
+        console.info(
+          `[pdfParser] ${file.name}：文字层仅 ${textCharCount} 字（${charsPerPage.toFixed(0)} 字/页），` +
+            `但检测到 ${imageOpCount} 处图像（${imagesPerPage.toFixed(1)} 处/页）—— ` +
+            `判定为内容以图片为主，转为 OCR 流程。`,
+        );
+      }
       throw new ScannedPdfError(totalPages, buffer, metaTitle, metaAuthor, file.name, file.size);
     }
 

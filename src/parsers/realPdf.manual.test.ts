@@ -10,11 +10,12 @@ import '@/lib/polyfills';
  * 真实 PDF 回归测试（条件执行，文件不存在时整个套件跳过）。
  *
  * 合成 PDF 只能验证算法；真实文件的排版怪癖与元数据结构无法靠夹具覆盖。
- * 这里覆盖两类真实样本：
- * - 普通文字版 PDF：必须能完整解析出内容（这是最主流的用例）；
- * - 扫描版 PDF：必须被准确识别并给出 OCR 建议，而不是抛底层错误。
+ * 这里覆盖三类真实样本：
+ * - 普通文字版 PDF：必须能完整解析出内容（最主流的用例）；
+ * - 扫描版 PDF：必须被准确识别并给出 OCR 建议，而不是抛底层错误；
+ * - **文字层只是残渣的 PDF**：整页内容都是图片，只有标题几行有文字。
  *
- * 想加入自己的样本，设置环境变量 REAL_PDF_PATH / REAL_SCAN_PATH 即可。
+ * 想加入自己的样本，设置环境变量 REAL_PDF_PATH / REAL_SCAN_PATH / REAL_RESIDUE_PATH。
  */
 
 const TEXT_PDF =
@@ -24,6 +25,20 @@ const TEXT_PDF =
 const SCAN_PDF =
   process.env.REAL_SCAN_PATH ??
   'C:\\Users\\Li Peilin\\.dsh\\attachments\\v1\\files\\df\\dfa7f379cf10f9a331445d90286d7b5528c90df532e857add724f8996c621f26\\深入理解计算机系统（中文清晰).pdf';
+
+/**
+ * 一份"标题有文字、题目是图片"的习题 PDF。
+ *
+ * 用户导入后反馈"为什么只识别出了标题"。查证：1 页，6 道题全是图片，
+ * 文字层只有 23 字（标题「概率论与数理统计习题5」
+ * 与页脚「单周周一下午2点前交作业」）。
+ *
+ * 旧实现在这种情况下会**正常返回**一个只含标题的文档 ——
+ * 用户拿到残缺内容却毫不知情。修复后应转为 OCR 流程。
+ */
+const RESIDUE_PDF =
+  process.env.REAL_RESIDUE_PATH ??
+  'C:\\Users\\Li Peilin\\.dsh\\attachments\\v1\\files\\56\\5681fce718aa522be34e64efb517bf35efee1af5887c48efb723f848949c7fce\\习题5-10月19日交(1).pdf';
 
 async function loadAsFile(path: string): Promise<File> {
   const buffer = await readFile(path);
@@ -50,6 +65,44 @@ describe.skipIf(!existsSync(TEXT_PDF))('真实文字版 PDF', () => {
     expect(all.replace(/\s/g, '').length).toBeGreaterThan(500);
     // 页码要落在块上，否则无法做"回跳原页"
     expect(doc.blocks.some((b) => (b.metadata.pageNumber ?? 0) >= 2)).toBe(true);
+  }, 120_000);
+});
+
+describe.skipIf(!existsSync(RESIDUE_PDF))('文字层只是残渣的 PDF（内容以图片为主）', () => {
+  it('不再返回只含标题的残缺文档，而是转为 OCR 流程', async () => {
+    let caught: unknown = null;
+    let returned: { blocks: unknown[] } | null = null;
+
+    try {
+      returned = await new PdfParser().parse(await loadAsFile(RESIDUE_PDF));
+    } catch (err) {
+      caught = err;
+    }
+
+    // 这就是本次修复的核心断言：
+    // 旧实现在这里会**成功返回**一个只含标题的文档，
+    // 用户拿到 23 个字却不知道其余内容都是图片。
+    if (returned) {
+      throw new Error(
+        `解析器返回了 ${returned.blocks.length} 个块而非转入 OCR —— ` +
+          `说明"文字层是残渣"的判定失效了`,
+      );
+    }
+
+    expect(caught).not.toBeNull();
+    expect(isScannedPdfError(caught)).toBe(true);
+    // 用户看到的提示必须点明"这是图片型 PDF"，而不是笼统的失败
+    expect((caught as Error).message).toMatch(/扫描|图片|OCR/);
+  }, 120_000);
+
+  it('提示中必须说明"可以 OCR"，让用户知道有出路', async () => {
+    let caught: Error | null = null;
+    try {
+      await new PdfParser().parse(await loadAsFile(RESIDUE_PDF));
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught?.message).toMatch(/OCR|识别/);
   }, 120_000);
 });
 
