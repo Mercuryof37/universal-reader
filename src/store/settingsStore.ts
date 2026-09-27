@@ -58,6 +58,40 @@ interface SettingsState {
 
 export type TranslationEngineId = 'deepl' | 'openai' | 'browser';
 
+/**
+ * 决定界面初始的翻译引擎。
+ *
+ * 优先级：显式配置的环境变量 → 按是否有云端代理自动选择。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么需要这个函数（一个真实的产品缺陷）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * `deepL` 与 `openai` 都需要 `VITE_TRANSLATE_ENDPOINT` 指向自建代理，
+ * 该变量为空时 `translateBlock` 会**直接抛错**。
+ *
+ * 而这里原本硬编码为 `'deepl'`，于是"未配置代理的部署"会出现一个很差的体验：
+ * **用户一打开译文开关就收到「未配置翻译端点」的报错**，
+ * 而他并不知道要先去设置里换引擎。
+ *
+ * 更糟的是 `.env.example` 里已经承诺了 `VITE_DEFAULT_TRANSLATE_ENGINE`
+ * 可以配置，但**代码从未读取它** —— 填了不起任何作用。
+ *
+ * 现在的行为：
+ * - 配了代理（VITE_TRANSLATE_ENDPOINT 非空）→ deepl
+ * - 没配代理 → browser（浏览器内置翻译，无需密钥）
+ * - 显式设置了 VITE_DEFAULT_TRANSLATE_ENGINE → 以它为准
+ */
+function resolveInitialEngine(): TranslationEngineId {
+  const configured = import.meta.env.VITE_DEFAULT_TRANSLATE_ENGINE;
+  if (configured === 'deepl' || configured === 'openai' || configured === 'browser') {
+    return configured;
+  }
+
+  // 没有云端代理时不要默认指向需要代理的引擎，否则用户一开译文就吃报错
+  return import.meta.env.VITE_TRANSLATE_ENDPOINT ? 'deepl' : 'browser';
+}
+
 const READING_DEFAULTS = {
   theme: 'scroll' as Theme,
   fontSize: 18,
@@ -84,7 +118,7 @@ export const useSettingsStore = create<SettingsState>()(
       ttsAutoContinue: true,
 
       defaultHighlightColor: 'amber',
-      defaultTranslationEngine: 'deepl',
+      defaultTranslationEngine: resolveInitialEngine(),
 
       setTheme: (theme) => set({ theme }),
       setFontSize: (fontSize) => set({ fontSize: clamp(fontSize, 12, 32) }),
