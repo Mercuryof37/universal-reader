@@ -8,7 +8,7 @@
 > 没有服务器存你的文件，也没有上传。可以放心导入私密文档。
 
 ```
-访问地址：https://REPLACE-WITH-YOUR-PAGES-DOMAIN.pages.dev
+访问地址：https://universal-reader.pages.dev/
 ```
 
 ---

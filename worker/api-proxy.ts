@@ -282,10 +282,35 @@ function normalizeDeepLTarget(lang: string): string {
  * 注意：CORS 只约束**浏览器**。直接发起的服务端请求不受影响，
  * 因此它防的是"别人网页白嫖"，不能替代限流。
  * 生产环境建议同时启用 Cloudflare 的 Rate Limiting。
+ *
+ * ── 支持配置多个来源与通配符 ──
+ *
+ * 只允许单一来源在实际使用中不够：Cloudflare Pages 的**每次推送都会生成
+ * 新的预览地址**（形如 `1955a0bc.universal-reader.pages.dev`，哈希会变），
+ * 只填生产地址会让预览部署无法使用云端功能，只填预览地址则会让生产地址失效，
+ * 而且下次推送后预览地址一变又失效。
+ *
+ * 因此 ALLOWED_ORIGIN 支持逗号分隔的多条规则，每条可用 `*` 通配：
+ *
+ * ```toml
+ * ALLOWED_ORIGIN = "https://universal-reader.pages.dev,https://*.universal-reader.pages.dev"
+ * ```
+ *
+ * **`*` 的语义**：匹配**单个 DNS 标签**（一个或多个非点字符），不跨点。
+ * 这个收窄是刻意的：
+ *
+ * | 规则 | 匹配 | 不匹配 |
+ * |---|---|---|
+ * | `https://*.universal-reader.pages.dev` | `1955a0bc.universal-reader.pages.dev` | `universal-reader.pages.dev`（写在前面即可）、`a.b.universal-reader.pages.dev` |
+ *
+ * 若允许跨点，`https://universal-reader.pages.dev.evil.com` 这类
+ * 「把你域名当子域」的构造就有机会混进来。
+ *
+ * **安全约束**：只含通配符的规则（如 `*`、`https://*`）会被**忽略** ——
+ * 否则等于放行所有来源，把这个白名单变成装饰。
  */
 function corsHeaders(request: Request, env: Env): Record<string, string> {
   const origin = request.headers.get('Origin');
-  const allowed = env.ALLOWED_ORIGIN?.trim();
 
   const base: Record<string, string> = {
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
@@ -295,11 +320,48 @@ function corsHeaders(request: Request, env: Env): Record<string, string> {
   };
 
   // 未配置来源白名单，或来源不匹配 → 不发放 CORS 许可
-  if (!allowed || !origin || origin !== allowed) {
+  if (!origin || !isOriginAllowed(origin, env.ALLOWED_ORIGIN)) {
     return base;
   }
 
   return { ...base, 'Access-Control-Allow-Origin': origin };
+}
+
+/**
+ * 判断请求来源是否在白名单内。
+ *
+ * 导出以便单元测试 —— 这是本文件里唯一有分支逻辑的安全判定，
+ * 出错的方式（放行所有人 / 挡住自己）都很隐蔽，值得单独测。
+ */
+export function isOriginAllowed(origin: string, allowedConfig: string | undefined): boolean {
+  const patterns = (allowedConfig ?? '')
+    .split(',')
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  if (!patterns.length) return false;
+
+  for (const pattern of patterns) {
+    // 通配符必须配合具体域名 —— 只含 * 的规则会让白名单形同虚设
+    const withoutWildcards = pattern.replace(/\*/g, '');
+    if (!/[a-z0-9]/i.test(withoutWildcards)) continue;
+
+    if (globToRegExp(pattern).test(origin)) return true;
+  }
+
+  return false;
+}
+
+/**
+ * 把白名单规则转成正则。
+ *
+ * `*` → `[^.]+`：匹配**一个或多个非点字符**，即单个 DNS 标签。
+ * 其余字符按字面量转义，特别是 `.` —— 若把它当通配，
+ * `https://universalXreader.pages.dev` 就会被误放行。
+ */
+function globToRegExp(pattern: string): RegExp {
+  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^.]+');
+  return new RegExp(`^${escaped}$`);
 }
 
 function json(data: unknown, status: number, cors: Record<string, string>): Response {

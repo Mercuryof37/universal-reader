@@ -16,12 +16,18 @@ compatibility_date = "2025-09-01"
 #   已配置不匹配  → 不发放 CORS 头 → 拒绝
 #
 # 填什么：你的 **Pages 站点地址**，不是 Worker 地址（两者极易混淆）
-#   形如 https://universal-reader.pages.dev
-#   绑了自定义域名就填自定义域名，例如 https://reader.example.com
+#
+# 建议同时写生产地址与预览通配符 —— Cloudflare Pages 每次推送都会生成
+# 新的预览地址（哈希会变），只填生产地址则预览不可用，只填预览地址则
+# 生产不可用、且下次推送后再次失效。
+#
+# `*` 匹配单个 DNS 标签，**不跨点**，也不会覆盖生产地址（生产需单独列出）：
+#   https://1955a0bc.universal-reader.pages.dev  ← 预览，被 * 覆盖
+#   https://universal-reader.pages.dev           ← 生产，需单独列
 #
 # 改完必须重新部署才生效：npx wrangler deploy
 [vars]
-ALLOWED_ORIGIN = "https://1955a0bc.universal-reader.pages.dev"
+ALLOWED_ORIGIN = "https://universal-reader.pages.dev,https://*.universal-reader.pages.dev,http://localhost:5173"
 
 # 密钥不要写在这里，用命令写入加密环境变量：
 #   npx wrangler secret put DEEPL_API_KEY

@@ -1,4 +1,4 @@
-node_modules
+﻿node_modules
 dist
 dist-ssr
 *.local
@@ -17,3 +17,6 @@ playwright-report
 # 从 node_modules 复制生成。不入库的理由：它是第三方二进制产物的搬运，
 # 入库会造成"版本升级后副本与依赖不一致"的隐患。
 public/pdfjs-wasm
+
+# Wrangler 本地开发变量（含密钥，绝不入库）
+.dev.vars
