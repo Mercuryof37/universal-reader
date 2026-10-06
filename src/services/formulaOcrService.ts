@@ -3,7 +3,12 @@
  *
  * 将图片中的数学公式识别为 LaTeX，通过 Cloudflare Worker 代理调用 SimpleTex API。
  * 用于扫描版 PDF 中公式区域的精确识别（替代通用 OCR 对公式的低质量输出）。
+ *
+ * ⚠️ 这是全应用**唯一**会把文档内容送出本机的函数，因此它自己也要检查隐私开关
+ * （见下方 `recognizeFormula` 的第二道防线），而不是只依赖调用方自觉。
  */
+
+import { useSettingsStore } from '@/store/settingsStore';
 
 const MAX_IMAGE_SIZE = 2_000_000;
 
@@ -17,6 +22,22 @@ export async function recognizeFormula(
   imageData: HTMLCanvasElement | OffscreenCanvas | ImageData,
   signal?: AbortSignal,
 ): Promise<string> {
+  /**
+   * 第二道防线。
+   *
+   * `ocrEngine.enhanceFormulaRegions()` 已经会在开关关闭时提前返回，
+   * 但那是**调用方**的自律。真正执行上传的是这个函数，所以它必须自己拒绝 ——
+   * 否则将来任何一个新调用方只要忘了检查，就会静默把文档内容发出去。
+   *
+   * 这里选择抛错而不是静默返回空串：万一真被绕过，
+   * 调用方会看到明确原因，而不是拿到一个莫名其妙的空结果。
+   */
+  if (!useSettingsStore.getState().formulaOcrEnabled) {
+    throw new Error(
+      '公式云端识别已在设置中关闭（formulaOcrEnabled = false），已拒绝上传。',
+    );
+  }
+
   const buffer = await toPngBuffer(imageData);
 
   if (buffer.byteLength > MAX_IMAGE_SIZE) {

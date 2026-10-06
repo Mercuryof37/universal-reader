@@ -9,7 +9,7 @@
  * 模型约 10MB 从 HuggingFace CDN 下载，ONNX Runtime WASM 约 28MB 从 CDN 加载）。
  * 但有两处只想要"类型或常量"：
  * - `FileUploadZone` 需要语言下拉框的选项列表；
- * - `pdfParser` / `ocrPostProcess` / `pdfTextLayer` 需要类型定义。
+ * - `pdfParser` / `ocrPostProcess` 需要类型定义。
  *
  * 若这些定义留在 ocrEngine 里，上述模块就会被迫把整个 OCR 引擎拉进依赖图，
  * 首屏包因此膨胀（实测主包从 68KB 涨到 201KB gzip）。

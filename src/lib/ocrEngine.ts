@@ -11,6 +11,7 @@ import { PaddleOcrService, V6_SMALL_MODEL } from 'ppu-paddle-ocr/web';
 import * as ort from 'onnxruntime-web';
 import { errorReport } from '@/lib/diagnostics';
 import { recognizeFormula } from '@/services/formulaOcrService';
+import { useSettingsStore } from '@/store/settingsStore';
 
 // Force ONNX Runtime to load WASM from CDN instead of bundling locally.
 // The .wasm file is ~28MB which exceeds Cloudflare Pages' 25MB limit.
@@ -340,12 +341,20 @@ class OcrEngine {
    * PaddleOCR treats formulas as regular text, producing garbled output like
    * "P{X=x,Y=y}=p²(1-p)^(x+y-2)" → "PI{X=2,Y=y}=p"A−p"".
    * SimpleTex specializes in formula OCR and returns accurate LaTeX.
+   *
+   * ⚠️ 这是全应用**唯一**会把文档内容送出本机的路径，因此受
+   * `settingsStore.formulaOcrEnabled` 控制，且该开关**默认关闭**。
+   * 关闭时直接返回原始结果 —— 不发起任何网络请求。
    */
   private async enhanceFormulaRegions(
     words: OcrWord[],
     imageData: ImageData | HTMLCanvasElement | OffscreenCanvas,
   ): Promise<OcrWord[]> {
     if (words.length < 3) return words;
+
+    // 隐私开关：默认关闭，关闭时不联网（读 store 是为了让扫描件 OCR 这条
+    // 非 React 链路也能拿到设置；ocrEngine 本身是按需动态 import 的）
+    if (!useSettingsStore.getState().formulaOcrEnabled) return words;
 
     const regions = detectFormulaRegions(words);
     if (!regions.length) return words;

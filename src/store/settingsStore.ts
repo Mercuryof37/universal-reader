@@ -36,6 +36,27 @@ interface SettingsState {
   defaultHighlightColor: HighlightColor;
   defaultTranslationEngine: TranslationEngineId;
 
+  /**
+   * 扫描件公式识别是否允许调用云端增强（SimpleTex）。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * 为什么它必须是一个「默认关闭」的开关
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 公式增强会把页面上裁剪出来的公式区域（一小块 PNG）POST 到自建 Worker，
+   * 再由 Worker 转发给第三方 `server.simpletex.cn`。这是整个应用里
+   * **唯一会把文档内容送出本机**的路径。
+   *
+   * 而本应用对外的核心承诺是「文档全程留在本机浏览器，不上传服务器」。
+   * 一个会自动触发、无法关闭的上传路径与这句话直接冲突 ——
+   * 所以它是**显式选择加入（opt-in）**，默认 `false`：
+   * 不打开，就一个字节都不会外发。
+   *
+   * 关闭时的行为：识别照常进行，只是公式退化为 PaddleOCR 的原始文字结果
+   * （可能是一串乱码），并且**完全不发起网络请求**。
+   */
+  formulaOcrEnabled: boolean;
+
   setTheme: (theme: Theme) => void;
   setFontSize: (size: number) => void;
   setLineHeight: (v: number) => void;
@@ -53,6 +74,7 @@ interface SettingsState {
   setTtsAutoContinue: (v: boolean) => void;
   setDefaultHighlightColor: (color: HighlightColor) => void;
   setDefaultTranslationEngine: (engine: TranslationEngineId) => void;
+  setFormulaOcrEnabled: (enabled: boolean) => void;
   resetReadingSettings: () => void;
 }
 
@@ -119,6 +141,8 @@ export const useSettingsStore = create<SettingsState>()(
 
       defaultHighlightColor: 'amber',
       defaultTranslationEngine: resolveInitialEngine(),
+      // 默认关闭：不显式打开，就不会有任何文档内容离开本机（见 interface 注释）
+      formulaOcrEnabled: false,
 
       setTheme: (theme) => set({ theme }),
       setFontSize: (fontSize) => set({ fontSize: clamp(fontSize, 12, 32) }),
@@ -141,6 +165,7 @@ export const useSettingsStore = create<SettingsState>()(
       setDefaultHighlightColor: (defaultHighlightColor) => set({ defaultHighlightColor }),
       setDefaultTranslationEngine: (defaultTranslationEngine) =>
         set({ defaultTranslationEngine }),
+      setFormulaOcrEnabled: (formulaOcrEnabled) => set({ formulaOcrEnabled }),
 
       resetReadingSettings: () => set({ ...READING_DEFAULTS }),
     }),

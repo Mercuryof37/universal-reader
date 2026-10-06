@@ -1,23 +1,31 @@
 import { useEffect, useState } from 'react';
-import { Download, RefreshCw, WifiOff, X } from 'lucide-react';
+import { Download, WifiOff, X } from 'lucide-react';
 import { subscribeOnline, usePwa } from '@/lib/pwa';
 
 /**
  * PWA 状态提示条。
  *
- * 三种提示共用一个位置，按优先级显示：
+ * 两种提示共用一个位置，按优先级显示：
  *
  * | 优先级 | 场景 | 文案 | 可关闭 |
  * |---|---|---|---|
- * | 1 | 有新版本在等待 | 「有新版本可用」+ 立即更新 | 是 |
- * | 2 | 离线中 | 「已离线，已缓存的内容仍可阅读」 | 否 |
- * | 3 | 首次可离线使用 | 「已可离线使用」 | 是 |
+ * | 1 | 离线中 | 「已离线，已缓存的内容仍可阅读」 | 否 |
+ * | 2 | 首次可离线使用 | 「已可离线使用」 | 是 |
  *
  * 「离线中」不可关闭是刻意的：它是**状态**而不是通知，
  * 让用户知道这不是网站坏了，同时暗示可以继续读已导入的书。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么没有「有新版本可用 / 立即更新」
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 本项目采用 `registerType: 'autoUpdate'`（见 `vite.config.ts` 与 `lib/pwa.ts`）。
+ * 该模式下 `updateServiceWorker()` 是空操作，`onNeedRefresh` 也不会被触发，
+ * 所以「有新版本」提示条**永远不会出现** —— 那段 UI 已被删除，
+ * 而不是留在这里装作能用。代价是页面会在无预警时自动重载。
  */
 export function PwaPrompt() {
-  const { needRefresh, offlineReady, update, dismiss } = usePwa();
+  const { offlineReady, dismiss } = usePwa();
   const [online, setOnline] = useState(() =>
     typeof navigator === 'undefined' ? true : navigator.onLine,
   );
@@ -29,26 +37,6 @@ export function PwaPrompt() {
     return (
       <Banner tone="offline" icon={<WifiOff className="h-4 w-4" aria-hidden />}>
         已离线 — 已缓存的页面与已导入的文档仍可正常阅读
-      </Banner>
-    );
-  }
-
-  if (needRefresh) {
-    return (
-      <Banner
-        tone="update"
-        icon={<Download className="h-4 w-4" aria-hidden />}
-        onClose={dismiss}
-      >
-        <span>有新版本可用</span>
-        <button
-          type="button"
-          onClick={update}
-          className="ml-2 inline-flex items-center gap-1 rounded-md bg-[var(--reader-accent)] px-2 py-0.5 text-xs font-medium text-[var(--reader-bg)]"
-        >
-          <RefreshCw className="h-3 w-3" aria-hidden />
-          立即更新
-        </button>
       </Banner>
     );
   }
@@ -70,7 +58,7 @@ function Banner({
   children,
   onClose,
 }: {
-  tone: 'update' | 'offline' | 'ready';
+  tone: 'offline' | 'ready';
   icon: React.ReactNode;
   children: React.ReactNode;
   onClose?: () => void;

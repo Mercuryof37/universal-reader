@@ -2,6 +2,7 @@ import { useCallback, useRef, useState } from 'react';
 import { FileUp, Loader2, ScanLine, X } from 'lucide-react';
 import { SUPPORTED_EXTENSIONS, SUPPORTED_HINT } from '@/parsers';
 import { useLibraryStore } from '@/store/libraryStore';
+import { useSettingsStore } from '@/store/settingsStore';
 import { OCR_LANG_OPTIONS, type OcrLang } from '@/lib/ocrTypes';
 
 /**
@@ -43,6 +44,9 @@ export function FileUploadZone({ compact = false }: { compact?: boolean }) {
   const ocrProgress = useLibraryStore((s) => s.ocrProgress);
   const startOcr = useLibraryStore((s) => s.startOcr);
   const cancelOcr = useLibraryStore((s) => s.cancelOcr);
+
+  const formulaOcrEnabled = useSettingsStore((s) => s.formulaOcrEnabled);
+  const setFormulaOcrEnabled = useSettingsStore((s) => s.setFormulaOcrEnabled);
 
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -120,6 +124,29 @@ export function FileUploadZone({ compact = false }: { compact?: boolean }) {
                 建议先用前 10 页试跑：确认识别质量与单页耗时后再决定整本处理。
                 识别失败的单页会被跳过，不会中断整个任务。
               </p>
+
+              {/*
+                隐私开关：公式增强是全应用唯一会把文档内容送出本机的路径
+                （页面局部像素 → 自建 Worker → 第三方 SimpleTex）。
+                默认关闭，且必须由用户在这里显式打开。
+              */}
+              <label className="flex max-w-md items-start gap-2 rounded-md border border-[var(--reader-border)] p-2 text-xs leading-relaxed">
+                <input
+                  type="checkbox"
+                  checked={formulaOcrEnabled}
+                  onChange={(e) => setFormulaOcrEnabled(e.target.checked)}
+                  className="mt-0.5 accent-[var(--reader-accent)]"
+                />
+                <span>
+                  <span className="font-medium">上传公式区域以换取更准的公式</span>
+                  <span className="block text-[var(--reader-muted)]">
+                    打开后，识别到公式时会把<span className="font-medium">那一小块图片</span>
+                    发往第三方服务（SimpleTex）换取 LaTeX，
+                    <span className="font-medium">需要联网</span>。默认关闭 ——
+                    不打开就没有任何内容离开本机，公式会保留为 OCR 的原始文字（可能是乱码）。
+                  </span>
+                </span>
+              </label>
 
               <div className="flex gap-2">
                 <button
