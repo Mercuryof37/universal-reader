@@ -10,6 +10,7 @@
 import { PaddleOcrService, V6_SMALL_MODEL } from 'ppu-paddle-ocr/web';
 import * as ort from 'onnxruntime-web';
 import { errorReport } from '@/lib/diagnostics';
+import { recognizeFormula } from '@/services/formulaOcrService';
 
 // Force ONNX Runtime to load WASM from CDN instead of bundling locally.
 // The .wasm file is ~28MB which exceeds Cloudflare Pages' 25MB limit.
@@ -265,11 +266,14 @@ class OcrEngine {
       ? words.reduce((sum, w) => sum + w.confidence, 0) / words.length
       : 0;
 
+    // Enhance formula regions with SimpleTex cloud OCR
+    const enhancedWords = await this.enhanceFormulaRegions(words, imageData);
+
     onProgress?.({ pageNum, total, status: 'complete' });
 
     return {
       pageNum,
-      words,
+      words: enhancedWords,
       avgConfidence,
       pageText: result.text,
       extraction: {
@@ -329,6 +333,208 @@ class OcrEngine {
   get isReady(): boolean {
     return this.initialized;
   }
+
+  /**
+   * Detect formula-like word clusters and re-recognize them with SimpleTex.
+   *
+   * PaddleOCR treats formulas as regular text, producing garbled output like
+   * "P{X=x,Y=y}=p²(1-p)^(x+y-2)" → "PI{X=2,Y=y}=p"A−p"".
+   * SimpleTex specializes in formula OCR and returns accurate LaTeX.
+   */
+  private async enhanceFormulaRegions(
+    words: OcrWord[],
+    imageData: ImageData | HTMLCanvasElement | OffscreenCanvas,
+  ): Promise<OcrWord[]> {
+    if (words.length < 3) return words;
+
+    const regions = detectFormulaRegions(words);
+    if (!regions.length) return words;
+
+    console.info(`[ocrEngine] 检测到 ${regions.length} 个公式候选区域，尝试 SimpleTex 增强`);
+
+    const canvas = ensureCanvas(imageData);
+    if (!canvas) return words;
+
+    const enhanced = [...words];
+
+    for (const region of regions) {
+      try {
+        const crop = cropCanvas(canvas, region.bbox);
+        if (!crop) continue;
+
+        const latex = await recognizeFormula(crop);
+        if (!latex || latex.length < 2) continue;
+
+        // Replace all words in this region with a single LaTeX word
+        const replacement: OcrWord = {
+          text: `$${latex}$`,
+          confidence: 95,
+          bbox: region.bbox,
+          fontSize: region.avgFontSize,
+        };
+
+        // Mark original words for removal, insert replacement at first position
+        for (let i = 0; i < enhanced.length; i++) {
+          if (region.wordIndices.includes(i)) {
+            if (i === region.wordIndices[0]) {
+              enhanced[i] = replacement;
+            } else {
+              enhanced[i] = null as unknown as OcrWord;
+            }
+          }
+        }
+
+        console.info(
+          `[ocrEngine] 公式增强成功：${region.originalText.slice(0, 40)}… → $${latex.slice(0, 40)}$`,
+        );
+      } catch (err) {
+        console.warn('[ocrEngine] 公式增强失败（保留原始识别结果）：', err);
+      }
+    }
+
+    return enhanced.filter((w): w is OcrWord => w !== null);
+  }
 }
 
 export const ocrEngine = new OcrEngine();
+
+// --- Formula region detection helpers ---
+
+const FORMULA_CONFIDENCE_THRESHOLD = 70;
+const FORMULA_SYMBOL_RE = /[{}^_\\±∑∏∫√∞≈≠≤≥∈∉⊂⊃∪∩∀∃∇∂αβγδεζηθλμνξπρσφψωΑΒΓΔΕΖΗΘΛΜΝΞΠΡΣΦΨΩ]/;
+const MATH_CHAR_RE = /[A-Za-z0-9{}^_+\-*/=()<>|!.,;:?'`~@#$%&[\]\\]/;
+
+interface FormulaRegion {
+  wordIndices: number[];
+  bbox: { x0: number; y0: number; x1: number; y1: number };
+  avgFontSize: number;
+  originalText: string;
+}
+
+/**
+ * Detect clusters of words that likely contain mathematical formulas.
+ *
+ * Heuristics:
+ * - Low confidence (< 70%) suggests PaddleOCR struggled (common with formulas)
+ * - Presence of math symbols or dense special characters
+ * - Adjacent low-confidence words are grouped into a single region
+ */
+function detectFormulaRegions(words: OcrWord[]): FormulaRegion[] {
+  const isFormulaCandidate = (w: OcrWord): boolean => {
+    if (w.confidence < FORMULA_CONFIDENCE_THRESHOLD) return true;
+    if (FORMULA_SYMBOL_RE.test(w.text)) return true;
+    // Dense math-like content: mostly ASCII symbols/digits, few CJK chars
+    const cjkCount = (w.text.match(/[\u4e00-\u9fff]/g) || []).length;
+    const totalChars = w.text.replace(/\s/g, '').length;
+    if (totalChars > 3 && cjkCount / totalChars < 0.3 && MATH_CHAR_RE.test(w.text)) {
+      return w.confidence < 85;
+    }
+    return false;
+  };
+
+  const regions: FormulaRegion[] = [];
+  let currentIndices: number[] = [];
+  let currentBbox = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
+  let currentFontSum = 0;
+  let currentText = '';
+
+  const flushRegion = () => {
+    if (currentIndices.length >= 2) {
+      regions.push({
+        wordIndices: [...currentIndices],
+        bbox: { ...currentBbox },
+        avgFontSize: currentFontSum / currentIndices.length,
+        originalText: currentText.trim(),
+      });
+    }
+    currentIndices = [];
+    currentBbox = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
+    currentFontSum = 0;
+    currentText = '';
+  };
+
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    if (isFormulaCandidate(w)) {
+      currentIndices.push(i);
+      currentBbox.x0 = Math.min(currentBbox.x0, w.bbox.x0);
+      currentBbox.y0 = Math.min(currentBbox.y0, w.bbox.y0);
+      currentBbox.x1 = Math.max(currentBbox.x1, w.bbox.x1);
+      currentBbox.y1 = Math.max(currentBbox.y1, w.bbox.y1);
+      currentFontSum += w.fontSize;
+      currentText += (currentText ? ' ' : '') + w.text;
+    } else {
+      // Check gap to previous candidate — if close, keep grouping
+      if (currentIndices.length > 0) {
+        const prevWord = words[currentIndices[currentIndices.length - 1]];
+        const gapX = w.bbox.x0 - (prevWord?.bbox.x1 ?? 0);
+        const gapY = Math.abs(((w.bbox.y0 + w.bbox.y1) / 2) - ((prevWord?.bbox.y0 + prevWord?.bbox.y1) / 2));
+        // If on same line and close, include as part of formula context
+        if (gapY < w.fontSize * 0.5 && gapX < w.fontSize * 3 && isFormulaCandidate(w)) {
+          currentIndices.push(i);
+          currentBbox.x0 = Math.min(currentBbox.x0, w.bbox.x0);
+          currentBbox.y0 = Math.min(currentBbox.y0, w.bbox.y0);
+          currentBbox.x1 = Math.max(currentBbox.x1, w.bbox.x1);
+          currentBbox.y1 = Math.max(currentBbox.y1, w.bbox.y1);
+          currentFontSum += w.fontSize;
+          currentText += ' ' + w.text;
+          continue;
+        }
+        flushRegion();
+      }
+    }
+  }
+  flushRegion();
+
+  return regions;
+}
+
+function ensureCanvas(
+  source: ImageData | HTMLCanvasElement | OffscreenCanvas,
+): HTMLCanvasElement | null {
+  if (source instanceof HTMLCanvasElement) return source;
+  if (typeof document === 'undefined') return null;
+
+  if (source instanceof ImageData) {
+    const c = document.createElement('canvas');
+    c.width = source.width;
+    c.height = source.height;
+    c.getContext('2d')!.putImageData(source, 0, 0);
+    return c;
+  }
+
+  // OffscreenCanvas → HTMLCanvasElement
+  const c = document.createElement('canvas');
+  c.width = source.width;
+  c.height = source.height;
+  const ctx = c.getContext('2d')!;
+  ctx.drawImage(source, 0, 0);
+  return c;
+}
+
+function cropCanvas(
+  source: HTMLCanvasElement,
+  bbox: { x0: number; y0: number; x1: number; y1: number },
+): HTMLCanvasElement | null {
+  const x = Math.max(0, Math.floor(bbox.x0));
+  const y = Math.max(0, Math.floor(bbox.y0));
+  const w = Math.min(Math.ceil(bbox.x1 - bbox.x0), source.width - x);
+  const h = Math.min(Math.ceil(bbox.y1 - bbox.y0), source.height - y);
+  if (w < 10 || h < 10) return null;
+
+  // Add padding around the crop for better formula recognition
+  const pad = Math.round(Math.max(w, h) * 0.1);
+  const px = Math.max(0, x - pad);
+  const py = Math.max(0, y - pad);
+  const pw = Math.min(w + pad * 2, source.width - px);
+  const ph = Math.min(h + pad * 2, source.height - py);
+
+  const crop = document.createElement('canvas');
+  crop.width = pw;
+  crop.height = ph;
+  const ctx = crop.getContext('2d')!;
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, pw, ph);
+  ctx.drawImage(source, px, py, pw, ph, 0, 0, pw, ph);
+  return crop;
+}
