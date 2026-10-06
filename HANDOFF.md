@@ -9,16 +9,19 @@
 > 用户导入 md / txt / pdf / epub，获得双语对照、语音朗读、批注能力，
 > **文档全程不离开浏览器**。
 >
-> ⚠️ 最后一句有**一处例外**：`5184bde` 引入的 SimpleTex 公式 OCR 会把页面局部像素
-> 上传给第三方云服务，且触发是自动的。详见 §1 的 T2 与 §5.7 的待决策。
+> ⚠️ 最后一句有**一处例外，且已于本轮收口**：`5184bde` 引入的 SimpleTex 公式 OCR
+> 是**唯一**会把页面局部像素送出本机的路径，但它现在是**默认关闭的显式开关**
+> （`settingsStore.formulaOcrEnabled`，默认 `false`）—— 不勾选就一个字节都不外发。
+> 详见 §1 的 T2、§5.8 与 §1 末尾的「本轮三项决定」。
 
 | 项 | 值 |
 |---|---|
 | 仓库 | `Mercuryof37/universal-reader`（分支 `main`） |
-| 当前提交 | **`aa8827a`**（2026-10-06，「fix(pwa): seed the navigation cache so offline cold start works」） |
+| 当前提交 | **`f549173`**（2026-10-06，「feat(privacy)!: make the formula upload opt-in, drop dead code and unused deps」）<br>`verify` 与 `Cloudflare Pages` 两项 check 均为 **success**，线上已服务于本次产物 |
 | 部署 | Cloudflare Pages（静态）+ 可选 Cloudflare Worker（API 代理） |
-| 代码规模 | `src/` 65 个文件 / 10,874 行 · `scripts/` 8 个 / 1,151 行 · `worker/` 1 个 / 453 行 |
-| 测试 | 18 个文件 / **205 个用例全部通过** |
+| 代码规模 | `src/` 63 个文件 / 10,636 行 · `scripts/` 8 个 / 1,151 行 · `worker/` 1 个 / 453 行 |
+| 依赖 | **26** 个（dependencies 16 + devDependencies 10），本轮由 29 降下来 |
+| 测试 | 18 个文件 / **200 个用例全部通过** |
 | 门禁 | `tsc -b` ✅ · `vitest run` ✅ · `npm run build` ✅（含 ONNX WASM 清理 + 产物校验） |
 | 文档 | `README.md`（用户手册）· `docs/`（3 份专题）· 本文 |
 
@@ -38,15 +41,24 @@
 | C5 | **翻译按字符计费** | 必须有缓存与"按需调用"。已实现视口懒翻译 + 两级缓存 |
 | C6 | **单人开发、静态托管** | 运维复杂度必须接近零。**因此不引入数据库、不引入服务端框架** |
 
-### 本轮（`aa8827a`）新增的两条张力 —— 必须与上面六条一起读
+### 上一轮（`aa8827a`）发现的两条张力 —— 必须与上面六条一起读（**T2 本轮已收口，T1 仍未解决**）
 
 | 编号 | 张力 | 具体事实 |
 |---|---|---|
-| T1 | **C2 离线 × 首次 OCR 需要联网** | OCR 引擎换成 PaddleOCR / ONNX Runtime Web 之后，**模型（约 10MB，来自 HuggingFace CDN）与 ONNX WASM（约 28MB，来自 jsDelivr）都只在运行时缓存里**（`ocr-models`、`onnx-wasm`，均 CacheFirst），**不在预缓存清单里**。也就是说「用过一次之后才能离线用」。国内网络对 HuggingFace 与 jsDelivr 的可达性都不保证，这是新增的**外部依赖风险** |
-| T2 | **C3 隐私 × SimpleTex 公式 OCR** | `5184bde` 引入的公式增强会把**页面局部像素**（裁剪出的公式区域，客户端上限 `MAX_IMAGE_SIZE = 2_000_000` 字节）POST 到自建 Worker，再由 Worker 以 `Authorization: Bearer <key>` 转发到第三方 `https://server.simpletex.cn/api/v1/simpletex_recognize`。这是本项目**第一次把文档内容送出本机**，与「文档全程留在本机浏览器，不上传服务器」的宣传口径存在直接张力；而且**触发是自动的**（`ocrEngine.ts` 一检测到公式候选区域就发），**不需要用户逐次确认** |
+| T1 | **C2 离线 × 首次 OCR 需要联网**（**仍未解决**） | OCR 引擎换成 PaddleOCR / ONNX Runtime Web 之后，**模型（约 10MB，来自 HuggingFace CDN）与 ONNX WASM（约 28MB，来自 jsDelivr）都只在运行时缓存里**（`ocr-models`、`onnx-wasm`，均 CacheFirst），**不在预缓存清单里**。也就是说「用过一次之后才能离线用」。国内网络对 HuggingFace 与 jsDelivr 的可达性都不保证，这是**外部依赖风险** |
+| T2 | **C3 隐私 × SimpleTex 公式 OCR**（**本轮已收口**） | `5184bde` 引入的公式增强会把**页面局部像素**（裁剪出的公式区域，客户端上限 `MAX_IMAGE_SIZE = 2_000_000` 字节）POST 到自建 Worker，再由 Worker 以 `Authorization: Bearer <key>` 转发到第三方 `https://server.simpletex.cn/api/v1/simpletex_recognize`。这是本项目**唯一**把文档内容送出本机的路径。**本轮改为默认关闭的显式开关**（`settingsStore.formulaOcrEnabled`，默认 `false`）：不勾选 → 不发起任何网络请求、一个字节都不外发。**但残余点必须保留**：勾选后仍会上传；需要联网；Worker 未配 `SIMPLETEX_API_KEY` 时该端点在线上实测仍返回 500；应用内**没有**「上传了什么」的审计视图。见 §5.8 与 §4.2 |
 
-> 另有一处**未解决的设计冲突**（PWA 更新模式自相矛盾），单列在 §5.7。
-> 它是上一次同步时就存在、至今没做产品决策的问题，接手后请优先处理。
+> 上一轮单列的「PWA 更新模式自相矛盾」**已于本轮拍板**：保留 `autoUpdate`，永不触发的提示 UI 已删除。见 §5.7。
+
+### 本轮三项决定（**已拍板，不要再翻案**）
+
+三项决定都是「已经做完并写进代码」，不是待办。细节见各自的小节：
+
+| 决定 | 结论 | 代价 / 残余点 | 详见 |
+|---|---|---|---|
+| 一 · PWA 更新模式 | **保留 `autoUpdate`**，不回到 prompt。据此删掉了 prompt 模式那套永不触发的「有新版本可用 / 立即更新」UI | 页面会**无预警自动重载**，滚动位置、展开的译文、进行中的 OCR 会丢 | §5.7 |
+| 二 · 公式云端识别 | **改为默认关闭的显式开关**（`settingsStore.formulaOcrEnabled`，默认 `false`），在 OCR 对话框里由用户勾选 | 隐私张力已收口（默认零上传）；勾选后仍上传到第三方、需要联网、线上端点当前 500、无审计视图 | §5.8 |
+| 三 · 死代码与冗余依赖 | 删除 `ocrWordExtraction.ts`（含 13 个孤立用例）、`ocrWordExtraction.test.ts`、`pdfTextLayer.ts`；移除 `pdf-lib`、`jszip`、`rehype-katex` | 无（都是无调用方的代码与无 import 的依赖） | §4.3 |
 
 ### 由此推出的"不要做"
 
@@ -59,7 +71,7 @@
 | 把 API 密钥放进前端 | 等同于公开。前端代码、产物、localStorage 对用户完全可见 |
 | 引入 CJK 字体子集化 | 当前用系统字体栈，中文显示成本为零。子集化要引入几 MB 字体与构建步骤，且易产生"生僻字变豆腐块"。**投入产出比为负** |
 | 把 PDF 解析移回 Web Worker | 见 §6 缺陷 1 —— 已尝试三次失败，当前方案是唯一可用的 |
-| 让 SimpleTex 公式增强继续"默认静默上传" | 与 C3 的口径直接冲突。**留着就必须让用户知情、可选**（见 §5.7 待决策） |
+| 让 SimpleTex 公式增强继续"默认静默上传" | 与 C3 的口径直接冲突。**已改为默认关闭的显式开关**（§5.8）。不要把它改回默认开启，也不要绕过开关去调 `recognizeFormula()` |
 | 把 ONNX WASM 重新塞回 `dist/` 或加进预缓存 | 单个 `.wasm` 约 28MB，**超过 Cloudflare Pages 单文件 25MB 上限**；构建后必须由 `clean-onnx-wasm.mjs` 删除并改走 CDN（见 §3） |
 
 ---
@@ -75,14 +87,25 @@
 | `dexie` | 4.4.6 | IndexedDB 封装 | 首屏 |
 | `lucide-react` | 0.548.0 | 图标 | 首屏 |
 | `@base-ui/react` | 1.8.0 | 无交互样式的无障碍组件 | 首屏 |
-| `unified` / `remark-parse` / `remark-gfm` / `remark-math` / `rehype-katex` / `unist-util-visit` | 11.0.5 / 11.0.0 / 4.0.1 / 6.0.0 / 7.0.1 / 5.1.0 | Markdown 解析（含 `$行内$` 与 `$$块级$$` 数学） | 导入 md/txt |
+| `unified` / `remark-parse` / `remark-gfm` / `remark-math` / `unist-util-visit` | 11.0.5 / 11.0.0 / 4.0.1 / 6.0.0 / 5.1.0 | Markdown 解析（含 `$行内$` 与 `$$块级$$` 数学） | 导入 md/txt |
 | `katex` | 0.19.0 | 数学公式渲染（`BlockRow.tsx` 区分 display / inline） | 导入含公式的文档 |
 | `pdfjs-dist` | 5.7.284 | PDF 解析（**含 WASM 解码器**） | 仅导入 PDF |
 | `epubjs` | 0.3.93 | EPUB 解析 | 仅导入 EPUB |
 | `ppu-paddle-ocr` | 6.6.0 | 浏览器端 OCR（PP-OCRv6 small，**替代原 Tesseract.js**） | 仅执行 OCR，模型约 10MB 运行时下载 |
 | `onnxruntime-web` | 1.30.0 | PaddleOCR 的 ONNX 推理运行时（WASM 约 28MB 由 CDN 提供） | 仅执行 OCR |
-| `pdf-lib` | 1.17.1 | 将 OCR 结果写回 PDF | **未接线，见 §4.3** |
-| `jszip` | 3.10.2 | ZIP 解包 | **实际未使用** |
+
+> **本轮移除了 3 个「装了没用」的依赖**（依赖总数 **29 → 26**，即 dependencies 19 → 16、
+> devDependencies 10 不变）：
+>
+> | 依赖 | 为什么可以删 |
+> |---|---|
+> | `pdf-lib@^1.17.1` | 它唯一的用途是配合 `pdfTextLayer.ts` 把 OCR 结果写回 PDF；该文件删除后，`src/`、`worker/`、`scripts/` 里 grep `pdf-lib` / `PDFDocument` **零命中** |
+> | `jszip@^3.10.2` | 全仓库没有任何 `from 'jszip'` / `require('jszip')` / `import('jszip')`（`epubParser.ts` 只在**注释**里提过它）。注意：`epubjs` 自己的 `dependencies` 里带 `jszip ^3.7.1`，所以 `node_modules/jszip` 依然存在 —— 移除的只是应用层的冗余声明 |
+> | `rehype-katex@^7.0.1` | 全仓库无任何 import；公式渲染实际由 `BlockRow.tsx` 直接调 `katex.renderToString()` 完成 |
+>
+> 实测：`npm install --ignore-scripts --no-audit --no-fund` 输出 `removed 23 packages in 1s`（exit 0）。
+> 详见 §4.3 的「已清理」表。
+
 
 > **OCR 引擎已于 `cdf2957` 更换**：`tesseract.js@^7.0.0` 被**移除**，改为
 > `ppu-paddle-ocr@6.6.0` + `onnxruntime-web@1.30.0`。更换理由（提交信息原文要点）：
@@ -115,7 +138,7 @@
 npm install          # 受限环境可用 --ignore-scripts
 npm run dev          # http://localhost:5173
 npm run build        # 完整构建（含 WASM 复制 + 图标生成 + ONNX WASM 清理 + 产物校验）
-npm test             # 205 个单元测试
+npm test             # 200 个单元测试
 npm run typecheck    # 三个 TS project：app / node / worker
 ```
 
@@ -186,23 +209,26 @@ Cleaned 1 ONNX WASM file(s) from dist.
 | 翻译缓存键与降级逻辑 | 单元测试 |
 | PWA 产物完整性 | 产物门禁 + `sw.js` 全文核对 |
 | 构建产物正确性 | 负向测试确认门禁有效 |
-| PWA 陈旧 chunk 修复（导航路由改 NetworkFirst、不再有 `navigateFallback`） | 线上 `sw.js` 直接抓取核对 + `src/lib/pwaOffline.test.ts` 8 个用例（读 `vite.config.ts` 把 `NAVIGATION_CACHE_NAME` 钉死）；`src/lib/preloadRecovery.ts` 另有 11 个用例，已在 197 的基线里计入 |
+| PWA 陈旧 chunk 修复（导航路由改 NetworkFirst、不再有 `navigateFallback`） | 线上 `sw.js` 直接抓取核对 + `src/lib/pwaOffline.test.ts` 8 个用例（读 `vite.config.ts` 把 `NAVIGATION_CACHE_NAME` 钉死）；`src/lib/preloadRecovery.ts` 另有 11 个用例。**这两个文件共 19 个用例，已计入当前 200 个用例的基线** |
 
-#### 本轮（`aa8827a`）的实测证据
+#### 本轮（已提交 `f549173`、已部署）的实测证据
 
 | 检查 | 结果 |
 |---|---|
 | `npx tsc -b` | **exit 0** |
-| `npx vitest run` | **205 passed / 18 files**（本次工作前是 197 / 17） |
-| `npm run build` | `PWA v1.3.0  mode generateSW  precache 18 entries (3578.19 KiB)`；`Removed ort-wasm-simd-threaded.jsep-MDYUKy93.wasm (served from CDN at runtime)`；`[verify-dist] 构建产物校验通过` —— 产物共 **83 个文件 / 5.54 MB**；WASM 解码器 **7 个 / 合计 1.41 MB**；`sw.js` 已生成且包含导航回退 |
-| GitHub check-runs（commit `a766d3f`） | `Cloudflare Pages: success`、`verify: success` |
-| 线上 `sw.js`（直接抓 `https://universal-reader.pages.dev/sw.js`） | 含 `NetworkFirst`、含 `html-navigation`；**不含** `createHandlerBoundToURL` |
-| 线上 precache 清单 | 含 `assets/index-DewjVU_A.js`、`assets/pdfParser-BC0kRy96.js`、`assets/epubParser-BQ_LEFRG.js`、`assets/ocrEngine-3Cz6SoQl.js` |
-| 线上 `index.html` | 响应头 `Cache-Control: public, max-age=0, must-revalidate`，引用 `/assets/index-DewjVU_A.js` |
+| `npx vitest run` | **200 passed / 18 files**（上一轮 `aa8827a` 是 205 / 18：**−13** 删除的孤立用例、**+8** 新增的公式隐私用例） |
+| `npm run build` | `PWA v1.3.0  mode generateSW  precache 18 entries (3578.54 KiB)`；`Removed ort-wasm-simd-threaded.jsep-MDYUKy93.wasm (served from CDN at runtime)`；`[verify-dist] 构建产物校验通过` —— 产物共 **83 个文件 / 5.54 MB**；WASM 解码器 **7 个 / 合计 1.41 MB**；`sw.js` 已生成且包含导航回退 |
+| 本轮本地构建哈希 | `index-BBM5E4Bw.js` · `pdfParser-DJvvPlRl.js` · `epubParser-C4ddlQTO.js` · `ocrEngine-BiEnaltO.js` · `index-edxBkGh6.css` |
+| GitHub check-runs（commit `f549173`） | `Cloudflare Pages: **success**`、`verify: **success**` |
+| 线上 `sw.js`（直接抓 `https://universal-reader.pages.dev/sw.js`） | 含 `NetworkFirst`、含 `html-navigation`；**不含** `createHandlerBoundToURL` —— 导航修复未被本轮改动破坏 |
+| 线上 precache 清单（本轮重新抓取） | 含 `assets/index-BUj-R2J2.js`、`assets/pdfParser-BjFMW2CJ.js`、`assets/epubParser-zridiCjA.js`、`assets/ocrEngine-BItOXzga.js`；入口 CSS 仍是 `assets/index-C6dUSkX0.css` |
+| 线上 `index.html` | 响应头 `Cache-Control: public, max-age=0, must-revalidate`（上一轮实测，本轮未复测内容哈希） |
 
-> **本地哈希 ≠ 线上哈希**：同一份源码，本地构建出 `index-BWQq926L.js` / `pdfParser-qWOY3aHL.js`，
-> 线上是 `index-DewjVU_A.js` / `pdfParser-BC0kRy96.js`。Cloudflare 的构建与本地构建**不是逐字节可复现的**，
-> **绝不能用本地 `dist/` 里的文件名去推断线上资源名**（排查这次故障时踩过这个坑）。
+> **本地哈希 ≠ 线上哈希**：同一份源码，本轮本地构建出 `index-BBM5E4Bw.js` / `pdfParser-DJvvPlRl.js`，
+> 线上（`f549173` 的产物）是 `index-BUj-R2J2.js` / `pdfParser-BjFMW2CJ.js`。
+> Cloudflare 的构建与本地构建**不是逐字节可复现的**（连 CSS 哈希都不同：本地 `index-edxBkGh6.css`，
+> 线上 `index-C6dUSkX0.css`），**绝不能用本地 `dist/` 里的文件名去推断线上资源名**
+> （排查这次故障时踩过这个坑）。
 
 ### 4.2 已实现但**从未在真机上跑通**
 
@@ -210,7 +236,8 @@ Cleaned 1 ONNX WASM file(s) from dist.
 |---|---|---|
 | **扫描版 PDF 的 OCR（PaddleOCR）** | 引擎已在 `cdf2957` 整体重写，代码完整，**真实扫描件的识别准确率未验证** | **最高**。见下方说明 |
 | 真实浏览器里的离线 PWA 流程 | 产物正确、线上 `sw.js` 已核对，但**从未做过「加载 → 刷新一次 → DevTools 切 Offline → 刷新」** | 中 |
-| SimpleTex 公式 OCR 端到端 | 代码完整 | 中。需要 Worker 上配好 `SIMPLETEX_API_KEY`（否则恒 500） |
+| **公式上传开关的真机行为** | 开关的默认值与早退顺序只有**单元测试与源码断言**（`formulaOcrPrivacy.test.ts` 8 个用例）；「勾选 / 不勾选各跑一次真实 OCR」**从未做过** | 中。见 §5.8 |
+| SimpleTex 公式 OCR 端到端 | 代码完整，且现在是**默认关闭的显式开关**（不勾选根本不会调用）；线上 `/api/formula-ocr` 上一轮实测返回 **500** | 中。需要 Worker 上配好 `SIMPLETEX_API_KEY`（否则恒 500） |
 | 云端翻译（DeepL / OpenAI） | Worker 已部署，前端已配端点 | 中。未做端到端验证（需要有效的 DeepL key） |
 | 云端 TTS（Azure） | 代码完整 | 中。未验证 |
 | 「安装到桌面」 | manifest 正确 | 低 |
@@ -220,29 +247,46 @@ Cleaned 1 ONNX WASM file(s) from dist.
 > `cdf2957` 把 Tesseract.js 整条替换为 PaddleOCR，**上述失败模式随引擎一起消失，
 > 但也意味着「这套代码在真实扫描件上从没跑过」**。
 >
-> 另：`src/**/*.test.ts` 里没有任何 `katex` / `$$` 断言 —— **本轮新增的数学公式渲染没有自动化测试覆盖**。
+> 另：`src/**/*.test.ts` 里没有任何 `katex` / `$$` 断言 —— **`cdf2957` 新增的数学公式渲染至今没有自动化测试覆盖**。
 >
 > 如果你要接手，**第一件事应该是跑通一次真实扫描件的 OCR**（见 §8 R1），而不是加新功能。
 
-### 4.3 已知的未接线代码（技术债）
+### 4.3 已清理的死代码与技术债
+
+#### 本轮已清理（原先列在「技术债 / 待办」里，现在**已经不存在了**）
+
+| 位置 | 为什么是死代码 | 处置 |
+|---|---|---|
+| `src/lib/ocrWordExtraction.ts` | 从 **Tesseract v7 的嵌套输出**（`blocks[].paragraphs[].lines[].words[]`）提词的模块；换成 PaddleOCR 后 `ocrEngine.ts` 直接读平铺的 `result.results[]`，全仓库**只有它自己的测试** import 它 | **已删除** |
+| `src/lib/ocrWordExtraction.test.ts` | **13 个用例**在测一个没有生产调用方的模块 | **已删除**（本轮测试数 −13 就是它） |
+| `src/lib/pdfTextLayer.ts` | 定义了 `addTextLayerToPdf`，但全仓库无任何调用方（grep `addTextLayerToPdf` 只命中它自己的定义行） | **已删除** |
+| `pdf-lib@^1.17.1` | 删掉 `pdfTextLayer.ts` 后，`src/`、`worker/`、`scripts/` 里 grep `pdf-lib` / `PDFDocument` 零命中 | **已从 `package.json` 移除** |
+| `jszip@^3.10.2` | 全仓库没有任何 `from 'jszip'` / `require('jszip')` / `import('jszip')`；`epubParser.ts` 只在**注释**里提过 "JSZip"。`epubjs` 自己的 `dependencies` 里带 `jszip: ^3.7.1`，所以 `node_modules/jszip` 依然存在（已实测） | **已从 `package.json` 移除**（只是移除应用层冗余声明，不是从磁盘上删包） |
+| `rehype-katex@^7.0.1` | 全仓库无任何 import（`src/` 里 grep `rehype` 零命中）；公式渲染实际由 `BlockRow.tsx` 直接调 `katex.renderToString()` 完成 | **已从 `package.json` 移除** |
+
+> 删除前已逐个 grep 确认无生产引用。`src/lib/ocrTypes.ts` 第 11 行的注释原先把 `pdfTextLayer`
+> 列为需要类型定义的模块之一，该名称也已同步删除。
+> 依赖总数因此从 **29（19 + 10）降到 26（16 + 10）**；`npm install --ignore-scripts --no-audit --no-fund`
+> 实测输出 `removed 23 packages in 1s`（exit 0）。
+
+#### 仍未处理的遗漏
 
 | 位置 | 问题 | 建议 |
 |---|---|---|
-| `src/lib/pdfTextLayer.ts` | 定义了 `addTextLayerToPdf`，**无任何调用方**。功能是把 OCR 结果写回 PDF 文字层供外部阅读器使用 | 要么接线，要么删除。**当前是死代码** |
-| `src/lib/ocrWordExtraction.ts` | 从 **Tesseract v7** 输出结构里提词的模块，换引擎后**无任何生产调用方**（只有它自己的单测引用它） | 同上：要么删除，要么保留作历史（`ocrPostProcess` / `ocrTypes` 的注释也还写着 tesseract） |
 | OCR 语言选择器（`OcrLang` / `OCR_LANG_OPTIONS`） | UI 上仍有语言下拉框，但 `OcrEngine.initialize(_lang)` 的参数**已不被使用**（PaddleOCR 是全字典多语言） | 决定是让选择器影响 `model`，还是从 UI 上撤掉 |
-| `jszip` 依赖 | `package.json` 声明了，`epubParser.ts` 引用了，但实际解析走 `epubjs` | 确认后移除依赖 |
-| 旧的 `pdfWorker.ts` | 已删除，但 `docs/03` 里仍有它的历史记录 | 保留（是历史，不是错误） |
+| `src/lib/ocrPostProcess.ts` 里的历史叙述 | 描述「tesseract v7 把词输出从平铺改成嵌套」等过去故障成因的段落 | **保留**（是历史事实，不是错误） |
+| 旧的 `pdfWorker.ts` | 已删除，但 `docs/03` 里仍有它的历史记录 | **保留**（是历史，不是错误） |
 
 ### 4.4 最近 6 个提交做了什么（`cdf2957` → `aa8827a`，HEAD = `aa8827a`）
 
-按时间升序排列（作者字段为提交里的原始值）：
+按时间升序排列（作者字段为提交里的原始值）。**本轮的改动还在工作区里，没有提交，所以不在下表内**
+（本轮改动的实测数据见 §4.1）：
 
 | commit | 日期 | 作者 | 主题 | 实质改动 |
 |---|---|---|---|---|
 | `cdf2957` | 2026-10-06 21:30 | Mercuryof37 | feat: 数学公式渲染 + OCR 引擎升级为 PaddleOCR | 13 个文件、**+1245 / −322 行**。移除 `tesseract.js@^7.0.0`，新增 `ppu-paddle-ocr@6.6.0` + `onnxruntime-web@1.30.0`（模型 `V6_SMALL_MODEL`）；`src/lib/ocrEngine.ts` 重写（540 行，非空行 463）；新增 `katex@0.19.0` / `remark-math@6.0.0` / `rehype-katex@7.0.1`，Markdown 支持 `$行内$` 与 `$$块级$$` |
 | `3d4a2ad` | 2026-10-06 22:06 | Mercuryof37 | fix: header/footer filtering, superscript rendering, and display math | 三件事：① **页眉页脚过滤**（`src/lib/ocrPostProcess.ts`，`HEADER_FOOTER_MARGIN_RATIO = 0.05`、`HEADER_FOOTER_FONT_RATIO = 0.85`：落在页面上下各 5% 边距内、且字号小于全页字号中位数 0.85 倍的行判为页眉/页脚丢弃）；② 修掉「单行的 `$$...$$` 被当成行内公式」这个真实缺陷；③ 加入 Unicode 上下标检测，交给 KaTeX 渲染。**另外把 ONNX WASM 改成从 CDN 加载**并新增 `scripts/clean-onnx-wasm.mjs`（见 §3） |
-| `d7a5bae` | 2026-10-06 22:13 | Mercuryof37 | fix: switch SW to autoUpdate + skipWaiting to prevent stale chunk errors | `registerType: 'prompt' → 'autoUpdate'`、`skipWaiting: false → true`。**这是错误方向**（见 §5.6.2），而且留下了至今未解决的副作用（见 §5.7） |
+| `d7a5bae` | 2026-10-06 22:13 | Mercuryof37 | fix: switch SW to autoUpdate + skipWaiting to prevent stale chunk errors | `registerType: 'prompt' → 'autoUpdate'`、`skipWaiting: false → true`。**这是错误方向**（见 §5.6.2）；它留下的「prompt 模式 UI 永不触发」问题已在本轮拍板处理（保留 `autoUpdate` + 删除死 UI，见 §5.7） |
 | `5184bde` | 2026-10-06 22:20 | Mercuryof37 | feat: integrate SimpleTex formula OCR into recognition pipeline | 新增 `src/services/formulaOcrService.ts`（73 行）与 `worker/api-proxy.ts` 的 `/api/formula-ocr`；`ocrEngine.enhanceFormulaRegions()` 在检测到公式候选区域时**自动**把裁剪图发给第三方 SimpleTex。**这是本项目第一次把文档像素送出本机**（见 §1 T2） |
 | `a766d3f` | 2026-10-06 22:39 | Universal Reader Dev | fix(pwa): stop serving stale index.html so lazy chunks never 404 | 陈旧 chunk 故障的**真因修复**：去掉 `navigateFallback`，导航请求改 NetworkFirst（见 §5.6.3） |
 | `aa8827a` | 2026-10-06 22:51 | Universal Reader Dev | fix(pwa): seed the navigation cache so offline cold start works | 补上 NetworkFirst 引入的离线冷启动空档：新增 `src/lib/pwaOffline.ts` + 8 个单测（见 §5.6.4） |
@@ -304,7 +348,7 @@ StableAnchor  { prefix, suffix, offset, length, selectedText }
 
 | Store | 持久化 | 内容 |
 |---|---|---|
-| `settingsStore` | localStorage | 主题、字号、语言、朗读参数 |
+| `settingsStore` | localStorage | 主题、字号、语言、朗读参数、**公式上传开关（`formulaOcrEnabled`，默认 `false`）** |
 | `libraryStore` | 无（每次从 IndexedDB 重建） | 文档列表、当前文档、导入状态 |
 | `annotationsStore` | 无（同上） | 当前文档的批注 |
 
@@ -363,7 +407,7 @@ https://universal-reader.pages.dev/assets/pdfParser-CiRxJgol.js
 
 `d7a5bae` 把 `registerType` 改成 `autoUpdate`、`skipWaiting` 改成 `true` —— 这是**错误方向**：
 `skipWaiting` 管的是「新 SW 何时接管」，**管不了「已经接管的 SW 主动把旧 HTML 递给用户」**。用错了杠杆。
-（它带来的副作用至今未解决，见 §5.7。）
+（它留下的副作用是「代码按 prompt 模式写、实际跑 autoUpdate」，本轮已拍板收尾，见 §5.7。）
 
 #### 5.6.3 `a766d3f` 的修法：导航请求改走网络优先
 
@@ -405,39 +449,86 @@ NetworkFirst **只回退它自己的 `html-navigation` 缓存**，而这个缓�
 - 拆成独立模块的原因：`pwa.ts` 顶层 import 了 `virtual:pwa-register/react`，
   该虚拟模块 vitest 解析不了；把纯逻辑摘出来才能直接测
 
-### 5.7 ⚠️ 待决策：`registerType: 'autoUpdate'` 与 prompt 模式的设计自相矛盾（**未解决**）
+### 5.7 ✅ 已决策：保留 `autoUpdate`（本轮拍板，**不要再翻案**）
 
-**这一条不是「已修好」，是「已确认存在、等产品决策」。接手后请优先处理。**
+**这一条上一轮是「待决策」，本轮已拍板并落地：选 (b) 承认自动更新，把 prompt 模式那套
+永不触发的 UI 删掉。** 下面是决策依据与代价。
 
-现状：
+现状（`vite.config.ts` **未改动**）：
 
-| 位置 | 写的是什么 |
+| 位置 | 现在是什么 |
 |---|---|
-| `vite.config.ts` | `registerType: 'autoUpdate'` + `skipWaiting: true`（外加 `clientsClaim: true`） |
-| `src/lib/pwa.ts` / `src/components/PwaPrompt.tsx` | 按 **prompt 模式**设计：提示条 + 「有新版本可用 / 立即更新」按钮，注释里写明选 prompt 的理由 |
+| `vite.config.ts` | `registerType: 'autoUpdate'` + `skipWaiting: true` + `clientsClaim: true` |
+| `src/lib/pwa.ts` | `PwaState` 收窄为 **`{ offlineReady, dismiss }`**；顶部注释整段重写为记录本决策 |
+| `src/components/PwaPrompt.tsx` | 只剩两种提示：离线中 / 已可离线使用（`Banner` 的 `tone` 收窄为 **`'offline' \| 'ready'`**） |
 
-`pwa.ts` 里写明的设计理由是：
-「自动更新看起来更省事，但对本应用有害……**阅读类应用最不能容忍的就是"读到一半被打断"**」。
+#### 为什么 prompt 模式那套 UI 是死代码
 
 读 `node_modules/vite-plugin-pwa@1.3.0/dist/client/build/react.js` 可确认，`autoUpdate` 模式下
 编译期常量 `auto === true`，于是：
 
-1. `updateServiceWorker()` 的函数体是 `if (!auto) { sendSkipWaitingMessage?.() }`
+1. 第 22–27 行：`updateServiceWorker()` 的函数体是 `if (!auto) { sendSkipWaitingMessage?.() }`
    → **它是个空操作**；
-2. `onNeedRefresh` 只在 `else`（prompt 分支）里被调用 → **`needRefresh` 永远为 `false`**，
+2. 第 56–85 行：`onNeedRefresh` 只在 `else`（prompt 分支）里被调用 → **`needRefresh` 永远为 `false`**，
    `PwaPrompt.tsx` 的「有新版本可用 / 立即更新」提示条**永远不会出现**；
-3. `activated` 事件在 `event.isUpdate || event.isExternal` 为真时调用 `window.location.reload()`
+3. 第 42–50 行：`activated` 事件在 `event.isUpdate || event.isExternal` 为真时调用 `window.location.reload()`
    → **页面会自动重载**。
 
-也就是说：**当前行为恰好是 `pwa.ts` 明确反对的那一种**（用户读到一半被自动重载），
-而 UI 上留给用户的「选择权」是一条永不出现的提示条。
+所以 **prompt 模式留下的那段 UI 从来不会被触发**，留着只会让人误以为「用户可以选择何时更新」。
+本轮按「删掉而不是留着装作能用」处理：
 
-**两个可选方向**（都需要维护者拍板）：
+| 位置 | 删了什么 |
+|---|---|
+| `src/lib/pwa.ts` | `PwaState` 从 `{ needRefresh, offlineReady, update, dismiss }` 收窄为 **`{ offlineReady, dismiss }`**；删掉 `updateServiceWorker` 的解构与 `update()`；`dismiss()` 现在只清 `offlineReady` |
+| `src/components/PwaPrompt.tsx` | 删掉 `needRefresh` 分支（「有新版本可用」文案 + 「立即更新」按钮）与 `RefreshCw` 图标导入；`Banner` 的 `tone` 类型由 `'update' \| 'offline' \| 'ready'` 收窄为 **`'offline' \| 'ready'`**；组件注释里的三行优先级表改为两行，并加了一节「为什么没有『有新版本可用』」 |
 
-- (a) 回到 `prompt`：`registerType: 'prompt'` + `skipWaiting: false`，恢复提示条语义 ——
-  但要重新确认「旧 HTML 递出旧 chunk」的问题不会以别的形式回来（5.6.2 的根因是 `navigateFallback`，不是 `skipWaiting`）
-- (b) 承认自动更新：保留 `autoUpdate`，删掉 `PwaPrompt.tsx` 的更新提示分支与 `pwa.ts` 里与之冲突的注释，
-  并接受「可能打断阅读」
+#### 代价（必须说清楚）
+
+**页面会在无预警的情况下自动重载**：正在读的**滚动位置、展开的译文、进行中的 OCR 都会丢**。
+这恰好是上一轮 `pwa.ts` 注释里明确反对的那一种行为 —— 决策的理由是：这个代价换来了
+「陈旧 HTML 引用已删除 chunk」这类故障能自愈，而导航本身已走 NetworkFirst（§5.6.3），
+在线时拿到的始终是服务器上最新的 HTML。
+
+#### 将来若想减少打扰
+
+`vite-plugin-pwa` 提供了 `onNeedReload` 钩子：`registerSW({ onNeedReload })`，
+可以自己决定何时调用 `window.location.reload()`（例如「没有正在进行的 OCR 时才 reload」）。
+**这属于后续可选改进，本轮未做。**
+
+> **不要再做的事**：不要把「有新版本可用 / 立即更新」分支加回 `PwaPrompt.tsx`；
+> 在没有重新决策之前，不要动 `vite.config.ts` 的 `registerType` / `skipWaiting`。
+
+### 5.8 ✅ 已决策：公式云端识别改为默认关闭的显式开关（本轮拍板，**不要再翻案**）
+
+**这是全应用唯一会把文档内容送出本机的路径**，本轮把它从「自动触发、无法关闭」
+改为**显式 opt-in**，于是上一轮记的 T2 隐私张力**已收口**：默认路径恢复为「零上传」。
+
+#### 改了什么
+
+| 位置 | 改动 |
+|---|---|
+| `src/store/settingsStore.ts` | 新增字段 **`formulaOcrEnabled: boolean`，默认 `false`** 与 setter `setFormulaOcrEnabled`；interface 里带一段长注释说明为什么必须默认关闭 |
+| `src/lib/ocrEngine.ts` | `enhanceFormulaRegions()` 在 `words.length < 3` 判断之后、`detectFormulaRegions()` **之前**插入早退：`if (!useSettingsStore.getState().formulaOcrEnabled) return words;`（开关判断早于任何网络调用，不做无用功） |
+| `src/services/formulaOcrService.ts` | **第二道防线**：真正执行上传的 `recognizeFormula()` 自己也检查开关，关闭时**抛错拒绝**（而不是静默返回空串）。理由：只靠调用方自觉不够，将来任何新调用方忘了检查开关，就会静默把文档内容发出去 |
+| `src/components/FileUploadZone.tsx` | OCR 对话框「识别页数」下方新增复选框 **「上传公式区域以换取更准的公式」**，文案写明「默认关闭 —— 不打开就没有任何内容离开本机，公式会保留为 OCR 的原始文字（可能是乱码）」 |
+| `src/store/formulaOcrPrivacy.test.ts` | 新增 **8 个用例**：默认值为 `false`；setter 可开可关；引擎源码确实读取该设置；开关判断早于 `detectFormulaRegions(words)`；早于 `await recognizeFormula(`；关闭时是 `return words` 形式的提前返回；**服务端第二道防线关闭时拒绝执行（抛错而不是发请求）**；**服务源码里的开关检查早于 `await toPngBuffer(` 与 `await fetch(`** |
+
+#### 已收口的部分
+
+**默认关闭 → 一个字节都不外发、不发起任何网络请求**；上传只在用户识别前明确勾选时发生。
+「文档全程留在本机浏览器」这句承诺在默认路径上重新成立。
+
+#### 必须如实保留的残余点
+
+- 勾选后仍会把**页面局部像素**上传到第三方 `server.simpletex.cn`（经自建 Worker 转发）
+- 勾选后**需要联网**；离线时该步骤失败，并保留 OCR 的原始识别结果
+- Worker 仍需配置 `SIMPLETEX_API_KEY`，否则该端点返回 500（**线上实测当前就是 500**）
+- 开关**没有**在应用内提供「哪些内容被上传过」的审计视图
+- 开关在**真实浏览器里的行为未验证**（只有单元测试与源码断言）：勾选 / 不勾选各跑一次 OCR
+  至今没做过，见 §4.2
+
+> **不要再做的事**：不要把默认值改回 `true`；不要绕过开关直接调用 `recognizeFormula()`；
+> 不要删掉 `formulaOcrService.ts` 里那道「第二道防线」的检查。
 
 ---
 
@@ -488,8 +579,8 @@ NetworkFirst **只回退它自己的 `html-navigation` 缓存**，而这个缓�
 
 | 问题 | 影响 | 难度 |
 |---|---|---|
-| **⚠️ 待决策：PWA 更新模式自相矛盾**（`autoUpdate` 会静默自动重载，而代码按 prompt 模式写） | 用户可能**读到一半被强制刷新**，而「立即更新」提示条永不出现。见 §5.7 | **需要产品决策** |
-| **⚠️ 待决策：SimpleTex 自动上传页面局部像素** | 与「文档全程不离开浏览器」的宣传口径冲突，且触发是自动的。见 §1 T2 | **需要产品决策** |
+| **PWA 自动更新会在阅读中静默重载**（已决策保留 `autoUpdate`，见 §5.7） | 页面会**无预警自动重载**：滚动位置、展开的译文、进行中的 OCR 会丢。旧的「立即更新」提示条已删除（它在 autoUpdate 下永不触发） | **已接受**；可选缓解是将来接 `registerSW({ onNeedReload })` |
+| **公式云端识别默认关闭**（已决策，见 §5.8） | 默认路径零上传；但**勾选后仍会把页面局部像素上传第三方**，需要联网，且 Worker 未配 `SIMPLETEX_API_KEY` 时端点返回 500、应用内无「上传了什么」的审计视图 | **残余风险已接受**（不再需要产品决策） |
 | **OCR 未经真机验证**（PaddleOCR） | 真实扫描件上的中文识别准确率完全未知（见 §4.2） | 未知 |
 | **文字版 PDF 的页眉页脚仍未过滤** | `3d4a2ad` 的过滤只作用在 **OCR 后处理**（`ocrPostProcess.ts`）这条路径上；走文字层的 PDF 仍是每页的页眉页码变成正文块，一本 300 页的书会产生近千个碎片 | 低 |
 | **PDF 双栏排版串行** | 教材、论文的左右栏被读成一行，正文顺序完全错乱 | 中 |
@@ -511,10 +602,9 @@ NetworkFirst **只回退它自己的 `html-navigation` 缓存**，而这个缓�
 |---|---|
 | 手机端 OCR 体验差 | CPU 弱 + 后台降频 |
 | 浏览器原生 TTS 音色差异 | Windows 与 macOS 观感不一致 |
-| 无 OCR 结果写回 PDF | `pdfTextLayer.ts` 未接线 |
-| 无 PWA 更新日志 | 用户不知道更新了什么 —— 而按 §5.7 的现状，连「有新版本」的提示条也不会出现 |
+| 无 PWA 更新日志 | 用户不知道更新了什么。按 §5.7 的决策，连「有新版本」的提示条也不会有 —— 只剩无预警的自动重载 |
 | OCR 语言下拉框已无实际作用 | PaddleOCR 是全字典多语言，`OcrEngine.initialize(_lang)` 的参数已不被使用，但 UI 上仍显示语言选项 |
-| 源码注释残留 tesseract 表述（**部分已修**） | **会误导排查的那批已在本轮修正**：`src/lib/ocrTypes.ts`（含「语言包 22MB」文案）、`parsers/index.ts`、`parsers/pdfParser.ts`、`parsers/scannedPdfError.ts` 已改为 PaddleOCR 口径。**仍未改的是历史叙述**：`ocrWordExtraction.ts` / `ocrPostProcess.ts` 里描述「tesseract v7 把词输出从平铺改成嵌套」等过去故障成因的段落 —— 那是历史事实，保留是对的，但这两个文件本身已无生产调用方（见上一节） |
+| 源码注释残留 tesseract 表述（**部分已修**） | **会误导排查的那批已修正**：`src/lib/ocrTypes.ts`（含「语言包 22MB」文案）、`parsers/index.ts`、`parsers/pdfParser.ts`、`parsers/scannedPdfError.ts` 已改为 PaddleOCR 口径。**仍未改的是历史叙述**：`ocrPostProcess.ts` 里描述「tesseract v7 把词输出从平铺改成嵌套」等过去故障成因的段落 —— 那是历史事实，保留是对的（另一个同类文件 `ocrWordExtraction.ts` 已在本轮删除，见 §4.3） |
 
 ---
 
@@ -578,36 +668,37 @@ NetworkFirst **只回退它自己的 `html-navigation` 缓存**，而这个缓�
 
 ### R6 · 清理技术债（可随时做）
 
-- 决定 `pdfTextLayer.ts` 是接线还是删除
-- 决定 `ocrWordExtraction.ts`（Tesseract 专用，换引擎后无生产调用方）是删除还是归档
 - 决定 OCR 语言下拉框的去留（`initialize(_lang)` 已不使用该参数）
-- 把源码里残留的 tesseract 注释与文案一并更正 —— **本轮已完成会误导的那批**（`ocrTypes.ts` 的「语言包 22MB」、`parsers/index.ts`、`pdfParser.ts`、`scannedPdfError.ts`）；剩下的 `ocrWordExtraction.ts` / `ocrPostProcess.ts` 属历史故障叙述，建议随这两个文件的去留一起处理
-- 移除未使用的依赖：`jszip`（**已核实**：`epubParser.ts` 只在注释里提过它，实际是 `epubjs` 自己的 `dependencies` 里带了 `jszip ^3.7.1`，应用层无需再声明）与 `rehype-katex`（**已核实**：全仓库无任何 import，渲染走 `BlockRow.tsx` 直接调 `katex.renderToString()`）
+- 把源码里残留的 tesseract 注释与文案一并更正 —— **会误导的那批已在上一轮修正**（`ocrTypes.ts` 的「语言包 22MB」、`parsers/index.ts`、`pdfParser.ts`、`scannedPdfError.ts`）；剩下的 `ocrPostProcess.ts` 属历史故障叙述，**保留是对的**，不要为「一致性」把它删掉
 - 为 `db.ts` / `useVirtualWindow.ts` 补单元测试（当前无覆盖）
 - 为数学公式渲染补测试（`src/**/*.test.ts` 里没有任何 `katex` / `$$` 断言）
+
+> **本轮已完成，不要再列回待办**：`pdfTextLayer.ts` 与 `ocrWordExtraction.ts`
+> （连同它的 13 个孤立用例）已删除；`pdf-lib` / `jszip` / `rehype-katex` 三个未使用依赖已从
+> `package.json` 移除。清单与核实方式见 §4.3 的「本轮已清理」表。
 
 ### R7 · 其他
 
 `Markdown 表格渲染` · `书签功能` · `PWA 更新日志` · `E2E 测试（Playwright）`
 
-### R8 · 两个待决策（**上一次同步时就存在，至今未解决**）
+### R8 · 已拍板的三项决定（**不要再翻案**）
 
-**为什么单独列**：它们不是"写代码"能解决的，需要产品口径拍板，而当前状态是**自相矛盾**的。
+上一轮留下来的两个「待决策」加一项清理，**本轮已全部拍板并落地**，不再是待办。
+决策内容与代价见 §1 的「本轮三项决定」表；这里只列结论和「不要做什么」：
 
-1. **PWA 更新模式**（详见 §5.7）：配置是 `autoUpdate`（激活即自动 `window.location.reload()`、
-   `updateServiceWorker()` 是空操作、`needRefresh` 恒为 false），
-   而 `src/lib/pwa.ts` / `PwaPrompt.tsx` 是按 `prompt`（把更新时机交给用户）写的。
-   **在拍板之前，不要动 `vite.config.ts` 的 `registerType` / `skipWaiting`。**
-2. **SimpleTex 公式 OCR 的去留**（详见 §1 T2）：它会**自动**把页面局部像素上传第三方。
-   可选方向：(a) 保留，但加显式开关与首次知情提示；(b) 只对用户手动框选的区域调用；
-   (c) 移除以恢复"零上传"口径。
+| 决定 | 结论 | 不要做什么 |
+|---|---|---|
+| PWA 更新模式（§5.7） | **保留 `autoUpdate`**，删除 prompt 模式那套永不触发的提示 UI（`PwaState` 收窄为 `{offlineReady, dismiss}`、删掉 `needRefresh` 分支与 `RefreshCw`、`Banner` 的 `tone` 收窄为 `'offline' \| 'ready'`） | 不要把「有新版本可用 / 立即更新」加回来；不要动 `vite.config.ts` 的 `registerType` / `skipWaiting` |
+| 公式云端识别（§5.8） | **默认关闭的显式开关**：`settingsStore.formulaOcrEnabled`（默认 `false`）+ OCR 对话框复选框；`recognizeFormula()` 里还有第二道防线（关闭时抛错拒绝上传） | 不要把默认值改成 `true`；不要绕过开关直接调 `recognizeFormula()`；不要删掉第二道防线 |
+| 死代码与冗余依赖（§4.3） | `ocrWordExtraction.ts`（含 13 个孤立用例）、`pdfTextLayer.ts` **已删**；`pdf-lib` / `jszip` / `rehype-katex` **已从 `package.json` 移除** | 不要「以防万一」把它们加回依赖或恢复文件 |
 
 ### R9 · 剩余端到端验证（见 §4.2，全部**未验证**）
 
 1. **真实浏览器离线流程**：加载 → 刷新一次 → DevTools 切 Offline → 刷新（至今没做过）
-2. **云端翻译端到端**（需要有效的 DeepL key）
-3. **SimpleTex 公式 OCR 端到端**（需要 Worker 上配好 `SIMPLETEX_API_KEY`，否则恒返回 500）
-4. **PaddleOCR 在真实扫描件上的中文识别准确率**（Node 测试跑不了它，必须浏览器）
+2. **公式上传开关的真机行为**：勾选 / 不勾选各跑一次真实 OCR（只有单元测试与源码断言，没有真机验证）
+3. **云端翻译端到端**（需要有效的 DeepL key）
+4. **SimpleTex 公式 OCR 端到端**（需要 Worker 上配好 `SIMPLETEX_API_KEY`，否则恒返回 500）
+5. **PaddleOCR 在真实扫描件上的中文识别准确率**（Node 测试跑不了它，必须浏览器）
 
 ---
 
@@ -662,8 +753,8 @@ npx vitest run src/parsers/realPdf.manual.test.ts
 
 ### ⚠️ 本地构建哈希 ≠ 线上构建哈希
 
-同一份源码：本地是 `index-BWQq926L.js` / `pdfParser-qWOY3aHL.js`，
-线上是 `index-DewjVU_A.js` / `pdfParser-BC0kRy96.js`。
+同一份源码：本地是 `index-BBM5E4Bw.js` / `pdfParser-DJvvPlRl.js`，
+线上是 `index-BUj-R2J2.js` / `pdfParser-BjFMW2CJ.js`（连入口 CSS 都不同：本地 `index-edxBkGh6.css`，线上 `index-C6dUSkX0.css`）。
 Cloudflare 的构建与本地构建**不是逐字节可复现的**。
 排查线上问题时，**唯一可靠的做法是直接抓线上的 `sw.js` / `index.html`**，
 不要用本地 `dist/` 里的文件名去推断线上资源名（见 §4.1）。
@@ -695,8 +786,10 @@ npx wrangler secret put SIMPLETEX_API_KEY     # 加密环境变量，不要写�
 npx wrangler deploy
 ```
 
-- 缺失时 `/api/formula-ocr` **恒返回 500 `未配置 SIMPLETEX_API_KEY`**
+- 缺失时 `/api/formula-ocr` **恒返回 500 `未配置 SIMPLETEX_API_KEY`**（**线上实测当前就是 500**）
 - 未配置时 PaddleOCR 主流程仍然工作：公式部分退化为 PaddleOCR 的原始识别结果（只告警）
+- **本轮起该端点默认根本不会被调用**：前端开关 `formulaOcrEnabled` 默认 `false`，
+  只有用户在 OCR 对话框里勾选「上传公式区域以换取更准的公式」之后才会发起请求（见 §5.8）
 - 服务端上限 **2,700,000** 个 base64 字符（约 2MB），超出返回 **413**；
   客户端上限 `MAX_IMAGE_SIZE = 2_000_000` 字节
 
@@ -713,9 +806,9 @@ npx wrangler deploy
 
 ## 11. 给接手者的建议
 
-1. **先决策、再写码**：§5.7（PWA 更新模式）与 §1 T2（SimpleTex 上传）是两个**待决策**项，
-   现状自相矛盾。**拍板之前不要动 `vite.config.ts` 的 `registerType` / `skipWaiting`。**
-2. **先跑一遍 `npm run build` 和 `npm test`**，确认基线是绿的（应为 `205 passed / 18 files`）
+1. **先读 §1 的「本轮三项决定」**：上一轮的两个待决策（PWA 更新模式、公式上传）**已经拍板落地**，
+   不要再翻案。对应代码见 §5.7（保留 `autoUpdate`，代价是会自动重载）与 §5.8（公式上传默认关闭）。
+2. **先跑一遍 `npm run build` 和 `npm test`**，确认基线是绿的（应为 `200 passed / 18 files`）
 3. **再跑通一次真实扫描件的 OCR**（R1）—— 这是最大的未知数：PaddleOCR 在真实扫描件上从没跑过
 4. **读 `docs/03-踩坑与修复记录.md`** —— 13 个缺陷换来的经验都在那里
    （另加 §5.6 的 PWA 陈旧 chunk 故障，同类教训）
@@ -724,4 +817,7 @@ npx wrangler deploy
    这个项目最贵的几个缺陷都是"源码正确但产物错误"
 7. **碰到 PWA / 缓存 / 更新问题时，先读 §5.6–§5.7** ——
    这里有两条已经踩过的坑：`navigateFallback` 会永远返回预缓存的旧 HTML；
-   NetworkFirst 需要有人先把页面骨架写进缓存
+   NetworkFirst 需要有人先把页面骨架写进缓存。另外记住 §5.7 的结论：
+   本项目**故意**选择了会自动重载的 `autoUpdate`，且**没有**更新提示条
+8. **改完记得确认产物相关的数字**：本轮基线是 `200 passed / 18 files`、precache
+   `18 entries (3578.54 KiB)`、依赖 26 个；这些数字散落在本文多处，改动后要一起更新

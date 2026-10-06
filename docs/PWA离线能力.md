@@ -48,9 +48,9 @@ vite: ^3.1.0 || ^4.0.0 || ^5.0.0 || ^6.0.0 || ^7.0.0 || ^8.0.0
 | OCR 模型 | **运行时 CacheFirst** | HuggingFace CDN 上的 PaddleOCR 模型，`cacheName: 'ocr-models'` | 约 10 MB，不适合预缓存；用过一次后离线可用 |
 | ONNX Runtime WASM | **运行时 CacheFirst** | jsDelivr 上的 `ort-wasm*.(wasm\|js\|mjs)`，`cacheName: 'onnx-wasm'` | 约 28 MB，**超过 Cloudflare Pages 单文件 25 MB 上限**，只能在运行时从 CDN 取 |
 
-预缓存共 **18 项，3,578.19 KiB**（构建日志原文：`PWA v1.3.0  mode generateSW  precache 18 entries (3578.19 KiB)`）。
+预缓存共 **18 项，3,578.54 KiB**（构建日志原文：`PWA v1.3.0  mode generateSW  precache 18 entries (3578.54 KiB)`）。
 
-> **本次同步的变更说明**：原表中「OCR 语言包 | 运行时 CacheFirst | jsDelivr / unpkg / tessdata 的资源 | 中文包约 22 MB」这一行**已作废** —— `cdf2957` 移除了 `tesseract.js@^7.0.0`，改用 `ppu-paddle-ocr@^6.6.0` + `onnxruntime-web@^1.30.0`，语言包方案随之消失，替换为上面两行。原记录的「预缓存共 18 项，约 2.8 MB」体积也不再成立，现为实测的 3,578.19 KiB。
+> **本次同步的变更说明**：原表中「OCR 语言包 | 运行时 CacheFirst | jsDelivr / unpkg / tessdata 的资源 | 中文包约 22 MB」这一行**已作废** —— `cdf2957` 移除了 `tesseract.js@^7.0.0`，改用 `ppu-paddle-ocr@^6.6.0` + `onnxruntime-web@^1.30.0`，语言包方案随之消失，替换为上面两行。原记录的「预缓存共 18 项，约 2.8 MB」体积也不再成立，现为实测的 3,578.54 KiB。
 
 ### 2.3 刻意排除的内容
 
@@ -64,7 +64,7 @@ vite: ^3.1.0 || ^4.0.0 || ^5.0.0 || ^6.0.0 || ^7.0.0 || ^8.0.0
 | `jbig2_nowasm_fallback.js` | 142 KB | 同上 |
 
 合计约 **1 MB**。通过 `globIgnores` 排除出预缓存清单后，
-首访安装体积的实测值为 **3,578.19 KiB**（见 2.2）。
+首访安装体积的实测值为 **3,578.54 KiB**（见 2.2）。
 
 > 本次同步补记：`globIgnores` 现在还多排除一项 `**/ort-wasm*` —— ONNX Runtime 的 WASM 约 28 MB，
 > 由 `scripts/clean-onnx-wasm.mjs` 在构建后从 `dist/` 里删除，运行时改从 jsDelivr 取
@@ -75,25 +75,28 @@ vite: ^3.1.0 || ^4.0.0 || ^5.0.0 || ^6.0.0 || ^7.0.0 || ^8.0.0
 **注意**：它们仍会被复制到 `dist/`——真遇到不支持 WASM 的环境时，
 pdf.js 有机会去取兜底版本。排除的只是"预缓存"，不是"交付"。
 
-### 2.4 为什么用「提示更新」而不是「自动更新」
+### 2.4 更新策略：保留 `autoUpdate`（已决策）
 
-> ⚠️ **本节所述配置已经不再成立，且冲突未解决 —— 状态：未解决 / 待决策。**
->
-> `d7a5bae` 把 `vite.config.ts` 改成了 **`registerType: 'autoUpdate'` + `skipWaiting: true`**，
-> 而 `src/lib/pwa.ts` 与 `src/components/PwaPrompt.tsx` **仍然是按 prompt 模式设计的**。
-> 下面这段设计理由**依然有效、依然代表设计意图**，但代码现状与它相反。
-> 已验证的副作用与待决策项见 **2.8**。
+> ✅ **本节原先记录的是 prompt 方案的设计理由，并标注「与配置冲突、未解决 / 待决策」。
+> 决策已落地：保留 `autoUpdate`，不回到 prompt；那套在 `autoUpdate` 下永不触发的提示 UI
+> 已作为死代码删除。** 依据、删除清单与代价见 **2.8**。
 
 **原设计**是 `registerType: 'prompt'` + `skipWaiting: false`，
-新版本装好后处于 **waiting** 状态，**等用户点确认才接管**。
-
-自动更新（`autoUpdate` / `skipWaiting: true`）看起来更省事，但对本应用有害：
+新版本装好后处于 **waiting** 状态，**等用户点确认才接管**。理由是这样最不打扰阅读：
 
 > 用户可能正在读一份长文档。页面在毫无预警的情况下重载，
 > **滚动位置、展开的译文、正在进行的 OCR 全部丢失。**
 
-阅读类应用最不能容忍"读到一半被打断"。因此把更新时机交给用户：
-提示条出现，他可以选"立即更新"或稍后。
+**现在采用的是 `autoUpdate`**（`registerType: 'autoUpdate'` + `clientsClaim: true` + `skipWaiting: true`），
+即**接受上面这份代价**。这个代价没有被否认，而是被明确写进 `src/lib/pwa.ts` 的注释里：
+页面会在**无预警**的情况下重载，滚动位置 / 展开译文 / 进行中的 OCR 会丢。
+接受它的理由是：`autoUpdate` 下「陈旧 HTML 引用已删除 chunk」这类故障能够自愈，
+而导航本身也已走 NetworkFirst（见 2.5）。
+
+**将来若想减少打扰**：vite-plugin-pwa 提供 `onNeedReload` 钩子（`registerSW({ onNeedReload })`），
+可以自己决定何时调用 `window.location.reload()`，不必回到 prompt 模式。
+
+注意：`vite.config.ts` 的这部分配置**本轮未改动**；本轮改的是代码里那套与它矛盾的 UI（见 2.8）。
 
 ### 2.5 陈旧 chunk 故障：现象 → 真因 → 修法 → 证据
 
@@ -133,6 +136,7 @@ https://universal-reader.pages.dev/assets/pdfParser-CiRxJgol.js
 
 **`d7a5bae` 曾试图用 `autoUpdate` + `skipWaiting: true` 解决它，那是错误方向**：
 `skipWaiting` 管的是「新 SW 何时接管」，**管不了「已经接管的 SW 主动把旧 HTML 递给用户」**。用错了杠杆。
+（`autoUpdate` 后来在**另一个理由**下被保留 —— 见 2.4 与 2.8；那与本次修复无关。）
 
 **修法（`a766d3f`）**
 
@@ -166,11 +170,11 @@ https://universal-reader.pages.dev/assets/pdfParser-CiRxJgol.js
 
 线上 `index.html` 响应头实测为 `Cache-Control: public, max-age=0, must-revalidate`。
 
-线上 precache 清单包含 `assets/index-DewjVU_A.js`、`assets/pdfParser-BC0kRy96.js`、
-`assets/epubParser-BQ_LEFRG.js`、`assets/ocrEngine-3Cz6SoQl.js` 等。
+线上 precache 清单包含 `assets/index-BUj-R2J2.js`、`assets/pdfParser-BjFMW2CJ.js`、
+`assets/epubParser-zridiCjA.js`、`assets/ocrEngine-BItOXzga.js` 等。
 
 > **不要用本地 `dist/` 里的文件名去推断线上资源名。** 同一次提交，本地是
-> `index-BWQq926L.js` / `pdfParser-qWOY3aHL.js`，线上是 `index-DewjVU_A.js` / `pdfParser-BC0kRy96.js` ——
+> `index-BBM5E4Bw.js` / `pdfParser-DJvvPlRl.js`，线上是 `index-BUj-R2J2.js` / `pdfParser-BjFMW2CJ.js` ——
 > Cloudflare 的构建与本地构建**不是逐字节可复现的**。
 
 ### 2.6 离线兜底：`seedNavigationFallback()`（`aa8827a`）
@@ -225,27 +229,41 @@ https://universal-reader.pages.dev/assets/pdfParser-CiRxJgol.js
 
 配套 **11 个单测**。
 
-### 2.8 待决策：`autoUpdate` 的已验证副作用 —— **未解决**
+### 2.8 `autoUpdate` 的副作用与已删除的死 UI（已决策）
 
-> **状态：未解决，需要产品决策。** 不得按「已修好」理解。这一条与 2.5 的修复**互相独立**。
+> **状态：已决策。** 保留 `autoUpdate`；随它而来的那套提示 UI 已被**删除**，而不是留着装作能用。
+> 这一条与 2.5 的修复**互相独立**。
 
 `d7a5bae` 把 `registerType: 'prompt' → 'autoUpdate'`、`skipWaiting: false → true`，
-但**并没有解决它想解决的问题**（见 2.5：用错了杠杆），反而留下了下面这些**已验证的**副作用。
+但**并没有解决它想解决的问题**（见 2.5：用错了杠杆），留下的是下面这些**已验证的**行为。
 
 读 `node_modules/vite-plugin-pwa@1.3.0/dist/client/build/react.js` 可确认：
 `autoUpdate` 模式下编译期常量 `auto === true`，于是：
 
-| # | 已验证后果 |
-|---|---|
-| 1 | `updateServiceWorker()` 的函数体是 `if (!auto) { sendSkipWaitingMessage?.() }` → **它是个空操作** |
-| 2 | `onNeedRefresh` 只在 `else`（prompt 分支）里被调用 → **`needRefresh` 永远为 false**，于是 `PwaPrompt.tsx` 的「有新版本可用 / 立即更新」提示条**永远不会出现** |
-| 3 | `activated` 事件在 `event.isUpdate` 为真时调用 `window.location.reload()` → **页面会自动重载** |
+| # | 已验证后果 | 本轮处置 |
+|---|---|---|
+| 1 | `updateServiceWorker()` 的函数体是 `if (!auto) { sendSkipWaitingMessage?.() }` → **它是个空操作** | 已从 `src/lib/pwa.ts` 删除该解构与 `update()` |
+| 2 | `onNeedRefresh` 只在 `else`（prompt 分支）里被调用 → **`needRefresh` 永远为 false** | `PwaState` 收窄为 **`{ offlineReady, dismiss }`**；`dismiss()` 现在只清 `offlineReady` |
+| 3 | `activated` 事件在 `event.isUpdate` 为真时调用 `window.location.reload()` → **页面会自动重载** | 保留（这正是决策本身），代价见下 |
 
-这与 `src/lib/pwa.ts` 里写明的设计理由**直接冲突**（即 2.4 引用的那段：
-「阅读类应用最不能容忍的就是"读到一半被打断"」）。**现在的行为正是它要避免的那一种。**
+**删除的死代码清单**（`src/components/PwaPrompt.tsx`）：
 
-**待决策的二选一**：保留自动重载并删掉再也用不上的提示条 UI，
-还是回到 `prompt` 让用户自己决定更新时机。
+- 「有新版本可用 / 立即更新」分支（原渲染条件是 `if (needRefresh)`）与 `RefreshCw` 图标导入 —— 一起删掉；
+- `Banner` 的 `tone` 类型由 `'update' | 'offline' | 'ready'` 收窄为 **`'offline' | 'ready'`**；
+- 组件注释里的三行优先级表改为两行，并新增一节说明「为什么没有『有新版本可用』」。
+
+**必须写清的代价**：页面会在**无预警**的情况下自动重载 ——
+**滚动位置、展开的译文、正在进行的 OCR 全部丢失**。
+2.4 引用的那句「阅读类应用最不能容忍的就是"读到一半被打断"」依然是事实描述，
+只是本项目现在**明确接受**了它，理由是 `autoUpdate` 下陈旧 chunk 类故障能自愈
+（2.5；完整链路见 `02-技术路径.md` 6.4.4）。
+`src/lib/pwa.ts` 顶部那段「为什么选提示更新而不是自动更新」的注释已**整段重写**为记录本决策，
+**代码注释与配置不再互相矛盾**。
+
+**将来若想减少打扰**：用 `registerSW({ onNeedReload })` 自行决定何时 `window.location.reload()`，
+而不必回到 prompt 模式。
+
+`vite.config.ts` 本轮**未改动**，仍是 `registerType: 'autoUpdate'` + `clientsClaim: true` + `skipWaiting: true`。
 
 ---
 
@@ -301,7 +319,7 @@ https://universal-reader.pages.dev/assets/pdfParser-CiRxJgol.js
 页面还未处于它的控制之下。
 
 > **本次同步更正**：本段原先写的是「`skipWaiting: false` 意味着它要等到下一次导航才接管」。
-> 现在实际配置是 **`skipWaiting: true` + `clientsClaim: true`**（起因见 2.8 的待决策项），
+> 现在实际配置是 **`skipWaiting: true` + `clientsClaim: true`**（起因见 2.8），
 > 新 SW 会立即接管，"刷新一次"**不再是接管的前提**。
 > 保留这一步的理由变成了：让下面的核对能看到一个已激活、已在运行的 SW 状态。
 
@@ -324,7 +342,7 @@ https://universal-reader.pages.dev/assets/pdfParser-CiRxJgol.js
 ```
 F12 → Application → Cache Storage
 应看到这些缓存：
-  workbox-precache-*   ← 18 项应用壳（3,578.19 KiB）
+  workbox-precache-*   ← 18 项应用壳（3,578.54 KiB）
   html-navigation      ← 导航用 HTML。seedNavigationFallback() 会在注册后立即写入 '/'
   pdfjs-wasm           ← 首次导入 PDF 后出现
   ocr-models           ← 首次执行 OCR 后出现（从 HuggingFace CDN 取，约 10 MB）
@@ -362,19 +380,33 @@ iOS Safari：分享 →「添加到主屏幕」
 
 ## 五、已知限制
 
-> 已解决的与**未解决 / 待决策 / 未验证**的分开列 —— 每条都在「状态」列里标明它属于哪一类，不混写。
+> 已决策的、未验证的、以及固有边界 / 部署前提分开列 —— 每条都在「状态」列里标明它属于哪一类，不混写。
 
 | 限制 | 说明 | 状态 |
 |---|---|---|
 | **首次访问必须先联网** | 这是所有 PWA 的固有性质：Service Worker 本身需要下载 | 固有边界 |
-| 预缓存 **3,578.19 KiB** | 首次访问会下载这些内容。相比"离线打不开"，这个代价是值得的 | 固有边界 |
+| 预缓存 **3,578.54 KiB** | 首次访问会下载这些内容。相比"离线打不开"，这个代价是值得的 | 固有边界 |
 | **首次 OCR 必须先联网** | PaddleOCR 模型（约 10 MB，HuggingFace CDN）与 ONNX Runtime WASM（约 28 MB，jsDelivr）**都不在预缓存清单里**，只在运行时 CacheFirst 缓存 —— 即「**用过一次之后才能离线用**」。首次 OCR 的初始化上限是 180 秒 | 固有边界（随 `cdf2957` 新增） |
 | **国内可达性不保证** | 上述两个 CDN 在国内的可达性都不保证；改自托管会撞上 Cloudflare Pages 25 MB 单文件上限 | 新增的外部依赖风险 |
 | **`SIMPLETEX_API_KEY` 是部署前提** | Worker 未配置该加密环境变量时，`/api/formula-ocr` **恒返回 500**（`未配置 SIMPLETEX_API_KEY`）。此时 PaddleOCR 主流程仍工作，公式部分退化为原始识别结果 | 部署前提 |
-| **公式识别会把页面局部像素上传到第三方云** | `server.simpletex.cn`。这是本项目**第一次把文档内容送出本机**，与「文档全程留在本机」的宣传口径存在**直接张力**；触发是**自动的**（检测到公式候选就发），不需要用户逐次确认 | **未解决**，见 `04-已知限制与路线图.md` 的 1.4 与 R10 |
-| **更新策略自相矛盾** | 实际配置是 `autoUpdate` + `skipWaiting: true`，但 UI 与逻辑仍按 prompt 设计：提示条永不出现、SW 激活即自动重载，与 2.4 的设计理由冲突 | **未解决 / 待决策**，见 2.8 |
+| **公式识别会把页面局部像素上传到第三方云** | `server.simpletex.cn`。这是本项目**唯一**一条把文档内容送出本机的路径，但**已改为默认关闭的显式 opt-in**：`settingsStore.formulaOcrEnabled` 默认 `false`，不勾选时引擎在上传前早退、上传函数自身也拒绝，**不发起任何网络请求**。勾选后仍会上传到该第三方（经自建 Worker 转发）且需要联网 | **已决策**（默认关闭；残余点见下方说明） |
+| **页面会无预警自动重载** | 这是保留 `autoUpdate` 的代价：新 SW 激活即 `window.location.reload()`，滚动位置 / 展开译文 / 进行中的 OCR 会丢。原先按 prompt 设计的那套提示 UI 已删除（永不触发）。将来可用 `registerSW({ onNeedReload })` 减少打扰 | **已决策**（保留 `autoUpdate`），见 2.4 与 2.8 |
 | **真实浏览器离线行为未验证** | 加载 → 刷新一次 → DevTools 切 Offline → 刷新，**至今没有在真实硬件上做过** | **未验证**，见第四节开头 |
+| **公式上传开关的真机行为未验证** | 「默认关闭 / 勾选后才上传」目前只有单元测试（`src/store/formulaOcrPrivacy.test.ts`，8 个用例）与源码断言守着；**勾选 / 不勾选各跑一次 OCR** 还没在真实浏览器里做过 | **未验证** |
 | 开发环境不启用 SW | `devOptions.enabled: false`。开启它会让改动看不到效果——"明明改了代码却没生效"的经典来源 | 刻意设计 |
+
+**「公式识别」这一行的完整口径**（部署启用 Worker 后必须一并告知使用者）：
+
+- **开关**：OCR 对话框里「识别页数」下方的复选框「上传公式区域以换取更准的公式」，
+  绑定 `settingsStore.formulaOcrEnabled`，**默认 `false`**；
+- **两道防线**：① `ocrEngine.enhanceFormulaRegions()` 在 `detectFormulaRegions()` **之前**早退
+  （`if (!useSettingsStore.getState().formulaOcrEnabled) return words;`）；
+  ② 真正上传的 `formulaOcrService.recognizeFormula()` 自身也检查开关，关闭时**抛错拒绝**
+  （而不是静默返回空串）—— 理由是「只靠调用方自觉不够，将来任何新调用方忘了检查就会静默把文档内容发出去」；
+- **不勾选 = 零上传**：不发起任何网络请求，公式保留为 OCR 的原始文字（可能是乱码）；
+- **残余点**（仍然成立，不得淡化）：勾选后上传的目的地仍是第三方 `server.simpletex.cn`（经自建 Worker 转发）、
+  需要联网、Worker 未配 `SIMPLETEX_API_KEY` 时该端点 500（**线上实测当前就是 500**）、
+  **没有**「哪些内容被上传过」的审计视图。
 
 ---
 
@@ -385,18 +417,18 @@ iOS Safari：分享 →「添加到主屏幕」
 | `vite.config.ts` | `VitePWA(...)` 配置：manifest、workbox、预缓存与运行时缓存、导航路由（2.5）。**226 行** |
 | `scripts/make-icons.mjs` | 生成 3 个 PNG 图标（零依赖的 PNG 编码器） |
 | `scripts/clean-onnx-wasm.mjs` | 构建后把打进 `dist/` 的 ONNX WASM 删掉（约 28 MB，改由 jsDelivr 在运行时提供） |
-| `src/lib/pwa.ts` | Service Worker 注册与在线状态订阅；`onRegisteredSW` 里调用 `seedNavigationFallback()` |
+| `src/lib/pwa.ts` | Service Worker 注册与在线状态订阅；`onRegisteredSW` 里调用 `seedNavigationFallback()`。**`PwaState` 已收窄为 `{ offlineReady, dismiss }`**，顶部注释记录 autoUpdate 决策（2.8） |
 | `src/lib/pwaOffline.ts` | `NAVIGATION_CACHE_NAME` 与 `seedNavigationFallback()`：预置离线兜底页面（2.6） |
 | `src/lib/pwaOffline.test.ts` | **8 个用例**：把缓存名与 `vite.config.ts` 钉死，断言导航路由仍是 NetworkFirst |
 | `src/lib/preloadRecovery.ts` | 监听 `vite:preloadError`，chunk 错配时提示并自动重载一次（2.7） |
 | `src/lib/preloadRecovery.test.ts` | **11 个单测** |
-| `src/components/PwaPrompt.tsx` | 三种提示条：有新版本 / 已离线 / 已可离线使用。⚠️ **当前 `autoUpdate` 配置下「有新版本」分支永不触发**（见 2.8） |
+| `src/components/PwaPrompt.tsx` | **两种提示条**：已离线 / 已可离线使用（`Banner` 的 `tone` 收窄为 `'offline' \| 'ready'`）。「有新版本可用 / 立即更新」分支与 `RefreshCw` 图标**已删除** —— 它在 `autoUpdate` 下永不触发（见 2.8） |
 | `src/App.tsx` | 挂载提示条 |
 | `src/main.tsx` | 应用入口：`installPreloadErrorRecovery()` 在 React 挂载（`createRoot`）之前调用 |
 | `index.html` | iOS 需要的 `apple-*` meta（iOS 不读 manifest 的 display 与图标） |
 | `scripts/verify-dist.mjs` | 构建产物门禁：`sw.js` 存在与含导航回退、图标齐备、未预缓存无用解码器。实测输出：产物共 **83 个文件，5.54 MB**；WASM 解码器 **7 个，合计 1.41 MB** |
-| `worker/api-proxy.ts` | `/api/formula-ocr` 代理：转发到 `server.simpletex.cn`，需要 `SIMPLETEX_API_KEY`（358 行） |
-| `src/services/formulaOcrService.ts` | 客户端裁剪区域 → PNG → base64 上传（73 行） |
+| `worker/api-proxy.ts` | `/api/formula-ocr` 代理：转发到 `server.simpletex.cn`，需要 `SIMPLETEX_API_KEY`（453 行） |
+| `src/services/formulaOcrService.ts` | 客户端裁剪区域 → PNG → base64 上传（94 行）。**第二道防线**：`recognizeFormula()` 自己检查 `formulaOcrEnabled`，关闭时抛错拒绝上传；`src/store/formulaOcrPrivacy.test.ts`（8 个用例）钉住它 |
 
 **iOS 的坑**：Safari 不读 manifest 里的 `display` 与图标，
 必须用 `apple-mobile-web-app-capable` 与 `apple-touch-icon` 单独声明，
