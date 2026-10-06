@@ -77,10 +77,34 @@ export default defineConfig({
         // （workbox 对超限文件只打警告、不报错，很容易被忽略）
         maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
 
-        // 导航请求走预缓存的 index.html —— 这是「离线也能打开网站」的关键
-        navigateFallback: '/index.html',
-        // 不把 Worker 的 API 请求当成导航请求处理
-        navigateFallbackDenylist: [/^\/api\//],
+        /**
+         * ⚠️ 刻意**不设** navigateFallback
+         *
+         * ═══════════════════════════════════════════════════════════
+         * 这是「Failed to fetch dynamically imported module」的真因
+         * ═══════════════════════════════════════════════════════════
+         *
+         * `navigateFallback: '/index.html'` 会注册一条**预缓存路由**，
+         * 而预缓存路由的优先级高于网络 —— 也就是说
+         * **在线时也会返回缓存的旧 index.html**。
+         *
+         * 后果是一条隐蔽的失败链：
+         *
+         *   旧 index.html（缓存）
+         *     → 它引用的是旧构建的 chunk 哈希
+         *     → 新部署后服务器上那些文件已被删除
+         *     → 用户点击导入 PDF，动态 import 一个不存在的文件
+         *     → Failed to fetch dynamically imported module: .../pdfParser-CiRxJgol.js
+         *
+         * **页面本身正常、其他功能也正常，只有按需加载的那几个解析器会炸** ——
+         * 这正是它难以定位的原因。
+         *
+         * `skipWaiting` / `autoUpdate` 解决不了这个问题：它们管的是
+         * 「新 SW 何时接管」，而这里的旧 SW 是**主动**把旧 HTML 递给了用户。
+         *
+         * 改法见下方 runtimeCaching 里的导航路由：在线走网络、离线回退缓存。
+         */
+        navigateFallback: undefined,
 
         // 构建后立刻接管，避免用户第一次访问时 SW 还在等待
         clientsClaim: true,
@@ -89,6 +113,29 @@ export default defineConfig({
         cleanupOutdatedCaches: true,
 
         runtimeCaching: [
+          {
+            /**
+             * 导航请求（打开页面 / 刷新）：**在线优先，离线回退**。
+             *
+             * 这是修复的核心 —— 只要在线，就拿服务器上最新的 index.html，
+             * 它引用的 chunk 哈希必然与服务器上的资源一致，
+             * 从根本上消除「旧 HTML 找新 chunk」的错配。
+             *
+             * 离线时才回退到预缓存的 index.html，保住离线可打开的能力。
+             *
+             * 用 NetworkFirst 而不是 NetworkOnly：后者会让离线彻底打不开网站，
+             * 而「离线可用」是本项目的核心约束之一。
+             */
+            urlPattern: ({ request }: { request: Request }) => request.mode === 'navigate',
+            handler: 'NetworkFirst',
+            options: {
+              cacheName: 'html-navigation',
+              // 网络等待上限：超时就回退缓存，避免弱网下白屏很久
+              networkTimeoutSeconds: 3,
+              expiration: { maxEntries: 8 },
+              cacheableResponse: { statuses: [0, 200] },
+            },
+          },
           {
             // pdf.js 的 WASM 解码器（jbig2 / openjpeg / qcms）
             // 扫描版 PDF 依赖它们，缺失时页面会渲染成白页且不报错
