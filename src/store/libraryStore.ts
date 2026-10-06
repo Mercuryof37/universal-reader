@@ -1,4 +1,4 @@
-﻿import { create } from 'zustand';
+import { create } from 'zustand';
 import type { DocDocument } from '@/types/content';
 import { deleteDocument, listDocuments, loadDocument, saveDocument, type DocumentRow } from '@/lib/db';
 import { parseFiles, isScannedPdfError } from '@/parsers';
@@ -191,6 +191,21 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
           lang,
           maxPages,
           onProgress: (p: OcrProgress) => set({ ocrProgress: p }),
+          /**
+           * 中途落盘。
+           *
+           * 没有它，整次 OCR 的结果只活在内存里，直到最后一页跑完才写库 ——
+           * 一本几百页的书要跑十几分钟，这期间任何中断（尤其是本应用
+           * `autoUpdate` 的 Service Worker 会在新版本部署后**自动重载页面**）
+           * 都会让整次扫描无声无息地消失：没有报错、没有摘要、书库里也没有条目。
+           *
+           * 只刷新书库列表，**不**设置 currentDocId ——
+           * 扫描还在进行，界面应停在进度视图，不该突然跳到阅读器。
+           */
+          onCheckpoint: async (snapshot) => {
+            await saveDocument(snapshot);
+            set({ documents: await listDocuments() });
+          },
         },
         pending.metaTitle,
         pending.metaAuthor,

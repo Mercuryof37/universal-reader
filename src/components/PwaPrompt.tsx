@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
-import { Download, WifiOff, X } from 'lucide-react';
+import { Download, RefreshCw, WifiOff, X } from 'lucide-react';
 import { subscribeOnline, usePwa } from '@/lib/pwa';
+import { useLibraryStore } from '@/store/libraryStore';
 
 /**
  * PWA 状态提示条。
@@ -25,18 +26,52 @@ import { subscribeOnline, usePwa } from '@/lib/pwa';
  * 而不是留在这里装作能用。代价是页面会在无预警时自动重载。
  */
 export function PwaPrompt() {
-  const { offlineReady, dismiss } = usePwa();
+  const { offlineReady, updatePending, dismiss, reloadNow } = usePwa();
+  const importing = useLibraryStore((s) => s.importing);
   const [online, setOnline] = useState(() =>
     typeof navigator === 'undefined' ? true : navigator.onLine,
   );
 
   useEffect(() => subscribeOnline(setOnline), []);
 
-  // 离线状态优先于「可离线使用」提示：后者在离线时已经没有意义
+  /**
+   * 新版本已就绪、但刷新被推迟时：等导入/OCR 一结束就自动刷新。
+   *
+   * 放在这里而不是在 `onNeedReload` 里轮询，是因为 `importing` 是 store 状态，
+   * 组件天然会在它变化时重渲染。之所以要「结束就刷新」而不是一直等用户点：
+   * 用户选的就是 autoUpdate，推迟只是为了**不毁掉正在进行的工作**，
+   * 工作一结束就该回到原本的自动更新语义。
+   * 此时结果已经落盘（中途检查点 + 最终保存），刷新不会丢东西。
+   */
+  useEffect(() => {
+    if (updatePending && !importing) reloadNow();
+  }, [updatePending, importing, reloadNow]);
+
+  // 离线状态优先于其他提示：它描述的是此刻能不能用
   if (!online) {
     return (
       <Banner tone="offline" icon={<WifiOff className="h-4 w-4" aria-hidden />}>
         已离线 — 已缓存的页面与已导入的文档仍可正常阅读
+      </Banner>
+    );
+  }
+
+  // 优先于「已可离线使用」：正在等的是刷新，用户需要知道为什么还没刷新
+  if (updatePending) {
+    return (
+      <Banner tone="ready" icon={<Download className="h-4 w-4" aria-hidden />}>
+        <span>新版本已就绪</span>
+        <button
+          type="button"
+          onClick={reloadNow}
+          className="ml-2 inline-flex items-center gap-1 rounded-md bg-[var(--reader-accent)] px-2 py-0.5 text-xs font-medium text-[var(--reader-bg)]"
+        >
+          <RefreshCw className="h-3 w-3" aria-hidden />
+          立即刷新
+        </button>
+        <span className="ml-2 text-[var(--reader-muted)]">
+          正在识别，完成后会自动刷新
+        </span>
       </Banner>
     );
   }

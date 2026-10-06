@@ -22,15 +22,27 @@
  * （`registerSW({ onNeedReload })`），可以自己决定何时调用 `window.location.reload()`。
  */
 
+import { useState } from 'react';
 import { useRegisterSW } from 'virtual:pwa-register/react';
 
 import { seedNavigationFallback } from '@/lib/pwaOffline';
+import { useLibraryStore } from '@/store/libraryStore';
 
 export interface PwaState {
   /** 应用已可离线使用 */
   offlineReady: boolean;
+  /**
+   * 新版本已就绪，但因为正在导入/OCR 而**推迟了自动刷新**。
+   *
+   * 有这个状态是因为 `autoUpdate` 的默认行为会直接 `location.reload()` ——
+   * 而导入与 OCR 的结果在完成前只存在内存里，刷新即全部丢失，
+   * 用户看到的是「扫描完了，但什么都没有」。见 `onNeedReload` 的说明。
+   */
+  updatePending: boolean;
   /** 关闭「已可离线使用」提示（本次会话不再询问，直到下次有新版） */
   dismiss: () => void;
+  /** 立刻刷新以应用新版本（仅在 updatePending 时由用户主动触发） */
+  reloadNow: () => void;
 }
 
 /**
@@ -43,11 +55,16 @@ export function usePwa(): PwaState {
   if (typeof window === 'undefined' || !('serviceWorker' in navigator)) {
     return {
       offlineReady: false,
+      updatePending: false,
       dismiss: () => {},
+      reloadNow: () => {},
     };
   }
 
   // eslint-disable-next-line react-hooks/rules-of-hooks -- 上面的分支只在非浏览器环境命中
+  const [updatePending, setUpdatePending] = useState(false);
+
+  // eslint-disable-next-line react-hooks/rules-of-hooks -- 同上
   const {
     offlineReady: [offlineReady, setOfflineReady],
   } = useRegisterSW({
@@ -59,12 +76,36 @@ export function usePwa(): PwaState {
       // 注册成功后趁在线把页面骨架写进导航缓存，补上离线冷启动的空档
       void seedNavigationFallback();
     },
+    /**
+     * 新版本接管时的刷新时机。
+     *
+     * 不传这个回调，`vite-plugin-pwa` 在 `autoUpdate` 下会直接
+     * `window.location.reload()` —— **无预警**。
+     *
+     * 这正是用户报过的故障：扫描版 PDF 识别到一半，新版本部署上线，
+     * 页面被自动刷新，而 OCR 结果当时还只在内存里，于是
+     * 「扫描完了，看不到文档，书库里也没有新条目，而且没有任何报错」。
+     *
+     * 所以：**正在导入或 OCR 时推迟刷新**，交给界面提示 + 空闲后再刷新。
+     * 其余情况保持 autoUpdate 原有的立即刷新语义。
+     */
+    onNeedReload() {
+      if (useLibraryStore.getState().importing) {
+        setUpdatePending(true);
+        return;
+      }
+      window.location.reload();
+    },
   });
 
   return {
     offlineReady,
+    updatePending,
     dismiss: () => {
       setOfflineReady(false);
+    },
+    reloadNow: () => {
+      window.location.reload();
     },
   };
 }

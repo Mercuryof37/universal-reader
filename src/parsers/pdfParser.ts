@@ -4,7 +4,7 @@ import { checkPdfSupport } from '@/lib/polyfills';
 import { errorReport, describeUnknownError } from '@/lib/diagnostics';
 import { createPdfDocumentParams, pdfjsLib } from '@/parsers/pdfRuntime';
 import { ScannedPdfError } from '@/parsers/scannedPdfError';
-import { OCR_CONTINUE_ON_PAGE_ERROR, OCR_RENDER_DPI, resolvePageLimit } from '@/lib/ocrTypes';
+import { OCR_CONTINUE_ON_PAGE_ERROR, OCR_RENDER_DPI, resolvePageLimit, shouldCheckpoint } from '@/lib/ocrTypes';
 import type { OcrLang, OcrProgress } from '@/lib/ocrTypes';
 import { ocrResultToBlocks } from '@/lib/ocrPostProcess';
 
@@ -382,6 +382,20 @@ export interface OcrParseOptions {
   /** 最多处理多少页（从第 1 页起）。不传则处理全部 */
   maxPages?: number;
   onProgress?: (p: OcrProgress) => void;
+  /**
+   * 每识别完若干页（见 `OCR_CHECKPOINT_EVERY_PAGES`）回调一次，
+   * 传入**到目前为止**的完整文档快照，供调用方落盘。
+   *
+   * 为什么需要它：整次 OCR 原本只在最后一页跑完后才写库，
+   * 中途任何中断（页面自动重载、误关标签页、崩溃）都会让整次扫描
+   * 无声无息地全部丢失。有了检查点，丢失窗口从"整次扫描"缩小到"最多几页"。
+   *
+   * 快照里的 `docId` 在整个过程中保持不变，因此反复写入是**覆盖**同一条记录，
+   * 不会产生重复文档。
+   *
+   * 回调抛错不会中断扫描（只告警）—— 落盘是尽力而为的保障，不该反过来毁掉任务。
+   */
+  onCheckpoint?: (snapshot: DocDocument) => void | Promise<void>;
 }
 
 /** 单页 OCR 失败时的记录 */
@@ -427,7 +441,7 @@ export async function ocrParsePdf(
   metaTitle: string,
   metaAuthor: string,
 ): Promise<OcrParseResult> {
-  const { lang, maxPages, onProgress } = options;
+  const { lang, maxPages, onProgress, onCheckpoint } = options;
 
   // 打开文档：这一步失败的原因与解析路径相同（加密 / 损坏 / 缺 API）
   let doc: Awaited<ReturnType<typeof pdfjsLib.getDocument>['promise']>;
@@ -458,10 +472,33 @@ export async function ocrParsePdf(
   let pagesProcessed = 0;
   let pagesSkipped = 0;
 
+  /**
+   * 文档 id 在循环**之前**就定下来。
+   *
+   * 原来它是在最后 `buildDocument({ docId: uid() })` 时才生成的，
+   * 于是中途落盘根本不可能 —— 每次检查点都会造出一个新 id，
+   * 结果是书库里堆一堆半成品而不是覆盖同一条。
+   */
+  const docId = uid();
+
+  /** 用当前的累积结果组装一次快照（供检查点落盘） */
+  const snapshot = (): DocDocument =>
+    buildDocument({
+      docId,
+      fileName,
+      format: 'pdf',
+      blocks: allDrafts,
+      title: metaTitle || undefined,
+      author: metaAuthor || undefined,
+      sizeBytes: fileSize,
+    });
+
   for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
     onProgress?.({ pageNum, total: totalPages, status: 'recognizing' });
 
     let pageCanvas: HTMLCanvasElement | undefined;
+    /** 本页是否真的产出了内容块（决定这一页要不要触发一次中途落盘） */
+    let blocksThisPage = false;
     try {
       const page = await doc.getPage(pageNum);
       const viewport = page.getViewport({ scale });
@@ -511,6 +548,7 @@ export async function ocrParsePdf(
         if (blocks.length) {
           allDrafts.push(...blocks);
           pagesProcessed++;
+          blocksThisPage = true;
         } else {
           // 关键区分：OCR 确实跑了但没提取到词，与"页面本身是空白"是两回事。
           // 曾经两者都被计入 skipped 且不报错，导致
@@ -534,6 +572,17 @@ export async function ocrParsePdf(
       }
 
       page.cleanup();
+
+      // 中途落盘：丢失窗口从"整次扫描"缩小到"最多 OCR_CHECKPOINT_EVERY_PAGES 页"。
+      // 只在这一页确实产出了内容时才写，空白页/失败页没必要触发一次写入。
+      if (onCheckpoint && blocksThisPage && shouldCheckpoint(pageNum, totalPages)) {
+        try {
+          await onCheckpoint(snapshot());
+        } catch (err) {
+          // 落盘失败不能反过来毁掉整次扫描 —— 告警后继续
+          console.warn(`[ocrParsePdf] 第 ${pageNum} 页后落盘失败（继续识别）：`, err);
+        }
+      }
     } catch (err) {
       // 关键：单页失败不中断整个任务。
       // 记录页码与原因，继续下一页 —— 否则 833 页的书会因一页坏掉而前功尽弃。
@@ -587,8 +636,10 @@ export async function ocrParsePdf(
     );
   }
 
+  // 复用循环前定下的 docId：中途检查点已经用这个 id 写过若干次，
+  // 最后一次写入必须是**覆盖**它，否则书库里会留下一个半成品 + 一个完整版
   const resultDoc = buildDocument({
-    docId: uid(),
+    docId,
     fileName,
     format: 'pdf',
     blocks: allDrafts,

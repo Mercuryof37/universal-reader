@@ -118,3 +118,37 @@ export function resolvePageLimit(totalPages: number, maxPages?: number): number 
   if (!Number.isFinite(maxPages) || maxPages <= 0) return totalPages;
   return Math.min(Math.floor(maxPages), totalPages);
 }
+
+/**
+ * 每隔多少页把已识别的结果落盘一次。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么必须有「中途落盘」这件事
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 原先整次 OCR 的结果只存在内存里，**直到最后一页跑完才写 IndexedDB**。
+ * 一本几百页的扫描书要跑十几分钟，这十几分钟里任何中断 ——
+ * 页面刷新、误关标签页、浏览器崩溃、内存不足 ——
+ * 都会让整次扫描**无声无息地全部丢失**：没有报错、没有摘要、书库里也没有条目，
+ * 用户完全不知道发生了什么。
+ *
+ * 这不是假想：本应用用 `autoUpdate` 的 Service Worker，
+ * 新版本部署后页面会**自动重载**，正好会在扫描途中把内存里的结果清空。
+ *
+ * 取 5 页：一次 IndexedDB 写入的代价远小于一页 OCR，
+ * 但丢失窗口从"整次扫描"缩小到"最多 5 页"。
+ */
+export const OCR_CHECKPOINT_EVERY_PAGES = 5;
+
+/**
+ * 当前这一页处理完后，是否应该把结果落盘。
+ *
+ * 纯函数，便于单测 —— 落盘时机的边界（第一页、末页、不足一个间隔的小任务）
+ * 是最容易写错又最不容易发现的地方。
+ */
+export function shouldCheckpoint(pageNum: number, totalPages: number): boolean {
+  if (!Number.isFinite(pageNum) || pageNum <= 0) return false;
+  // 末页一定落盘：否则不足一个间隔的任务（比如试跑 3 页）永远等不到检查点
+  if (pageNum >= totalPages) return true;
+  return pageNum % OCR_CHECKPOINT_EVERY_PAGES === 0;
+}
