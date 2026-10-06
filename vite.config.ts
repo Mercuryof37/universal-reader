@@ -29,7 +29,7 @@ export default defineConfig({
      *   不适合预缓存，用 CacheFirst 让「用过一次之后离线也能用」。
      */
     VitePWA({
-      registerType: 'prompt',
+      registerType: 'autoUpdate',
       injectRegister: null,
       includeAssets: ['icons/*.png'],
 
@@ -84,7 +84,7 @@ export default defineConfig({
 
         // 构建后立刻接管，避免用户第一次访问时 SW 还在等待
         clientsClaim: true,
-        skipWaiting: false,
+        skipWaiting: true,
 
         cleanupOutdatedCaches: true,
 
