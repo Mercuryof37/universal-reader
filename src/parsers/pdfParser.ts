@@ -221,7 +221,7 @@ function median(values: number[]): number {
 
 /**
  * 扫描版专用错误从独立模块重新导出，保持既有调用路径可用。
- * 定义放在 scannedPdfError.ts 是为了避免"为拿一个错误类而拖进整个 pdfjs + tesseract 依赖树"。
+ * 定义放在 scannedPdfError.ts 是为了避免"为拿一个错误类而拖进整个 pdfjs + PaddleOCR 依赖树"。
  */
 export { ScannedPdfError, isScannedPdfError } from '@/parsers/scannedPdfError';
 
@@ -443,7 +443,8 @@ export async function ocrParsePdf(
   const totalPages = resolvePageLimit(doc.numPages, maxPages);
   const scale = OCR_RENDER_DPI / 72;
 
-  // OCR 引擎按需加载：tesseract.js 体积很大，只有真的执行 OCR 时才需要它。
+  // OCR 引擎按需加载：PaddleOCR 依赖的 ONNX Runtime WASM 约 28MB、模型约 10MB，
+  // 体积依然很大，只有真的执行 OCR 时才需要它。
   const { ocrEngine, analyzeCanvasInk } = await import('@/lib/ocrEngine');
   await ocrEngine.initialize(lang);
 

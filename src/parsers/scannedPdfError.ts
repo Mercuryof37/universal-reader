@@ -7,7 +7,7 @@
  *
  * 这个类原先定义在 `pdfParser.ts` 里，而 `parsers/index.ts` 与
  * `store/libraryStore.ts` 都需要 import 它来判断"是不是扫描件"。
- * 问题在于：pdfParser 依赖 pdfjs，而 pdfParser 又依赖 tesseract.js（OCR），
+ * 问题在于：pdfParser 依赖 pdfjs，而 pdfParser 又依赖 PaddleOCR（OCR），
  * 于是"只想要一个错误类"的模块被迫把这两个大依赖一起静态引入 ——
  * 首屏包从 68KB 涨到 201KB（gzip），按需加载的优化被一个 import 语句抵消掉了。
  *

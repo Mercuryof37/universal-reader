@@ -4,7 +4,7 @@ import { guessExtension } from '@/lib/utils';
 import { MarkdownParser } from '@/parsers/markdownParser';
 import { TextParser } from '@/parsers/textParser';
 // 从独立模块导入，而不是从 pdfParser：
-// pdfParser 静态依赖 pdfjs、动态依赖 tesseract.js（OCR）。
+// pdfParser 静态依赖 pdfjs、动态依赖 PaddleOCR（OCR）。
 // 仅仅为了拿到这个错误类而 import pdfParser，会把两个大依赖拖进首屏包
 // —— 实测主包会从 68KB 涨到 201KB（gzip），按需加载的优化被一个 import 抵消。
 import { isScannedPdfError } from '@/parsers/scannedPdfError';

@@ -5,7 +5,8 @@
  * 为什么这些定义不放在 ocrEngine.ts 里
  * ═══════════════════════════════════════════════════════════════
  *
- * `ocrEngine.ts` 静态依赖 tesseract.js（含 WASM，中文语言包 22MB）。
+ * `ocrEngine.ts` 静态依赖 PaddleOCR（`ppu-paddle-ocr` + `onnxruntime-web`；
+ * 模型约 10MB 从 HuggingFace CDN 下载，ONNX Runtime WASM 约 28MB 从 CDN 加载）。
  * 但有两处只想要"类型或常量"：
  * - `FileUploadZone` 需要语言下拉框的选项列表；
  * - `pdfParser` / `ocrPostProcess` / `pdfTextLayer` 需要类型定义。
@@ -29,7 +30,10 @@ export const OCR_LANG_OPTIONS: { value: OcrLang; label: string }[] = [
 
 /** OCR 流程的阶段，供界面展示进度文案 */
 export type OcrStatus =
-  /** 首次下载语言包并初始化 WASM（中文包约 22MB，这一步最慢） */
+  /**
+   * 首次下载模型并初始化 ONNX Runtime WASM
+   * （PP-OCRv6 small 模型约 10MB 来自 HuggingFace CDN，ONNX WASM 约 28MB 来自 jsDelivr，这一步最慢）
+   */
   | 'initializing'
   | 'recognizing'
   | 'complete';
@@ -56,7 +60,7 @@ export interface OcrPageResult {
   /** 该页平均置信度 0-100，低于阈值时应提示用户核对 */
   avgConfidence: number;
   /**
-   * 整页纯文本。tesseract 无论哪种输出结构都会提供它，
+   * 整页纯文本。PaddleOCR 的结果里也始终提供它，
    * 因此是"识别出了文字但取不到坐标"时的兜底，也是重要诊断信息。
    */
   pageText?: string;
