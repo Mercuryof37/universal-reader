@@ -17,6 +17,8 @@
 
 import { useRegisterSW } from 'virtual:pwa-register/react';
 
+import { seedNavigationFallback } from '@/lib/pwaOffline';
+
 export interface PwaState {
   /** 有新版在等待接管 */
   needRefresh: boolean;
@@ -53,6 +55,10 @@ export function usePwa(): PwaState {
     onRegisterError(error: unknown) {
       // 注册失败不影响使用，只是没有离线能力 —— 不打扰用户，但要留痕
       console.warn('[pwa] Service Worker 注册失败：', error);
+    },
+    onRegisteredSW() {
+      // 注册成功后趁在线把页面骨架写进导航缓存，补上离线冷启动的空档
+      void seedNavigationFallback();
     },
   });
 

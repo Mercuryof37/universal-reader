@@ -24,9 +24,9 @@ export default defineConfig({
      * 缓存策略的分工：
      * - **预缓存**（precache）：构建产物里的入口 chunk、样式、图标。
      *   这些是「能打开页面」的最小集合，必须离线可用。
-     * - **运行时缓存**（runtimeCaching）：pdfjs 的 WASM 解码器与
-     *   tesseract 的语言包。它们的体积大（合计约 25MB）、按需下载，
-     *   不适合预缓存，用 CacheFirst 让「用过一次之后离线也能用」。
+     * - **运行时缓存**（runtimeCaching）：pdfjs 的 WASM 解码器、
+     *   PaddleOCR 的模型与 ONNX Runtime WASM。它们的体积大（合计数十 MB）、
+     *   按需下载，不适合预缓存，用 CacheFirst 让「用过一次之后离线也能用」。
      */
     VitePWA({
       registerType: 'autoUpdate',
