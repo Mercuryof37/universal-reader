@@ -86,11 +86,46 @@ describe('工作结束后自动刷新（否则新版本可能永远不生效）'
     expect(PROMPT_SRC).toMatch(/reloadNow\(\)/);
   });
 
+  it('离线时不自动刷新 —— 此时界面显示的是「已离线」，重载只会莫名其妙', () => {
+    /**
+     * 这是一个真实存在过的缺陷：自动刷新的 effect 原先只判断
+     * `updatePending && !importing`，**没有判断是否在线**。
+     * 于是「推迟期间断网，然后识别结束」会导致一次毫无意义的离线重载 ——
+     * 而且用户此刻看到的是优先级更高的「已离线」提示条，
+     * 根本不知道有更新在等着。
+     */
+    expect(PROMPT_SRC).toMatch(/updatePending\s*&&\s*!importing\s*&&\s*online/);
+    // online 必须在依赖数组里，否则状态变化不会重新触发
+    expect(PROMPT_SRC).toMatch(/\},\s*\[[^\]]*\bonline\b[^\]]*\]\)/);
+  });
+
   it('推迟期间界面上有明确提示，而不是让用户以为卡住了', () => {
     // 文案必须同时说明「有新版本」和「什么时候会刷新」
     expect(PROMPT_SRC).toMatch(/新版本已就绪/);
     expect(PROMPT_SRC).toMatch(/完成后会自动刷新/);
     // 并且给用户一个自己动手的出口
     expect(PROMPT_SRC).toMatch(/立即刷新/);
+  });
+
+  it('注释里的优先级表与代码顺序一致（离线 → 刷新 → 可离线）', () => {
+    /**
+     * 注释与代码不一致是「下次改错」的温床：原先那张表只列了
+     * 「离线中 / 首次可离线使用」两项，新增的「新版本已就绪」分支没有进表。
+     * 代码里的三道 if 顺序即真实优先级，注释必须跟上。
+     */
+    const offline = PROMPT_SRC.indexOf('if (!online)');
+    const pending = PROMPT_SRC.indexOf('if (updatePending)');
+    const ready = PROMPT_SRC.indexOf('if (offlineReady)');
+
+    expect(offline).toBeGreaterThan(-1);
+    expect(pending).toBeGreaterThan(-1);
+    expect(ready).toBeGreaterThan(-1);
+    expect(offline).toBeLessThan(pending);
+    expect(pending).toBeLessThan(ready);
+
+    // 注释表格里三项都要出现
+    expect(PROMPT_SRC).toMatch(/离线中/);
+    expect(PROMPT_SRC).toMatch(/新版本就绪、刷新被推迟/);
+    expect(PROMPT_SRC).toMatch(/首次可离线使用/);
   });
 });

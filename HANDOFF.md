@@ -17,12 +17,12 @@
 | 项 | 值 |
 |---|---|
 | 仓库 | `Mercuryof37/universal-reader`（分支 `main`） |
-| 当前提交 | **`fc79896`**（2026-10-06，「fix(ocr): stop losing a whole scan to a mid-run reload, and defer that reload」，即 §5.9 缺陷 21 的修复）<br>**已推送到 `origin/main`**（push 重试了 7 次，本机 `github.com:443` 时通时断，见 §10）。**部署状态：截至本文更新时 Cloudflare Pages 尚未确认完成** —— 已推送不等于已上线，线上实际服务于哪一份产物以部署完成后的实测为准 |
+| 当前提交 | **`ed66ba8`**（2026-10-06，**本轮第二个提交**：随后补的顺序守卫测试，见 §4.4）<br>**本轮共两个提交**：`fc79896`（「fix(ocr): stop losing a whole scan to a mid-run reload, and defer that reload」，即 §5.9 缺陷 21 的修复）＋ **`ed66ba8`**（只新增测试文件，**不影响产物**）。**二者均已推送到 `origin/main`**（`fc79896` 的 push 重试了 7 次，本机 `github.com:443` 时通时断，见 §10）。**部署状态：已确认** —— `fc79896` 的 `verify` 与 `Cloudflare Pages` 两项 check 均为 **success**；`ed66ba8` 的 check 当时仍在 `in_progress`，但它与 `fc79896` 的产物**完全相同**（只加测试文件、不进产物） |
 | 部署 | Cloudflare Pages（静态）+ 可选 Cloudflare Worker（API 代理） |
 | 上一轮提交 | `f549173`（三项决策）与 `f331393`（文档同步）：**二者均已部署**（`verify` 与 `Cloudflare Pages` 两项 check 均为 **success**，线上已服务于那一批产物） |
-| 代码规模 | `src/` 64 个文件 / 10,922 行 · `scripts/` 8 个 / 1,151 行 · `worker/` 1 个 / 453 行 |
+| 代码规模 | `src/` **65 个文件 / 11,018 行** · `scripts/` 8 个 / 1,151 行 · `worker/` 1 个 / 453 行 |
 | 依赖 | **26** 个（dependencies 16 + devDependencies 10），本轮**不变**（上一轮由 29 降下来） |
-| 测试 | 19 个文件 / **209 个用例全部通过** |
+| 测试 | **20 个文件 / 216 个用例全部通过** |
 | 门禁 | `tsc -b` ✅ · `vitest run` ✅ · `npm run build` ✅（含 ONNX WASM 清理 + 产物校验） |
 | 文档 | `README.md`（用户手册）· `docs/`（3 份专题）· 本文 |
 
@@ -140,7 +140,7 @@
 npm install          # 受限环境可用 --ignore-scripts
 npm run dev          # http://localhost:5173
 npm run build        # 完整构建（含 WASM 复制 + 图标生成 + ONNX WASM 清理 + 产物校验）
-npm test             # 209 个单元测试
+npm test             # 216 个单元测试
 npm run typecheck    # 三个 TS project：app / node / worker
 ```
 
@@ -211,7 +211,7 @@ Cleaned 1 ONNX WASM file(s) from dist.
 | 翻译缓存键与降级逻辑 | 单元测试 |
 | PWA 产物完整性 | 产物门禁 + `sw.js` 全文核对 |
 | 构建产物正确性 | 负向测试确认门禁有效 |
-| PWA 陈旧 chunk 修复（导航路由改 NetworkFirst、不再有 `navigateFallback`） | 线上 `sw.js` 直接抓取核对 + `src/lib/pwaOffline.test.ts` 8 个用例（读 `vite.config.ts` 把 `NAVIGATION_CACHE_NAME` 钉死）；`src/lib/preloadRecovery.ts` 另有 11 个用例。**这两个文件共 19 个用例，已计入当前 209 个用例的基线** |
+| PWA 陈旧 chunk 修复（导航路由改 NetworkFirst、不再有 `navigateFallback`） | 线上 `sw.js` 直接抓取核对 + `src/lib/pwaOffline.test.ts` 8 个用例（读 `vite.config.ts` 把 `NAVIGATION_CACHE_NAME` 钉死）；`src/lib/preloadRecovery.ts` 另有 11 个用例。**这两个文件共 19 个用例，已计入当前 216 个用例的基线** |
 | **OCR 中途落盘**（`shouldCheckpoint` 的边界规则） | 单元测试（`src/lib/ocrCheckpoint.test.ts` 9 个用例：末页必落盘、每 5 页一次、首页不落、丢失窗口有上界、非法输入返回 `false`）**＋ 源码断言**（parser 与 store 两端都钉）。**但真机中断场景未验证**，见 §4.2 与 §5.9 |
 
 #### 上一轮（已提交 `f549173`、已部署）的实测证据
@@ -225,7 +225,7 @@ Cleaned 1 ONNX WASM file(s) from dist.
 | GitHub check-runs（commit `f549173`） | `Cloudflare Pages: **success**`、`verify: **success**` |
 | 线上 `sw.js`（直接抓 `https://universal-reader.pages.dev/sw.js`） | 含 `NetworkFirst`、含 `html-navigation`；**不含** `createHandlerBoundToURL` —— 导航修复未被本轮改动破坏 |
 | 线上 precache 清单（本轮重新抓取） | 含 `assets/index-BUj-R2J2.js`、`assets/pdfParser-BjFMW2CJ.js`、`assets/epubParser-zridiCjA.js`、`assets/ocrEngine-BItOXzga.js`；入口 CSS 仍是 `assets/index-C6dUSkX0.css` |
-| 线上 `index.html` | 响应头 `Cache-Control: public, max-age=0, must-revalidate`（上一轮实测，本轮未复测内容哈希） |
+| 线上 `index.html` | 响应头 `Cache-Control: public, max-age=0, must-revalidate`（上一轮实测；**本轮已带 cache-buster 复测内容哈希**，见下表 —— 它正是核对部署时该用的判据） |
 
 > **本地哈希 ≠ 线上哈希**：同一份源码，上一轮本地构建出 `index-BBM5E4Bw.js` / `pdfParser-DJvvPlRl.js`，
 > 线上（`f549173` 的产物）是 `index-BUj-R2J2.js` / `pdfParser-BjFMW2CJ.js`。
@@ -233,21 +233,27 @@ Cleaned 1 ONNX WASM file(s) from dist.
 > 线上 `index-C6dUSkX0.css`），**绝不能用本地 `dist/` 里的文件名去推断线上资源名**
 > （排查这次故障时踩过这个坑）。
 
-#### 本轮（已提交并推送 `fc79896`，**部署尚未确认**）的实测证据
+#### 本轮（已推送 `fc79896` + `ed66ba8`，**部署已确认**）的实测证据
 
 | 检查 | 结果 |
 |---|---|
 | `npx tsc -b` | **exit 0** |
-| `npx vitest run` | **209 passed / 19 files**（上一轮 200 / 18 → 本轮 **+9**，全部来自新增的 `src/lib/ocrCheckpoint.test.ts`） |
+| `npx vitest run` | **216 passed / 20 files**（上一轮 200 / 18 → 本轮 **+16**，来自**两个**新增文件：`src/lib/ocrCheckpoint.test.ts` **9 个用例** + `src/lib/pwaReload.test.ts` **7 个用例**） |
 | `npm run build` | `PWA v1.3.0  mode generateSW  precache 18 entries (3579.98 KiB)`；`[verify-dist] 构建产物校验通过` —— 产物共 **83 个文件 / 5.54 MB**；WASM 解码器 **7 个 / 合计 1.41 MB**（**产物规模、WASM 数量与体积、依赖数 26 三项本轮均未变**） |
 | 本轮本地构建哈希 | `index-DWhM5bxu.js` · `pdfParser-BQZ8b1PC.js` · `epubParser-BJh-4Mxz.js` · `ocrEngine-DFAnINT2.js` · `index-edxBkGh6.css` |
-| 关键文件行数 | `src/lib/pwa.ts` **132** · `src/components/PwaPrompt.tsx` **126** · `src/parsers/pdfParser.ts` **745** · `src/store/libraryStore.ts` **244** · `src/lib/ocrTypes.ts` **154** · `src/lib/ocrCheckpoint.test.ts` **110**（新增） |
-| GitHub check-runs（commit `fc79896`） | **尚未核对**；`Cloudflare Pages` 的部署结果**截至本文更新时未确认** |
-| 线上 `sw.js` / 线上 precache 清单 | **本轮未复测**（部署未确认，复测没有意义；上一轮实测值见上表） |
+| 关键文件行数 | `src/lib/pwa.ts` **132** · `src/components/PwaPrompt.tsx` **126** · `src/parsers/pdfParser.ts` **745** · `src/store/libraryStore.ts` **244** · `src/lib/ocrTypes.ts` **154** · `src/lib/ocrCheckpoint.test.ts` **110**（新增） · `src/lib/pwaReload.test.ts` **96**（新增） |
+| GitHub check-runs（commit `fc79896`） | **已核对**：`verify: **success**`、`Cloudflare Pages: **success**`。commit `ed66ba8`（只新增测试文件、**不影响产物**）的 check 当时仍在 `in_progress`，但它与 `fc79896` 的产物**完全相同** |
+| 线上 `index.html`（**带 cache-buster**：`?t=<时间戳>`） | **已复测**：入口 chunk = **`assets/index-CiMmJIqw.js`** —— 与本地构建哈希不同（这是常态，见 §10）；响应头仍是 `Cache-Control: public, max-age=0, must-revalidate` |
+| 线上 `sw.js`（**本轮已复测，但第一次抓错了**） | ⚠️ **不带 cache-buster 抓 `sw.js` 会读到 Cloudflare 边缘缓存里的旧副本**，第一次抓取据此误判成「没部署」。**核对部署必须带 `?t=<时间戳>`，或改用响应头为 `must-revalidate` 的 `index.html` 作判据**。这与本项目原始故障（§5.6）**是同一类错误 —— 都是读到了被缓存的旧产物** |
 
-> **不要拿本表当"已上线"的证据。** 本轮只验证到「源码 + 本地产物 + 本地门禁」这一层：
-> 推送成功 ≠ 部署完成。等 Cloudflare Pages 确认之后，再按 §10 的做法直接抓线上
-> `sw.js` 与 `index.html` 核对，并补测两个修法的真机行为（见 §4.2）。
+> **本表这次就是"已上线"的证据**（与上一轮不同，本轮部署已确认）：`fc79896` 的两项 check
+> 均为 `success`，线上 `index.html` 实测也已指向本批产物。**但这只证明「产物已上线」，
+> 不等于「修法已生效」** —— 两个修法的真机行为仍未验证，见 §4.2 与 §5.9.6。
+>
+> ⚠️ **核对部署时的坑（必须记住）**：抓线上的 `sw.js` **一定要带 cache-buster**
+> （`?t=<时间戳>`），否则会读到 Cloudflare 边缘缓存里的旧副本，从而得出「没部署」的
+> **错误结论**（第一次抓就是这么误判的）。这与 §5.6 记录的原始故障**是同一类错误**：
+> 读到了被缓存的旧产物。更稳的判据是抓响应头为 `must-revalidate` 的 `index.html`。
 
 ### 4.2 已实现但**从未在真机上跑通**
 
@@ -301,7 +307,7 @@ Cleaned 1 ONNX WASM file(s) from dist.
 | `src/lib/ocrPostProcess.ts` 里的历史叙述 | 描述「tesseract v7 把词输出从平铺改成嵌套」等过去故障成因的段落 | **保留**（是历史事实，不是错误） |
 | 旧的 `pdfWorker.ts` | 已删除，但 `docs/03` 里仍有它的历史记录 | **保留**（是历史，不是错误） |
 
-### 4.4 最近 9 个提交做了什么（`cdf2957` → `fc79896`，HEAD = `fc79896`）
+### 4.4 最近 10 个提交做了什么（`cdf2957` → `ed66ba8`，HEAD = `ed66ba8`）
 
 按时间升序排列（作者字段为提交里的原始值）。
 
@@ -315,10 +321,14 @@ Cleaned 1 ONNX WASM file(s) from dist.
 | `aa8827a` | 2026-10-06 22:51 | Universal Reader Dev | fix(pwa): seed the navigation cache so offline cold start works | 补上 NetworkFirst 引入的离线冷启动空档：新增 `src/lib/pwaOffline.ts` + 8 个单测（见 §5.6.4） |
 | `f549173` | 2026-10-06 | Mercuryof37 | feat(privacy)!: make the formula upload opt-in, drop dead code and unused deps | 上一轮的三项决策：公式上传改为默认关闭的显式开关（§5.8）、删掉 prompt 模式的死 UI（§5.7）、删除 `ocrWordExtraction.ts` / `pdfTextLayer.ts` 与三个未使用依赖（§4.3） |
 | `f331393` | 2026-10-06 | — | 文档同步 | 把上一轮的三项决策与实测数字写进 `HANDOFF.md` / `README.md`。**无代码改动** |
-| `fc79896` | 2026-10-06 | — | fix(ocr): stop losing a whole scan to a mid-run reload, and defer that reload | **本轮**：修 §5.9 缺陷 21 的两个修法 —— 导入/OCR 期间推迟自动刷新（`pwa.ts` + `PwaPrompt.tsx`）与 OCR 中途落盘（`ocrTypes.ts` + `pdfParser.ts` + `libraryStore.ts`），新增 `ocrCheckpoint.test.ts` 9 个用例 |
+| `fc79896` | 2026-10-06 | — | fix(ocr): stop losing a whole scan to a mid-run reload, and defer that reload | **本轮第一个提交**：修 §5.9 缺陷 21 的两个修法 —— 导入/OCR 期间推迟自动刷新（`pwa.ts` + `PwaPrompt.tsx`）与 OCR 中途落盘（`ocrTypes.ts` + `pdfParser.ts` + `libraryStore.ts`），新增 `ocrCheckpoint.test.ts` 9 个用例 |
+| `ed66ba8` | 2026-10-06 | — | 补顺序守卫测试（推迟刷新） | **本轮第二个提交**：新增 `src/lib/pwaReload.test.ts`（**7 个用例 / 96 行**），针对「导入/OCR 期间**推迟刷新**」做**顺序**断言 —— 钉住「先检查 `importing`、再决定要不要 `reload()`」这一次序，以及「被推迟时置 `updatePending`」与「工作结束后 `PwaPrompt` 才调 `reloadNow`」。**只新增测试文件、不改产物**，因此它与 `fc79896` 的部署产物**完全相同** |
 
 > 注：`a766d3f` / `aa8827a` 的作者是 `Universal Reader Dev`（其余几个是 `Mercuryof37`），
 > 主题前缀也因此从 `fix:` 变成 `fix(pwa):`。
+>
+> 注：`ed66ba8` 的提交信息与作者字段未逐字复核，该行按本轮已知事实描述（只新增测试文件、
+> 与 `fc79896` 产物相同）。
 
 ---
 
@@ -607,7 +617,7 @@ NetworkFirst **只回退它自己的 `html-navigation` 缓存**，而这个缓�
 |---|---|
 | `src/lib/pwa.ts` | `useRegisterSW` 现在传入 **`onNeedReload`**。不传时 `vite-plugin-pwa` 会直接 `window.location.reload()`；传了之后**由我们决定时机**。回调逻辑：`if (useLibraryStore.getState().importing) { setUpdatePending(true); return; }` —— 正在导入/OCR 就**不刷新**，只置一个标志；否则保持 autoUpdate 原有的立即刷新语义。`PwaState` 新增 **`updatePending: boolean`** 与 **`reloadNow: () => void`**（见 §5.4）|
 | `src/components/PwaPrompt.tsx` | 新增**「新版本已就绪」横幅**（含**「立即刷新」按钮** + 文案「正在识别，完成后会自动刷新」），优先级排在「已可离线使用」**之前**。新增一个 `useEffect`：当 `updatePending && !importing` 时调用 `reloadNow()` —— **工作一结束就自动刷新**。理由：用户选的是 autoUpdate，推迟只是为了不毁掉进行中的工作；工作结束后结果已落盘（检查点 + 最终保存），此时刷新不会丢东西。另外把 `RefreshCw` 图标（上一轮曾随死 UI 一起删掉）与 `useLibraryStore` 的导入加了回来 |
-| 单元测试 | 本轮的测试集中在 `src/lib/ocrCheckpoint.test.ts`（见 5.9.5）。**修法一的真机行为仍未验证**（§5.9.6）—— 单元测试只能钉住"代码写了什么"，钉不住"部署恰好落在扫描途中时会怎样" |
+| 单元测试 | 修法一的**顺序**断言在 `src/lib/pwaReload.test.ts`（**7 个用例 / 96 行**，`ed66ba8` 补上的）；修法二的检查点规则在 `src/lib/ocrCheckpoint.test.ts`（9 个用例，见 5.9.5）。**修法一的真机行为仍未验证**（§5.9.6）—— 单元测试只能钉住"代码写了什么"，钉不住"部署恰好落在扫描途中时会怎样" |
 
 #### 5.9.4 修法二：OCR 期间**中途落盘**（丢失窗口从「整次扫描」降到「最多几页」）
 
@@ -638,7 +648,13 @@ NetworkFirst **只回退它自己的 `html-navigation` 缓存**，而这个缓�
 > 第 6–9 条是**读源码断言**，因为「只做一半」的实现能编译、能过测试，正是本项目记录过的
 > 「看着对、跑起来不对」—— 所以链路两端都要钉。
 
-其余门禁：`npx tsc -b` **exit 0**；`npx vitest run` **209 passed / 19 files**；
+**修法一（推迟刷新）的证据在另一个文件**：`src/lib/pwaReload.test.ts`（`ed66ba8` 补上，
+**7 个用例 / 96 行**）—— 同样是读源码的**顺序**断言：`onNeedReload` 里 `importing` 的检查
+必须出现在 `window.location.reload()` **之前**；被推迟时要置 `updatePending`，而不是静默什么都不做；
+`PwaState` 要暴露 `updatePending` 与 `reloadNow`（界面需要它们）；`PwaPrompt` 在
+`updatePending && !importing` 时才调 `reloadNow`。
+
+其余门禁：`npx tsc -b` **exit 0**；`npx vitest run` **216 passed / 20 files**；
 `npm run build` 通过产物校验。完整数字见 §4.1 的「本轮」表。
 
 #### 5.9.6 必须如实保留的未验证点
@@ -647,7 +663,9 @@ NetworkFirst **只回退它自己的 `html-navigation` 缓存**，而这个缓�
   - 「部署正好落在扫描途中时不再丢失」需要**一次真实的部署落在一次真实的扫描中间**才能验；
   - 「中途落盘」只有单元测试与源码断言，**没有真机跑过一次会中断的长扫描**。
 - 因此「新版本已就绪」横幅与「立即刷新」按钮**至今没有被人眼在真实浏览器里看到过**。
-- 本轮 `fc79896` **已推送但部署尚未确认**（见开头的表格与 §4.1）。
+- 本轮的两个提交（`fc79896` + `ed66ba8`）**已推送，且部署已确认**（`fc79896` 的 `verify` 与
+  `Cloudflare Pages` 两项 check 均 success；`ed66ba8` 与它产物相同）—— **但「产物已上线」
+  不等于「修法已生效」**：上面两条真机行为依然未验证。见开头的表格与 §4.1。
 
 #### 5.9.7 教训
 
@@ -837,7 +855,9 @@ NetworkFirst **只回退它自己的 `html-navigation` 缓存**，而这个缓�
 4. **SimpleTex 公式 OCR 端到端**（需要 Worker 上配好 `SIMPLETEX_API_KEY`，否则恒返回 500）
 5. **PaddleOCR 在真实扫描件上的中文识别准确率**（Node 测试跑不了它，必须浏览器）
 6. **导入/OCR 期间推迟自动刷新**（§5.9 修法一）：**需要一次真实部署正好落在一次真实扫描中间**
-   才能验；「新版本已就绪」横幅与「立即刷新」按钮至今没被人眼在真实浏览器里看到过
+   才能验；「新版本已就绪」横幅与「立即刷新」按钮至今没被人眼在真实浏览器里看到过。
+   目前只有 `src/lib/pwaReload.test.ts` 的 7 个顺序断言（`ed66ba8` 补上）—— 它钉的是"代码写了什么"，
+   替代不了这次验证
 7. **OCR 中途落盘在真实中断下的效果**（§5.9 修法二）：关标签页 / 浏览器崩溃各试一次，
    确认书库里确实留着已识别的那部分（目前只有 9 个单元用例与源码断言，「最多丢 5 页」是推出的结论，不是实测）
 
@@ -901,13 +921,19 @@ npx vitest run src/parsers/realPdf.manual.test.ts
 同一份源码：本地是 `index-DWhM5bxu.js` / `pdfParser-BQZ8b1PC.js`（本轮 `fc79896` 的本地构建），
 上一轮本地是 `index-BBM5E4Bw.js` / `pdfParser-DJvvPlRl.js`，而那一轮的线上产物是
 `index-BUj-R2J2.js` / `pdfParser-BjFMW2CJ.js`（连入口 CSS 都不同：本地 `index-edxBkGh6.css`，
-线上 `index-C6dUSkX0.css`）。
+线上 `index-C6dUSkX0.css`）。本轮线上入口 chunk 实测为 **`assets/index-CiMmJIqw.js`**，
+同样与本地 `index-DWhM5bxu.js` 不同。
 Cloudflare 的构建与本地构建**不是逐字节可复现的**。
 排查线上问题时，**唯一可靠的做法是直接抓线上的 `sw.js` / `index.html`**，
 不要用本地 `dist/` 里的文件名去推断线上资源名（见 §4.1）。
 
-> **本轮 `fc79896` 的线上哈希尚未核对**：推送成功但部署未确认，所以**本文不给出任何"线上现在是哪个文件"的断言**。
-> 等 Cloudflare Pages 完成部署后，按上面的做法重新抓一次 `sw.js` 与 `index.html` 补进 §4.1。
+> **本轮 `fc79896` 的线上哈希已核对**：带 cache-buster 抓线上 `index.html`，入口 chunk 为
+> **`assets/index-CiMmJIqw.js`**；部署已确认（`verify` 与 `Cloudflare Pages` 两项 check 均 **success**）。
+> `ed66ba8` 只新增测试文件、**不影响产物**，因此线上产物与 `fc79896` 完全相同。
+>
+> ⚠️ **抓 `sw.js` 必须带 cache-buster**：不带 `?t=<时间戳>` 会读到 **Cloudflare 边缘缓存里的旧副本**，
+> 第一次抓取就因此误判成「没部署」。这与 §5.6 的原始故障**是同一类错误 —— 读到了被缓存的旧产物**。
+> 更稳的判据是抓响应头为 `must-revalidate` 的 `index.html`。
 
 ### ⚠️ 安全：`ALLOWED_ORIGIN` 必须配置
 
@@ -954,8 +980,9 @@ npx wrangler deploy
 失败时不要怀疑凭据或远端配置，先重试。
 
 > **推送成功 ≠ 部署完成**：Cloudflare Pages 需要几分钟构建。
-> 本轮 `fc79896` 正是如此 —— 已推送到 `origin/main`，但**部署状态截至本文更新时未确认**。
-> 写文档或向用户汇报时，**不要把"已推送"说成"已上线"**。
+> 本轮 `fc79896` 已经走完这一步 —— 已推送到 `origin/main`，且 `verify` 与 `Cloudflare Pages`
+> 两项 check 均为 **success**，部署**已确认**（见 §4.1）。但这条纪律本身仍然成立：
+> **在 check 变绿之前，不要把"已推送"说成"已上线"**。
 
 ---
 
@@ -965,7 +992,7 @@ npx wrangler deploy
    不要再翻案。对应代码见 §5.7（保留 `autoUpdate`，代价是会自动重载）与 §5.8（公式上传默认关闭）。
    **另加本轮的一条**：§5.9（缺陷 21，「扫描结果全丢」）—— 它**没有**改变 §5.7 的决策，
    只是缓解了那条代价里最严重的一项
-2. **先跑一遍 `npm run build` 和 `npm test`**，确认基线是绿的（应为 `209 passed / 19 files`）
+2. **先跑一遍 `npm run build` 和 `npm test`**，确认基线是绿的（应为 `216 passed / 20 files`）
 3. **再跑通一次真实扫描件的 OCR**（R1）—— 这是最大的未知数：PaddleOCR 在真实扫描件上从没跑过
 4. **读 `docs/03-踩坑与修复记录.md`** —— 13 个缺陷换来的经验都在那里
    （另加 §5.6 的 PWA 陈旧 chunk 故障与 §5.9 的「扫描结果全丢」，三者是同一类教训：**全绿也不代表对**）
@@ -976,5 +1003,5 @@ npx wrangler deploy
    这里有三条已经踩过的坑：`navigateFallback` 会永远返回预缓存的旧 HTML；
    NetworkFirst 需要有人先把页面骨架写进缓存；**长任务期间不能让它被自动刷新打断，且长任务的结果必须中途落盘**。
    另外记住 §5.7 的结论：本项目**故意**选择了会自动重载的 `autoUpdate`
-8. **改完记得确认产物相关的数字**：本轮基线是 `209 passed / 19 files`、precache
-   `18 entries (3579.98 KiB)`、`src/` 64 个文件 / 10,922 行、依赖 26 个；这些数字散落在本文多处，改动后要一起更新
+8. **改完记得确认产物相关的数字**：本轮基线是 `216 passed / 20 files`、precache
+   `18 entries (3579.98 KiB)`、`src/` 65 个文件 / 11,018 行、依赖 26 个；这些数字散落在本文多处，改动后要一起更新

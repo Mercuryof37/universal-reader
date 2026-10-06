@@ -6,24 +6,29 @@ import { useLibraryStore } from '@/store/libraryStore';
 /**
  * PWA 状态提示条。
  *
- * 两种提示共用一个位置，按优先级显示：
+ * 三种提示共用一个位置，**按下面的顺序判断**（代码顺序即优先级）：
  *
- * | 优先级 | 场景 | 文案 | 可关闭 |
+ * | 顺序 | 场景 | 文案 | 可关闭 |
  * |---|---|---|---|
  * | 1 | 离线中 | 「已离线，已缓存的内容仍可阅读」 | 否 |
- * | 2 | 首次可离线使用 | 「已可离线使用」 | 是 |
+ * | 2 | 新版本就绪、刷新被推迟 | 「新版本已就绪」+「立即刷新」 | 否（会自动消失） |
+ * | 3 | 首次可离线使用 | 「已可离线使用」 | 是 |
  *
  * 「离线中」不可关闭是刻意的：它是**状态**而不是通知，
  * 让用户知道这不是网站坏了，同时暗示可以继续读已导入的书。
  *
  * ═══════════════════════════════════════════════════════════════
- * 为什么没有「有新版本可用 / 立即更新」
+ * 为什么这里会有一个「新版本已就绪」条 —— 它和当初删掉的那条不是一回事
  * ═══════════════════════════════════════════════════════════════
  *
- * 本项目采用 `registerType: 'autoUpdate'`（见 `vite.config.ts` 与 `lib/pwa.ts`）。
- * 该模式下 `updateServiceWorker()` 是空操作，`onNeedRefresh` 也不会被触发，
- * 所以「有新版本」提示条**永远不会出现** —— 那段 UI 已被删除，
- * 而不是留在这里装作能用。代价是页面会在无预警时自动重载。
+ * 本项目是 `registerType: 'autoUpdate'`，所以**没有**「有新版本可用 / 立即更新」
+ * 那种需要用户点确认的条：`updateServiceWorker()` 在 autoUpdate 下是空操作、
+ * `onNeedRefresh` 也不会触发，那条 UI 属于死代码，已经删掉。
+ *
+ * 现在这一条是**另一回事**：它不是「请你决定要不要更新」，而是
+ * **「更新已经就绪，但我暂时没有刷新，因为你有活儿在跑」**。
+ * 它由 `lib/pwa.ts` 的 `onNeedReload` 置位（导入/OCR 期间推迟刷新），
+ * 工作一结束就自动刷新、提示条随之消失。
  */
 export function PwaPrompt() {
   const { offlineReady, updatePending, dismiss, reloadNow } = usePwa();
@@ -42,10 +47,14 @@ export function PwaPrompt() {
    * 用户选的就是 autoUpdate，推迟只是为了**不毁掉正在进行的工作**，
    * 工作一结束就该回到原本的自动更新语义。
    * 此时结果已经落盘（中途检查点 + 最终保存），刷新不会丢东西。
+   *
+   * ⚠️ **必须同时判断 `online`**：离线时刷新毫无意义，而且此刻界面显示的是
+   * 「已离线」那条（优先级更高，见上方表格），用户根本看不到「新版本已就绪」，
+   * 突然重载只会莫名其妙。等恢复在线后这个 effect 会再次运行。
    */
   useEffect(() => {
-    if (updatePending && !importing) reloadNow();
-  }, [updatePending, importing, reloadNow]);
+    if (updatePending && !importing && online) reloadNow();
+  }, [updatePending, importing, online, reloadNow]);
 
   // 离线状态优先于其他提示：它描述的是此刻能不能用
   if (!online) {
