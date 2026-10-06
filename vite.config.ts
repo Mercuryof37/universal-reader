@@ -69,6 +69,7 @@ export default defineConfig({
         globIgnores: [
           '**/pdfjs-wasm/quickjs-eval*',
           '**/pdfjs-wasm/*_nowasm_fallback.js',
+          '**/ort-wasm*',
         ],
 
         // 单文件预缓存上限。pdfWorkerEntry 有 1.15MB，默认的 2MB 够用，
@@ -100,13 +101,22 @@ export default defineConfig({
             },
           },
           {
-            // tesseract 的语言包与核心 WASM。默认从 CDN 下载，体积大（中文约 22MB），
-            // 用 CacheFirst 让「识别过一次之后离线也能继续用」。
-            urlPattern: /^https:\/\/(cdn\.jsdelivr\.net|unpkg\.com|tessdata\.projectnaptha\.com)\/.*/,
+            // PaddleOCR 模型文件（从 HuggingFace CDN 下载，约 10MB）
+            urlPattern: /^https:\/\/huggingface\.co\/.*/,
             handler: 'CacheFirst',
             options: {
-              cacheName: 'ocr-assets',
+              cacheName: 'ocr-models',
               expiration: { maxEntries: 30, maxAgeSeconds: 60 * 60 * 24 * 365 },
+              cacheableResponse: { statuses: [0, 200] },
+            },
+          },
+          {
+            // ONNX Runtime WASM 文件（约 28MB），首次 OCR 时按需加载
+            urlPattern: /\/ort-wasm.*\.(wasm|js|mjs)$/,
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'onnx-wasm',
+              expiration: { maxEntries: 10, maxAgeSeconds: 60 * 60 * 24 * 365 },
               cacheableResponse: { statuses: [0, 200] },
             },
           },
@@ -158,7 +168,7 @@ export default defineConfig({
     },
   },
   optimizeDeps: {
-    include: ['tesseract.js'],
+    exclude: ['ppu-paddle-ocr', 'ppu-ocv', 'onnxruntime-web'],
   },
   worker: {
     format: 'es',

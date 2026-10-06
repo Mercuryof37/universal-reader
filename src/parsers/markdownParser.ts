@@ -1,6 +1,7 @@
 import { unified } from 'unified';
 import remarkParse from 'remark-parse';
 import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
 import { visit } from 'unist-util-visit';
 import type { ContentBlock, DocDocument, FileParser } from '@/types/content';
 import { buildDocument, uid } from '@/lib/utils';
@@ -28,7 +29,7 @@ export class MarkdownParser implements FileParser {
   async parse(file: File): Promise<DocDocument> {
     const { text: raw } = await readTextFile(file);
     const text = stripBom(raw);
-    const tree = unified().use(remarkParse).use(remarkGfm).parse(text);
+    const tree = unified().use(remarkParse).use(remarkGfm).use(remarkMath).parse(text);
 
     const drafts: DraftBlock[] = [];
 
@@ -40,9 +41,10 @@ export class MarkdownParser implements FileParser {
           return 'skip';
         }
         case 'paragraph': {
-          // 列表项内部的段落交给 list 分支统一处理，避免重复
           if (parent && parent.type === 'listItem') return 'skip';
-          drafts.push(textBlock('paragraph', extractText(node)));
+          const pText = extractTextWithMath(node);
+          const hasInline = /\$[^$]+\$/.test(pText);
+          drafts.push(textBlock('paragraph', pText, hasInline ? { hasInlineMath: true } : {}));
           return 'skip';
         }
         case 'blockquote': {
@@ -64,6 +66,11 @@ export class MarkdownParser implements FileParser {
           const src = 'url' in node ? String(node.url) : '';
           const alt = 'alt' in node && node.alt ? String(node.alt) : '';
           if (src) drafts.push(textBlock('image', alt, { src }));
+          return 'skip';
+        }
+        case 'math': {
+          const value = 'value' in node ? String(node.value) : '';
+          if (value.trim()) drafts.push(textBlock('math', value));
           return 'skip';
         }
         case 'html': {
@@ -113,6 +120,25 @@ function extractText(node: unknown): string {
   return '';
 }
 
+/** 递归抽取文本，保留行内公式的 $...$ 定界符供渲染层交给 KaTeX */
+function extractTextWithMath(node: unknown): string {
+  if (!node || typeof node !== 'object') return '';
+  const n = node as { type?: string; value?: unknown; children?: unknown[] };
+  if (n.type === 'inlineMath') {
+    const v = typeof n.value === 'string' ? n.value : '';
+    return `$${v}$`;
+  }
+  if (typeof n.value === 'string') return n.value;
+  if (Array.isArray(n.children)) {
+    return n.children
+      .map((child) => extractTextWithMath(child))
+      .join('')
+      .replace(/[ \t]+\n/g, '\n')
+      .trim();
+  }
+  return '';
+}
+
 /** 把列表压成带缩进的纯文本行 */
 function flattenList(node: unknown, depth = 0): string[] {
   const n = node as { children?: unknown[] };
@@ -147,6 +173,8 @@ function mergeAdjacent(blocks: DraftBlock[]): DraftBlock[] {
       prev &&
       prev.type === 'paragraph' &&
       block.type === 'paragraph' &&
+      !prev.metadata.hasInlineMath &&
+      !block.metadata.hasInlineMath &&
       !/[。！？.!?：:；;】」』"']$/.test(prev.content) &&
       prev.content.length + block.content.length <= 400;
     if (mergeable) {

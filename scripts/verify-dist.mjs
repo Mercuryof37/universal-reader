@@ -132,7 +132,7 @@ if (check(existsSync(swPath), 'dist/sw.js 缺失 —— PWA 插件未生效，�
 // ── 6. 单个 chunk 体积 ──────────────────────────────────────
 for (const name of readdirSync(assets)) {
   const size = statSync(join(assets, name)).size;
-  if (size > MAX_CHUNK_BYTES && !/^pdfWorkerEntry-/.test(name)) {
+  if (size > MAX_CHUNK_BYTES && !/^pdfWorkerEntry-/.test(name) && !/^ort-wasm/.test(name)) {
     problems.push(`${name} 体积 ${mb(size)}，超过上限 ${mb(MAX_CHUNK_BYTES)}`);
   }
 }

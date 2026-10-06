@@ -1,5 +1,6 @@
 import { memo, useMemo, useRef } from 'react';
 import { Loader2, Volume2, Square } from 'lucide-react';
+import katex from 'katex';
 import type { Annotation, BilingualLayout, ContentBlock } from '@/types/content';
 import { buildSegments, selectionOffsets } from '@/lib/annotations';
 import { useAnnotationsStore } from '@/store/annotationsStore';
@@ -201,9 +202,23 @@ function RichText({
     ) : null;
   }
 
+  if (block.type === 'math') {
+    const html = renderMath(block.content, true);
+    return (
+      <div
+        className="block-math my-4 overflow-x-auto text-center"
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+    );
+  }
+
   const inner = segments.map((seg, i) => {
     if (!seg.color || seg.annotationIds.length === 0) {
-      return <span key={i}>{seg.text}</span>;
+      return block.metadata.hasInlineMath ? (
+        <span key={i}>{renderInlineMath(seg.text)}</span>
+      ) : (
+        <span key={i}>{seg.text}</span>
+      );
     }
     const isActive = activeId !== null && seg.annotationIds.includes(activeId);
     return (
@@ -215,7 +230,7 @@ function RichText({
         onClick={() => onPick(seg.annotationIds[0] ?? null)}
         title="点击查看该批注"
       >
-        {seg.text}
+        {block.metadata.hasInlineMath ? renderInlineMath(seg.text) : seg.text}
       </mark>
     );
   });
@@ -262,4 +277,43 @@ function RichText({
         </p>
       );
   }
+}
+
+/** 用 KaTeX 渲染 LaTeX 公式为 HTML 字符串 */
+function renderMath(tex: string, displayMode: boolean): string {
+  try {
+    return katex.renderToString(tex, {
+      displayMode,
+      throwOnError: false,
+      strict: false,
+      trust: true,
+    });
+  } catch {
+    return `<code>${tex}</code>`;
+  }
+}
+
+/** 将含 $...$ 的文本拆分为普通文本 + 行内公式的 React 节点数组 */
+function renderInlineMath(text: string): React.ReactNode[] {
+  const parts: React.ReactNode[] = [];
+  const regex = /\$([^$]+)\$/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push(text.slice(lastIndex, match.index));
+    }
+    const html = renderMath(match[1], false);
+    parts.push(
+      <span key={`m-${match.index}`} dangerouslySetInnerHTML={{ __html: html }} />,
+    );
+    lastIndex = regex.lastIndex;
+  }
+
+  if (lastIndex < text.length) {
+    parts.push(text.slice(lastIndex));
+  }
+
+  return parts;
 }

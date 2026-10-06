@@ -200,4 +200,5 @@ export const BLOCK_TYPE_LABEL: Record<BlockType, string> = {
   code: '代码',
   list: '列表',
   image: '图片',
+  math: '公式',
 };

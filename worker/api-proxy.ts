@@ -21,6 +21,7 @@ export interface Env {
   OPENAI_API_KEY?: string;
   AZURE_SPEECH_KEY?: string;
   AZURE_SPEECH_REGION?: string;
+  SIMPLETEX_API_KEY?: string;
   /** 允许的前端来源，例如 https://reader.example.com */
   ALLOWED_ORIGIN?: string;
   /** 简单的每日配额，防止密钥被刷爆 */
@@ -57,6 +58,8 @@ export default {
           return await handleTranslate(body, env, cors);
         case '/api/tts':
           return await handleTts(body, env, cors);
+        case '/api/formula-ocr':
+          return await handleFormulaOcr(body, env, cors);
         default:
           return json({ error: `未知端点 ${url.pathname}` }, 404, cors);
       }
@@ -225,6 +228,66 @@ async function handleTts(
     status: 200,
     headers: { ...cors, 'Content-Type': 'audio/mpeg', 'Cache-Control': 'no-store' },
   });
+}
+
+/**
+ * 公式 OCR（SimpleTex API）。
+ *
+ * 接收 base64 编码的图片，返回 LaTeX 字符串。
+ * SimpleTex 对中文+数学混合排版的识别准确率远超通用 OCR，
+ * 且免费额度足够个人使用（2000 次/天）。
+ */
+async function handleFormulaOcr(
+  body: Record<string, unknown>,
+  env: Env,
+  cors: Record<string, string>,
+): Promise<Response> {
+  const imageBase64 = asString(body.image);
+  if (!imageBase64) return json({ error: '缺少 image（base64）' }, 400, cors);
+  if (!env.SIMPLETEX_API_KEY) {
+    return json({ error: '未配置 SIMPLETEX_API_KEY' }, 500, cors);
+  }
+
+  // base64 大小上限 ~2MB（编码后约 2.7MB）
+  if (imageBase64.length > 2_700_000) {
+    return json({ error: '图片过大，请裁剪到公式区域后再试' }, 413, cors);
+  }
+
+  const formData = new FormData();
+  // 将 base64 转为 Blob
+  const binaryStr = atob(imageBase64);
+  const bytes = new Uint8Array(binaryStr.length);
+  for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+  formData.append('file', new Blob([bytes], { type: 'image/png' }), 'formula.png');
+
+  const resp = await fetch('https://server.simpletex.cn/api/v1/simpletex_recognize', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${env.SIMPLETEX_API_KEY}`,
+    },
+    body: formData,
+  });
+
+  if (!resp.ok) {
+    const detail = await resp.text();
+    return json({ error: `SimpleTex 返回 ${resp.status}`, detail }, resp.status, cors);
+  }
+
+  const data = (await resp.json()) as {
+    res?: { latex?: string };
+    status?: boolean;
+    message?: string;
+  };
+
+  if (!data.res?.latex) {
+    return json(
+      { error: data.message || 'SimpleTex 未返回 LaTeX' },
+      502,
+      cors,
+    );
+  }
+
+  return json({ latex: data.res.latex }, 200, cors);
 }
 
 function pickAzureVoice(lang: string, preferred: string): string {

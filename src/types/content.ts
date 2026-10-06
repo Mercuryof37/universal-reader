@@ -17,7 +17,8 @@ export type BlockType =
   | 'quote'
   | 'code'
   | 'list'
-  | 'image';
+  | 'image'
+  | 'math';
 
 /** 批注类型 */
 export type AnnotationType = 'highlight' | 'note' | 'tag' | 'question';
@@ -76,6 +77,8 @@ export interface BlockMetadata {
   src?: string;
   /** OCR 置信度 0-100，仅 OCR 生成的块有此字段 */
   ocrConfidence?: number;
+  /** 段落内是否包含行内公式（$...$），渲染时需走 KaTeX */
+  hasInlineMath?: boolean;
 }
 
 /** 统一内容块 */
