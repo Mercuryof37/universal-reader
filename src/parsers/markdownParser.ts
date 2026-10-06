@@ -42,6 +42,23 @@ export class MarkdownParser implements FileParser {
         }
         case 'paragraph': {
           if (parent && parent.type === 'listItem') return 'skip';
+          // Single-line $$...$$ is parsed as inlineMath by remark-math.
+          // Detect by checking raw source at the node's position.
+          const pNode = node as { children?: unknown[]; position?: { start: { offset: number }; end: { offset: number } } };
+          const children = pNode.children ?? [];
+          if (children.length === 1 && (children[0] as { type?: string })?.type === 'inlineMath') {
+            const pos = pNode.position;
+            if (pos) {
+              const rawSlice = text.slice(pos.start.offset, pos.end.offset).trim();
+              if (rawSlice.startsWith('$$') && rawSlice.endsWith('$$')) {
+                const mathValue = (children[0] as { value?: string }).value ?? '';
+                if (mathValue.trim()) {
+                  drafts.push(textBlock('math', mathValue));
+                  return 'skip';
+                }
+              }
+            }
+          }
           const pText = extractTextWithMath(node);
           const hasInline = /\$[^$]+\$/.test(pText);
           drafts.push(textBlock('paragraph', pText, hasInline ? { hasInlineMath: true } : {}));

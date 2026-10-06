@@ -14,7 +14,7 @@
     "typecheck": "tsc -b",
     "predev": "node scripts/copy-pdfjs-wasm.mjs && node scripts/make-icons.mjs",
     "prebuild": "node scripts/copy-pdfjs-wasm.mjs && node scripts/make-icons.mjs",
-    "postbuild": "node scripts/verify-dist.mjs",
+    "postbuild": "node scripts/clean-onnx-wasm.mjs && node scripts/verify-dist.mjs",
     "copy-wasm": "node scripts/copy-pdfjs-wasm.mjs",
     "icons": "node scripts/make-icons.mjs",
     "verify-dist": "node scripts/verify-dist.mjs",

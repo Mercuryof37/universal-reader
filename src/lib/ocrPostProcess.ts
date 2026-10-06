@@ -21,6 +21,8 @@ const SAME_LINE_TOLERANCE = 5;
 const PARAGRAPH_BREAK_RATIO = 1.35;
 const HEADING_FONT_RATIO = 1.3;
 const HEADING_MAX_CHARS = 80;
+const HEADER_FOOTER_MARGIN_RATIO = 0.05;
+const HEADER_FOOTER_FONT_RATIO = 0.85;
 
 /**
  * 把 tesseract 的纯文本输出转成内容块。
@@ -123,7 +125,10 @@ function looksLikeHeading(text: string): boolean {
   );
 }
 
-export function ocrResultToBlocks(result: OcrPageResult): Omit<ContentBlock, 'id'>[] {
+export function ocrResultToBlocks(
+  result: OcrPageResult,
+  pageHeight?: number,
+): Omit<ContentBlock, 'id'>[] {
   // 关键兜底：拿不到词级坐标时，用纯文本也要产出内容。
   // 否则就会出现"识别出 7058 字却报告什么都没识别到"这种荒唐结果。
   if (!result.words.length) {
@@ -147,6 +152,9 @@ export function ocrResultToBlocks(result: OcrPageResult): Omit<ContentBlock, 'id
   const medianGap = median(gaps) || 0;
   const medianFontSize = median(lines.map((l) => l.fontSize)) || 12;
 
+  // Filter out header/footer lines: in top/bottom margin with small font
+  const filteredLines = filterHeaderFooter(lines, pageHeight, medianFontSize);
+
   const blocks: Omit<ContentBlock, 'id'>[] = [];
   let currentText = '';
   let currentConfSum = 0;
@@ -154,7 +162,7 @@ export function ocrResultToBlocks(result: OcrPageResult): Omit<ContentBlock, 'id
   let currentFontSize = 0;
   let prevY: number | null = null;
 
-  for (const line of lines) {
+  for (const line of filteredLines) {
     const gap = prevY === null ? 0 : Math.abs(prevY - line.y);
     const breakGap = medianGap > 0 ? medianGap * PARAGRAPH_BREAK_RATIO : line.fontSize * 1.35;
     const endsSentence = currentText && /[。！？!?.;；]$/.test(currentText);
@@ -215,6 +223,31 @@ export function ocrResultToBlocks(result: OcrPageResult): Omit<ContentBlock, 'id
   }
 
   return blocks;
+}
+
+/**
+ * Filter out header/footer lines based on position and font size.
+ *
+ * Headers/footers typically sit in the top/bottom 5% of the page
+ * and use smaller font than body text. Both conditions must be met
+ * to avoid stripping legitimate short content near page edges.
+ */
+function filterHeaderFooter(
+  lines: OcrLine[],
+  pageHeight: number | undefined,
+  medianFontSize: number,
+): OcrLine[] {
+  if (!pageHeight || pageHeight <= 0 || lines.length < 3) return lines;
+
+  const topThreshold = pageHeight * HEADER_FOOTER_MARGIN_RATIO;
+  const bottomThreshold = pageHeight * (1 - HEADER_FOOTER_MARGIN_RATIO);
+  const smallFontThreshold = medianFontSize * HEADER_FOOTER_FONT_RATIO;
+
+  return lines.filter((line) => {
+    const inMargin = line.y < topThreshold || line.y > bottomThreshold;
+    const smallFont = line.fontSize < smallFontThreshold;
+    return !(inMargin && smallFont);
+  });
 }
 
 function groupWordsIntoLines(words: OcrWord[]): OcrLine[] {

@@ -506,7 +506,7 @@ export async function ocrParsePdf(
           totalPages,
           onProgress,
         );
-        const blocks = ocrResultToBlocks(ocrResult);
+        const blocks = ocrResultToBlocks(ocrResult, pageCanvas.height);
         if (blocks.length) {
           allDrafts.push(...blocks);
           pagesProcessed++;

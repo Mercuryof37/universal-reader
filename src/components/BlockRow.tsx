@@ -214,11 +214,7 @@ function RichText({
 
   const inner = segments.map((seg, i) => {
     if (!seg.color || seg.annotationIds.length === 0) {
-      return block.metadata.hasInlineMath ? (
-        <span key={i}>{renderInlineMath(seg.text)}</span>
-      ) : (
-        <span key={i}>{seg.text}</span>
-      );
+      return <span key={i}>{renderInlineMath(seg.text)}</span>;
     }
     const isActive = activeId !== null && seg.annotationIds.includes(activeId);
     return (
@@ -230,7 +226,7 @@ function RichText({
         onClick={() => onPick(seg.annotationIds[0] ?? null)}
         title="点击查看该批注"
       >
-        {block.metadata.hasInlineMath ? renderInlineMath(seg.text) : seg.text}
+        {renderInlineMath(seg.text)}
       </mark>
     );
   });
@@ -293,6 +289,55 @@ function renderMath(tex: string, displayMode: boolean): string {
   }
 }
 
+/**
+ * Convert Unicode superscripts/subscripts and common ^/_ patterns to LaTeX.
+ * Only applied to plain text segments (not inside existing $...$ math).
+ */
+function normalizeSuperSub(text: string): string {
+  const SUPER_MAP: Record<string, string> = {
+    '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4',
+    '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9',
+    'ⁿ': 'n', 'ᵃ': 'a', 'ᵇ': 'b', 'ᶜ': 'c', 'ᵈ': 'd',
+    'ᵉ': 'e', 'ᶠ': 'f', 'ᵍ': 'g', 'ʰ': 'h', 'ⁱ': 'i',
+    'ʲ': 'j', 'ᵏ': 'k', 'ˡ': 'l', 'ᵐ': 'm', 'ᵒ': 'o',
+    'ᵖ': 'p', 'ʳ': 'r', 'ˢ': 's', 'ᵗ': 't', 'ᵘ': 'u',
+    'ᵛ': 'v', 'ʷ': 'w', 'ˣ': 'x', 'ʸ': 'y', 'ᶻ': 'z',
+    '⁺': '+', '⁻': '-', '⁽': '(', '⁾': ')',
+  };
+  const SUB_MAP: Record<string, string> = {
+    '₀': '0', '₁': '1', '₂': '2', '₃': '3', '₄': '4',
+    '₅': '5', '₆': '6', '₇': '7', '₈': '8', '₉': '9',
+    'ₐ': 'a', 'ₑ': 'e', 'ₕ': 'h', 'ᵢ': 'i', 'ⱼ': 'j',
+    'ₖ': 'k', 'ₗ': 'l', 'ₘ': 'm', 'ₙ': 'n', 'ₒ': 'o',
+    'ₚ': 'p', 'ᵣ': 'r', 'ₛ': 's', 'ₜ': 't', 'ᵤ': 'u',
+    'ᵥ': 'v', 'ₓ': 'x',
+    '₊': '+', '₋': '-', '₍': '(', '₎': ')',
+  };
+
+  const SUPER_RE = /[⁰¹²³⁴⁵⁶⁷⁸⁹ⁿᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐᵒᵖʳˢᵗᵘᵛʷˣʸᶻ⁺⁻⁽⁾]+/g;
+  const SUB_RE = /[₀₁₂₃₄₅₆₇₈₉ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ₊₋₍₎]+/g;
+
+  let result = text;
+
+  result = result.replace(SUPER_RE, (match) => {
+    const latex = [...match].map((ch) => SUPER_MAP[ch] ?? ch).join('');
+    return `$^{${latex}}$`;
+  });
+
+  result = result.replace(SUB_RE, (match) => {
+    const latex = [...match].map((ch) => SUB_MAP[ch] ?? ch).join('');
+    return `$_{${latex}}$`;
+  });
+
+  // Bare ^ and _ patterns in plain text only
+  result = result.replace(/(\w)\^\{([^}]+)\}/g, '$1$^{$2}$$');
+  result = result.replace(/(\w)\^(\w+)/g, '$1$^{$2}$$');
+  result = result.replace(/(\w)_\{([^}]+)\}/g, '$1$_{$2}$$');
+  result = result.replace(/(\w)_(\w+)/g, '$1$_{$2}$$');
+
+  return result;
+}
+
 /** 将含 $...$ 的文本拆分为普通文本 + 行内公式的 React 节点数组 */
 function renderInlineMath(text: string): React.ReactNode[] {
   const parts: React.ReactNode[] = [];
@@ -302,7 +347,11 @@ function renderInlineMath(text: string): React.ReactNode[] {
 
   while ((match = regex.exec(text)) !== null) {
     if (match.index > lastIndex) {
-      parts.push(text.slice(lastIndex, match.index));
+      const plainText = text.slice(lastIndex, match.index);
+      const normalized = normalizeSuperSub(plainText);
+      // Re-parse normalized text for any new $...$ created by normalizeSuperSub
+      const subParts = parseNormalizedText(normalized, lastIndex);
+      parts.push(...subParts);
     }
     const html = renderMath(match[1], false);
     parts.push(
@@ -312,8 +361,36 @@ function renderInlineMath(text: string): React.ReactNode[] {
   }
 
   if (lastIndex < text.length) {
-    parts.push(text.slice(lastIndex));
+    const plainText = text.slice(lastIndex);
+    const normalized = normalizeSuperSub(plainText);
+    const subParts = parseNormalizedText(normalized, lastIndex);
+    parts.push(...subParts);
   }
 
   return parts;
+}
+
+/** Parse text that may contain $...$ from normalizeSuperSub conversion */
+function parseNormalizedText(text: string, offsetBase: number): React.ReactNode[] {
+  const result: React.ReactNode[] = [];
+  const regex = /\$([^$]+)\$/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+
+  while ((m = regex.exec(text)) !== null) {
+    if (m.index > last) {
+      result.push(text.slice(last, m.index));
+    }
+    const html = renderMath(m[1], false);
+    result.push(
+      <span key={`ms-${offsetBase + m.index}`} dangerouslySetInnerHTML={{ __html: html }} />,
+    );
+    last = regex.lastIndex;
+  }
+
+  if (last < text.length) {
+    result.push(text.slice(last));
+  }
+
+  return result;
 }

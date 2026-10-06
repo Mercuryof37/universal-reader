@@ -8,7 +8,12 @@
  * - 模型从 HuggingFace CDN 下载并缓存。
  */
 import { PaddleOcrService, V6_SMALL_MODEL } from 'ppu-paddle-ocr/web';
+import * as ort from 'onnxruntime-web';
 import { errorReport } from '@/lib/diagnostics';
+
+// Force ONNX Runtime to load WASM from CDN instead of bundling locally.
+// The .wasm file is ~28MB which exceeds Cloudflare Pages' 25MB limit.
+ort.env.wasm.wasmPaths = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ort.env.versions.web ?? ort.env.versions.common}/dist/`;
 import {
   OCR_BLANK_LUMA_THRESHOLD,
   OCR_MAX_PIXELS,
