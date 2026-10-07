@@ -837,3 +837,77 @@ describe('跨行构件：阅读顺序', () => {
     expect(blocks[0]?.content).toBe('甲乙丙');
   });
 });
+
+/**
+ * ═══════════════════════════════════════════════════════════════
+ * 用**用户真实文档的数据**做回归保护
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 坐标、字号、词数全部取自用户导出的 `ocr-structure` JSON
+ * （那份习题 PDF：画布高 2223、23 个词、dominantFontSize 42.5）。
+ *
+ * 当时的故障是**整页被合并成了一行**：
+ *   第一行 yRange = [212, 1628]，跨度 **1416 像素**、含 **18 个词**。
+ * 后果就是整页挤成一段，题目 17/20/24/28 全连在一起。
+ *
+ * 根因：`canMergeAsBranch` 的判据 1（纵向重叠）与判据 2（横向压得实）
+ * **都没有纵向距离上限**，而 host 跨度会随每次合并不断变宽 →
+ * 链式反应 → 跨度覆盖页宽之后整页被吞。
+ *
+ * 这组用例钉的就是那个根因：**横向被包住但纵向隔很远的两行，绝不能并。**
+ */
+describe('真实文档回归：整页不得被合并成一行', () => {
+  // 第一题：长行，水平跨度 225→1604
+  const q17 = w(
+    '17. 设 随机 变量 (X ,Y) 具有 分 布律 P {X = x ,Y = y} = p (1 − p )x+y−2 ,0 < p < 1',
+    225,
+    212,
+    43,
+    1379,
+    90,
+  );
+  // 第三题：落在 q17 的水平跨度**之内**，但纵向低 719 像素
+  const q24 = w('24. 设随机变量(X,Y)的概率密度为', 211, 931, 43, 545, 93);
+  // 第四题：更低，纵向差 1185 像素
+  const q28 = w(
+    '28. 设 X,Y是相互独立的随机变量，它们都服从正态分布 N(0，σ²).试',
+    225,
+    1397,
+    38,
+    956,
+    94,
+  );
+
+  it('横向被包住、纵向隔了 719 像素的两行必须分开', () => {
+    const blocks = ocrResultToBlocks(pageResult({ words: [q17, q24] }));
+
+    // 修好之前这里只有 1 个块（整页一行）
+    expect(blocks.length).toBeGreaterThanOrEqual(2);
+    expect(blocks.some((b) => b.content.includes('17.'))).toBe(true);
+    expect(blocks.some((b) => b.content.includes('24.'))).toBe(true);
+  });
+
+  it('三题依次排开时，每个题号都还在，且不再是「整页一块」', () => {
+    const blocks = ocrResultToBlocks(pageResult({ words: [q17, q24, q28] }));
+    const text = blocks.map((b) => b.content).join('\n');
+
+    for (const marker of ['17.', '24.', '28.']) {
+      expect(text, `题号 ${marker} 不应消失`).toContain(marker);
+    }
+    expect(blocks.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('页脚（远在页面底部）不得被并进正文', () => {
+    // 真实页脚 y=2149，与正文最低的 q28（y=1397）相差 752 像素
+    const footer = w('单周周一下午2点前交作业', 634, 2149, 42, 401, 100);
+    const blocks = ocrResultToBlocks(pageResult({ words: [q17, q24, footer] }));
+
+    // 页脚要么被过滤掉、要么单独成块，但绝不能被并进某道题里
+    for (const b of blocks) {
+      if (b.content.includes('交作业')) {
+        expect(b.content.length).toBeLessThan(60);
+      }
+    }
+  });
+});
+
