@@ -251,6 +251,22 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       // 曾经这里显示给用户的是 "OCR 识别失败：undefined"，信息量为零。
       // 用 errorReport 保证任何抛出值都能变成可读、可复制上报的文本。
       console.error('[startOcr] 原始错误对象：', err);
+
+      /**
+       * 清掉中断记录 —— 因为**这次失败已经如实报给用户了**。
+       *
+       * 不这么做会污染「浏览器崩溃」的持久记录：那条记录是靠
+       * 「启动时发现上次识别没走完、且不是应用刷新的」来判定的，
+       * 而普通报错同样会留下没走完的痕迹。若不清掉，
+       * 用户下次重新加载页面时就会被误记成「浏览器崩过一次」，
+       * 累计两次就会把「开始识别」按钮禁掉 —— 明明只是识别失败而已。
+       *
+       * 真正被浏览器杀掉的进程没有机会执行到这里，
+       * 那条记录才会留到下次启动被记成崩溃。这正是两者的分界。
+       */
+      clearOcrAttempt();
+      clearOcrStage();
+
       set({
         error: `OCR 识别失败。\n\n${errorReport('（以下是诊断信息，可复制反馈）', err)}`,
         ocrProgress: null,
