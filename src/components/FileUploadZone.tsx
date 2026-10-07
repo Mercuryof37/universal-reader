@@ -5,6 +5,7 @@ import { useLibraryStore } from '@/store/libraryStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { OCR_LANG_OPTIONS, type OcrLang } from '@/lib/ocrTypes';
 import { detectOcrSupport } from '@/lib/ocrSupport';
+import { getInterruptedOcr, getLastReloadReason } from '@/lib/sessionDiagnostics';
 
 /**
  * 估算剩余时长。
@@ -49,8 +50,16 @@ export function FileUploadZone({ compact = false }: { compact?: boolean }) {
   const formulaOcrEnabled = useSettingsStore((s) => s.formulaOcrEnabled);
   const setFormulaOcrEnabled = useSettingsStore((s) => s.setFormulaOcrEnabled);
 
-  // 环境能力检测只做一次；结果不会在会话中变化
-  const [ocrSupport] = useState(() => detectOcrSupport());
+  // 环境能力与「上次是否崩过」只判定一次，结果不会在会话中变化
+  const [ocrSupport] = useState(() => {
+    const interrupted = getInterruptedOcr();
+    const lastReload = getLastReloadReason();
+    return detectOcrSupport({
+      hadInterruptedRun: interrupted !== null,
+      // 三条应用内刷新路径都没有记录 ⇒ 页面是被外部（浏览器）中断的
+      interruptedByExternal: interrupted !== null && lastReload === null,
+    });
+  });
 
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -125,16 +134,36 @@ export function FileUploadZone({ compact = false }: { compact?: boolean }) {
               </label>
 
               {/*
-                环境能力检测：不支持的内核要在**开始前**就说清楚。
-                起因是一次真实排查 —— 某国产浏览器（内核过旧）
-                在推理时会把整个页面弄没，且不留任何报错，
-                用户与应用都无从判断。与其让人撞上一次莫名崩溃，
-                不如在这里直接告知并给出可执行的建议。
+                环境判定：内核不支持 / 疑似有问题时，在**开始之前**就说清楚。
+                起因见 lib/ocrSupport.ts 的注释 —— 某外壳浏览器会在推理时
+                把整个页面弄没，不留任何报错，用户与应用都无从判断。
               */}
-              {!ocrSupport.ok && (
-                <div className="max-w-md rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-xs leading-relaxed text-amber-900 dark:text-amber-100">
-                  <p className="font-medium">这个浏览器无法运行文字识别</p>
+              {ocrSupport.level !== 'ok' && (
+                <div
+                  className={
+                    'max-w-md rounded-md border p-3 text-xs leading-relaxed ' +
+                    (ocrSupport.level === 'unsupported'
+                      ? 'border-red-500/40 bg-red-500/10 text-red-900 dark:text-red-100'
+                      : 'border-amber-500/40 bg-amber-500/10 text-amber-900 dark:text-amber-100')
+                  }
+                >
+                  <p className="font-medium">
+                    {ocrSupport.level === 'unsupported'
+                      ? '当前浏览器内核不支持此功能'
+                      : `当前浏览器可能无法稳定运行此功能${ocrSupport.problemBrowser ? `（${ocrSupport.problemBrowser}）` : ''}`}
+                  </p>
+
                   <p className="mt-1 whitespace-pre-line">{ocrSupport.reason}</p>
+
+                  <p className="mt-2">
+                    <span className="font-medium">推荐使用：</span>
+                    {ocrSupport.recommendation}
+                  </p>
+
+                  <p className="mt-1 opacity-80">
+                    只有扫描版 PDF 的文字识别需要用到这些能力；
+                    文字版 PDF 与 Markdown / TXT / EPUB 不受影响，可以正常导入阅读。
+                  </p>
                 </div>
               )}
 
@@ -169,13 +198,28 @@ export function FileUploadZone({ compact = false }: { compact?: boolean }) {
               <div className="flex gap-2">
                 <button
                   type="button"
+                  disabled={ocrSupport.level === 'unsupported'}
+                  /**
+                   * 内核确实不支持时**直接挡住**，而不是让用户点下去撞崩溃。
+                   * 上面那块提示已经说明了原因与替代浏览器，
+                   * 这里再点一次只会浪费他的时间，还可能把页面弄没、丢掉已导入的文件。
+                   *
+                   * 注意只对 `unsupported`（能力实测缺失）硬挡；
+                   * `risky`（已知外壳浏览器 / 上次崩过）**不禁用** ——
+                   * 那两条是启发式与历史记录，不该剥夺用户再试一次的机会。
+                   */
+                  title={
+                    ocrSupport.level === 'unsupported'
+                      ? '当前浏览器内核不支持文字识别，请改用推荐浏览器'
+                      : undefined
+                  }
                   onClick={() =>
                     void startOcr(
                       selectedLang,
                       pageLimit === 'all' ? undefined : Number(pageLimit),
                     )
                   }
-                  className="rounded-lg bg-[var(--reader-accent)] px-5 py-2 text-sm font-medium text-[var(--reader-bg)] transition-opacity hover:opacity-90"
+                  className="rounded-lg bg-[var(--reader-accent)] px-5 py-2 text-sm font-medium text-[var(--reader-bg)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   开始识别
                 </button>
