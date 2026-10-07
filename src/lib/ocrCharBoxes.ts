@@ -710,6 +710,27 @@ export interface CharScript {
 export const SCRIPT_CHAR_MAX_HEIGHT_RATIO = 0.8;
 export const SCRIPT_CHAR_MIN_SHIFT_RATIO = 0.15;
 export const SCRIPT_CHAR_MAX_SHIFT_RATIO = 0.5;
+/**
+ * 中心位移的门槛（相对主字高），**取 0**。
+ *
+ * 用来排除**中线符号**：等号这类字符墨迹天生只占中线，
+ * 底边高于基线但**中心并不上移**，只看底边会把它们判成上标
+ * （实测 `$^{=}$` 就是这么来的）。
+ *
+ * 为什么门槛是 0 而不是某个正数 —— 可以推出来：
+ *
+ *   中心位移 = 抬高量 + 半个自身字高 − 半个主字高      （均以主字高归一化）
+ *
+ *   · 实测那个等号：抬高 0.295、自身高 0.256 → **−0.077**（中心反而更低）；
+ *   · 恰好在抬高下限的浅上标（既有用例的夹具）：抬高 0.15、自身高 0.75 → **+0.025**。
+ *
+ * 两者分别落在 0 的两侧，所以门槛取 0 就能分开，而且**判据本身是有意义的**：
+ * 「升起来的字，中心不该低于正文中心」。
+ *
+ * 已知代价：抬高量很小、自身又偏高的字符可能被漏判。
+ * 按本文件一贯取舍 —— 宁可漏判，也不要把等号包成上标。
+ */
+export const SCRIPT_CHAR_MIN_CENTER_SHIFT_RATIO = 0;
 /** 判定所需的最少可测字符数（与词级判据的 `SCRIPT_MIN_LINE_WORDS` 同口径） */
 export const SCRIPT_MIN_MEASURED_CHARS = 3;
 /** 算基线时，「正常字」至少要有这么多个，否则不出结论 */
@@ -785,6 +806,36 @@ export function classifyCharsByGeometry(
   const minShift = mainHeight * SCRIPT_CHAR_MIN_SHIFT_RATIO;
   const maxShift = mainHeight * SCRIPT_CHAR_MAX_SHIFT_RATIO;
 
+  /**
+   * ═══════════════════════════════════════════════════════════════
+   * 为什么还必须看**中心**，不能只看底边（用户真实数据，实测）
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 只看底边会把**中线符号**判成上标。实测第 20 题那一行：
+   *
+   *   求  bbox [296, 1174.3, 320, 1202.8]  高 28.5  底边 1202.8  中心 1188.55
+   *   =  bbox [378, 1186.3, 398, 1193.6]  高  7.3  底边 1193.6  中心 1189.95
+   *
+   * 于是输出成了 `(2) 求 Z $^{=}$ X + Y 的概率密度.` —— **等号被包成了上标**。
+   *
+   * 但等号的**中心比正文还低 1.4px**：它根本没有「升高」，
+   * 它只是「矮」—— 等号的墨迹天生只占中线那两条横杠。
+   * 任何墨迹位于基线上方的中线符号（`=`、`≈`、`≡`、`~`）都会这样。
+   *
+   * 真正的上标是**整个字身都在更高处**：底边高，**中心也高**。
+   * 所以这里补一条中心位移判据，两条同时成立才算。
+   * 它能挡住全部中线符号，却不影响真正的指数 ——
+   * 指数被抬高后中心必然随之上移。
+   */
+  const normalCenters = idx
+    .filter((i) => (measurements[i]?.h ?? 0) >= mainHeight * SCRIPT_CHAR_MAX_HEIGHT_RATIO)
+    .map((i) => {
+      const m = measurements[i];
+      return m ? (m.y0 + m.y1) / 2 : 0;
+    });
+  const baselineCenter = medianOf(normalCenters);
+  const minCenterShift = mainHeight * SCRIPT_CHAR_MIN_CENTER_SHIFT_RATIO;
+
   const out: CharScript[] = [];
   for (const i of idx) {
     const m = measurements[i];
@@ -792,9 +843,19 @@ export function classifyCharsByGeometry(
 
     const up = baseline - m.y1;
     const down = m.y0 - baseline;
-    if (up >= minShift - SHIFT_EPSILON && up <= maxShift + SHIFT_EPSILON) {
+    const centerUp = baselineCenter - (m.y0 + m.y1) / 2;
+
+    if (
+      up >= minShift - SHIFT_EPSILON &&
+      up <= maxShift + SHIFT_EPSILON &&
+      centerUp >= minCenterShift - SHIFT_EPSILON
+    ) {
       out.push({ index: i, kind: 'super' });
-    } else if (down >= minShift - SHIFT_EPSILON && down <= maxShift + SHIFT_EPSILON) {
+    } else if (
+      down >= minShift - SHIFT_EPSILON &&
+      down <= maxShift + SHIFT_EPSILON &&
+      centerUp <= -minCenterShift + SHIFT_EPSILON
+    ) {
       out.push({ index: i, kind: 'sub' });
     }
   }
