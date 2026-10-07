@@ -1395,3 +1395,5 @@ describe('真实文档回归：公式主干（含中文的式子）仍然可以�
     expect(line?.fontSize).toBeCloseTo(78.7, 1);
   });
 });
+
+import '@/lib/ocrPostProcess.layout.test';

@@ -73,7 +73,31 @@ const REQUIRED_OCR_MODELS = [
   'detection/ort/PP-OCRv6_small_det.ort',
   'recognition/ort/PP-OCRv6_small_rec.ort',
   'recognition/ppocrv6_dict.txt',
+  // 版面分析模型（见 src/lib/layoutAnalysis.ts）。
+  // ⚠️ 它同样必须**硬失败**：缺了它的表现是「版面分析静默退回几何启发式」——
+  // 而几何启发式正是本次要替换掉的东西。也就是说缺了它站点看起来
+  // 完全正常，只是页眉页脚又会被当成正文、公式又会被当成大标题。
+  // 没有任何人会发现问题，所以必须在这里拦住。
+  'layout/PP-DocLayout-S.onnx',
 ];
+
+/**
+ * Cloudflare Pages 单个静态资源上限：**25 MiB**。
+ *
+ * 官方文档（https://developers.cloudflare.com/pages/platform/limits/ ）原文：
+ *   "The maximum file size for a single Cloudflare Pages site asset is 25 MiB."
+ *
+ * 为什么要把这条固化成构建门禁：超限的**唯一**表现是部署时报错，
+ * 而本地 `npm run build`、类型检查、单元测试**全都是绿的** ——
+ * 这个问题只会在真正部署时才暴露。这正是本脚本开头那张表里
+ * 同一类失败模式（源码看不出、产物才看得出）。
+ *
+ * 这条门禁的直接由来：初版方案打算用 PP-DocLayoutV2/V3 做版面分析，
+ * 实测它们分别是 203.42 MiB / 123.90 MiB —— 超限 5–8 倍。
+ * 没有这条检查的话，要等到部署那一步才会发现整个方案发布不上去。
+ */
+const MAX_ASSET_BYTES = 25 * 1024 * 1024;
+
 if (
   check(
     existsSync(ocrModelDir),
@@ -88,11 +112,28 @@ if (
       modelBytes += size;
       // 空文件或截断的下载也要拦住：那种情况浏览器会报 Failed to fetch 或解析失败
       check(size > 1024, `dist/ocr-models/${rel} 只有 ${size} 字节，像是下载失败`);
+      check(
+        size <= MAX_ASSET_BYTES,
+        `dist/ocr-models/${rel} 有 ${mb(size)}，超过 Cloudflare Pages 的单文件上限 ` +
+          `${mb(MAX_ASSET_BYTES)} —— 这个产物**部署不上去**（本地构建与测试都不会报错）`,
+      );
     }
   }
   if (modelBytes > 0) {
     notes.push(`OCR 模型 ${REQUIRED_OCR_MODELS.length} 个，合计 ${mb(modelBytes)}（同源发布）`);
   }
+}
+
+// ── 2c. **全部**产物都不能超过 Pages 的单文件上限 ─────────────
+// 不只是模型：任何一个静态资源超限都会让**整个站点**部署失败，
+// 而它同样不会在本地构建或单元测试里暴露出来。
+for (const file of walk(dist)) {
+  const size = statSync(file).size;
+  check(
+    size <= MAX_ASSET_BYTES,
+    `${file.slice(dist.length + 1)} 有 ${mb(size)}，超过 Cloudflare Pages 的单文件上限 ` +
+      `${mb(MAX_ASSET_BYTES)}`,
+  );
 }
 
 // ── 3. 不应存在 sourcemap ───────────────────────────────────
