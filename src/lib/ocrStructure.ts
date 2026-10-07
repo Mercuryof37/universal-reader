@@ -19,6 +19,9 @@
  */
 import type { ContentBlock } from '@/types/content';
 import type { OcrWord } from '@/lib/ocrTypes';
+// 字符框不在 `OcrWord` 上 —— 由 `ocrCharBoxes` 用 WeakMap 旁挂，必须显式取。
+// 这条例外值得写出来：看上去像"少了一个字段"，其实是刻意的设计。
+import { getAttachedChars } from '@/lib/ocrCharBoxes';
 
 /** 一个词在页面上的原始形态（字段名刻意取短，便于阅读与对比） */
 export interface OcrStructureWord {
@@ -34,6 +37,11 @@ export interface OcrStructureWord {
   height: number;
   /** 中心 y，判上下标时用的就是这个量 */
   centerY: number;
+  /**
+   * 字符级框。**只有真的拿到时才存在**（见下面 `wordEntries` 里的长注释）。
+   * 缺这个字段 = 字符级定位这一步没跑成，而不是"字符框为空"。
+   */
+  chars?: { char: string; bbox: [number, number, number, number] }[];
 }
 
 /** 一个词相对**本行基线**的实测几何：定阈值要看的正是这几个数 */
@@ -103,6 +111,8 @@ export interface OcrStructure {
   /** 所有词 */
   words: OcrStructureWord[];
   wordsTotal: number;
+  /** 拿到字符级框的词数；0 表示字符级定位这一步没跑成 */
+  wordsWithChars: number;
   /** 成行结果 */
   lines: OcrStructureLine[];
   linesTotal: number;
@@ -174,8 +184,45 @@ export function buildOcrStructure(input: {
       fontSize: round(word.fontSize),
       height: round(height),
       centerY: round((word.bbox.y0 + word.bbox.y1) / 2),
+      /**
+       * 字符级框（如果这一页拿到了）。
+       *
+       * ═══════════════════════════════════════════════════════════════
+       * 为什么必须导出它
+       * ═══════════════════════════════════════════════════════════════
+       *
+       * 字符级定位是判断上下标的**唯一依据**，而它整条链路都是
+       * 「拿不到就静默退回旧行为」（见 `ocrEngine.attachCharBoxes` 的注释）。
+       * 这个设计对用户是对的 —— 少一个字符框不该让整页识别失败；
+       * 但**对诊断是灾难**：导出里若没有字符框，就分不清
+       * 「功能没跑」「跑了但识别器建不起来」「跑了但没判出上下标」。
+       *
+       * 实测撞上过这一点：导出的 JSON 里既没有字符框、文本里也没有 `^{}`，
+       * 于是完全无从判断是哪一种。加字段比猜便宜得多。
+       *
+       * ⚠️ 字符框**不在 `word` 上**：`ocrCharBoxes` 刻意用 `WeakMap` 旁挂
+       * （没有字符框的词一个额外属性都不加），必须经 `getAttachedChars()` 取。
+       * 没有字符框时**不写这个字段**（而不是写空数组）——
+       * 「没有字段」与「有字段但为空」是两种不同的事实，前者说明这步没跑成。
+       */
+      ...(getAttachedChars(word)?.chars?.length
+        ? {
+            chars: getAttachedChars(word)!.chars.map((c) => ({
+              char: c.char,
+              bbox: [round(c.x0), round(c.y0), round(c.x1), round(c.y1)] as [
+                number,
+                number,
+                number,
+                number,
+              ],
+            })),
+          }
+        : {}),
     };
   });
+
+  /** 本页拿到字符框的词数 —— 一眼看出这一步到底跑没跑成 */
+  const wordsWithChars = wordEntries.filter((w) => w.chars?.length).length;
 
   const lineEntries: OcrStructureLine[] = input.lines.map((line) => {
     const ws = line.wordIndices
@@ -283,6 +330,15 @@ export function buildOcrStructure(input: {
     thresholds: thresholdsOf(input.thresholds),
     words: keptWords,
     wordsTotal: wordEntries.length,
+    /**
+     * 拿到字符级框的词数。
+     *
+     * **0 与「字段不存在」含义不同**，所以这里单独给一个计数：
+     *   · `wordsWithChars > 0` → 字符级定位跑通了；
+     *   · `wordsWithChars === 0` → 没跑通（识别器建不起来，或被降档画布等前置条件挡住）。
+     * 有了它，下一次导出就能一眼分清"功能没生效"与"生效了但没判出上下标"。
+     */
+    wordsWithChars,
     lines: keptLines,
     linesTotal: lineEntries.length,
     blocks,
