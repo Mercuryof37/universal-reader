@@ -13,10 +13,37 @@ import { recognizeFormula } from '@/services/formulaOcrService';
 import { useSettingsStore } from '@/store/settingsStore';
 import { OCR_MODEL_BASE, OCR_MODEL_FILES, buildOcrModel } from '@/lib/ocrModelSource';
 import { resolveExecutionProviders } from '@/lib/ocrExecutionProvider';
+import { noteOcrStage } from '@/lib/sessionDiagnostics';
 
 // Force ONNX Runtime to load WASM from CDN instead of bundling locally.
 // The .wasm file is ~28MB which exceeds Cloudflare Pages' 25MB limit.
 ort.env.wasm.wasmPaths = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ort.env.versions.web ?? ort.env.versions.common}/dist/`;
+
+/**
+ * 单线程运行 ONNX。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么必须设成 1
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * ONNX Runtime Web 默认会按 CPU 核数起线程池，用它那个
+ * `ort-wasm-simd-threaded.*.wasm` 构建。多线程版本依赖：
+ *   · `SharedArrayBuffer` —— 需要页面处于**跨源隔离**（COOP/COEP 响应头），
+ *     本站在 Cloudflare Pages 上并未开启；
+ *   · 从脚本 URL 创建 **Worker** —— 而我们的 wasm/worker 是从
+ *     `cdn.jsdelivr.net` **跨源**加载的，浏览器不允许从跨源地址直接 new Worker。
+ *
+ * 这两条一旦失败，Emscripten 的运行时会走 `abort()` 路径。
+ * `abort()` **不是 JS 异常**，它直接终止执行环境 ——
+ * 页面不会留下任何报错、不会进入我们的 catch，用户只看到进程消失、
+ * 页面被重载。这正是用户实测到的形态：
+ *   「刷新来源：不是应用发起的」「中断前最后走到：recognize」
+ *
+ * 设成 1 之后完全不用线程池，也就不碰 SharedArrayBuffer 与跨源 Worker。
+ * 代价是推理慢一些，但换来的是**失败时抛正常异常、能显示成错误横幅**，
+ * 而不是静默把页面带走。
+ */
+ort.env.wasm.numThreads = 1;
 import {
   OCR_BLANK_LUMA_THRESHOLD,
   OCR_MAX_PIXELS,
@@ -163,34 +190,41 @@ function factorForMaxPixels(
   return pixels <= maxPixels ? 1 : Math.sqrt(maxPixels / pixels);
 }
 
-/** 将 canvas 转为 PNG ArrayBuffer 供 PaddleOCR 消费 */
-async function canvasToBuffer(
+/**
+ * 把各种图像输入统一成 `HTMLCanvasElement`。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么**不再**编码成 PNG buffer
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 原先这里把画布 `toBlob('image/png')` 再 `arrayBuffer()`，然后把 buffer
+ * 交给 `recognize()`。那是一条又贵又脆的路径：
+ *   · 一张 8.3 MP 的画布编码成 PNG 要遍历全部像素，还要额外分配 blob 与 buffer 两份内存；
+ *   · `toBlob` 是浏览器内部的异步编码，失败了**既没有异常也没有回调**，
+ *     我们只能拿到 null —— 而在它内部崩溃时连 null 都拿不到，是进程直接消失。
+ *
+ * 而本库的 `recognize()` 本来就接受画布对象（`CanvasLike` 只需要
+ * `width` / `height` / `getContext('2d')`，`HTMLCanvasElement` 完全满足）。
+ * 直接传画布：少一次全图编码、少两份大内存，也少了一个会静默失败的环节。
+ */
+function toCanvas(
   imageData: ImageData | HTMLCanvasElement | OffscreenCanvas,
-): Promise<ArrayBuffer> {
-  let canvas: HTMLCanvasElement;
+): HTMLCanvasElement | null {
+  if (typeof document === 'undefined') return null;
+  if (imageData instanceof HTMLCanvasElement) return imageData;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = imageData.width;
+  canvas.height = imageData.height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
 
   if (imageData instanceof ImageData) {
-    canvas = document.createElement('canvas');
-    canvas.width = imageData.width;
-    canvas.height = imageData.height;
-    const ctx = canvas.getContext('2d')!;
     ctx.putImageData(imageData, 0, 0);
-  } else if (imageData instanceof OffscreenCanvas) {
-    const blob = await imageData.convertToBlob({ type: 'image/png' });
-    return blob.arrayBuffer();
   } else {
-    canvas = imageData;
+    ctx.drawImage(imageData, 0, 0);
   }
-
-  return new Promise((resolve, reject) => {
-    canvas.toBlob(
-      (blob) => {
-        if (!blob) reject(new Error('canvas.toBlob returned null'));
-        else blob.arrayBuffer().then(resolve, reject);
-      },
-      'image/png',
-    );
-  });
+  return canvas;
 }
 
 export type { OcrLang, OcrPageResult, OcrProgress, OcrWord };
@@ -339,8 +373,18 @@ class OcrEngine {
           : `${factor === maxPixelFactor ? '上限缩放' : '降档'} ×${factor.toFixed(2)}`;
 
       try {
-        const buffer = await canvasToBuffer(input);
-        const result = await this.service!.recognize(buffer, { flatten: true });
+        noteOcrStage('to-canvas', `第 ${pageNum} 页：${label} → 准备画布`);
+        const canvas = toCanvas(input);
+        if (!canvas) {
+          lastError = new Error('无法把页面图像转换为画布');
+          continue;
+        }
+
+        // 直接把画布交给 OCR（不再编码 PNG，见 toCanvas 的注释）
+        noteOcrStage('onnx', `第 ${pageNum} 页：${label} → 送入推理（${canvas.width}×${canvas.height}）`);
+        const result = await this.service!.recognize(canvas, { flatten: true });
+
+        noteOcrStage('onnx-done', `第 ${pageNum} 页：${label} → 推理返回`);
         if (factor < 0.999) {
           console.info(`[ocrEngine] 第 ${pageNum} 页以「${label}」识别成功`);
         }
