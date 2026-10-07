@@ -4,6 +4,7 @@ import { SUPPORTED_EXTENSIONS, SUPPORTED_HINT } from '@/parsers';
 import { useLibraryStore } from '@/store/libraryStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { OCR_LANG_OPTIONS, type OcrLang } from '@/lib/ocrTypes';
+import { detectOcrSupport } from '@/lib/ocrSupport';
 
 /**
  * 估算剩余时长。
@@ -47,6 +48,9 @@ export function FileUploadZone({ compact = false }: { compact?: boolean }) {
 
   const formulaOcrEnabled = useSettingsStore((s) => s.formulaOcrEnabled);
   const setFormulaOcrEnabled = useSettingsStore((s) => s.setFormulaOcrEnabled);
+
+  // 环境能力检测只做一次；结果不会在会话中变化
+  const [ocrSupport] = useState(() => detectOcrSupport());
 
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -119,6 +123,20 @@ export function FileUploadZone({ compact = false }: { compact?: boolean }) {
                   <option value="all">全部 {scannedPdf.pageCount} 页</option>
                 </select>
               </label>
+
+              {/*
+                环境能力检测：不支持的内核要在**开始前**就说清楚。
+                起因是一次真实排查 —— 某国产浏览器（内核过旧）
+                在推理时会把整个页面弄没，且不留任何报错，
+                用户与应用都无从判断。与其让人撞上一次莫名崩溃，
+                不如在这里直接告知并给出可执行的建议。
+              */}
+              {!ocrSupport.ok && (
+                <div className="max-w-md rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-xs leading-relaxed text-amber-900 dark:text-amber-100">
+                  <p className="font-medium">这个浏览器无法运行文字识别</p>
+                  <p className="mt-1 whitespace-pre-line">{ocrSupport.reason}</p>
+                </div>
+              )}
 
               <p className="max-w-md text-xs leading-relaxed text-[var(--reader-muted)]">
                 建议先用前 10 页试跑：确认识别质量与单页耗时后再决定整本处理。
