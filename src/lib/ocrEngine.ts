@@ -227,6 +227,35 @@ function toCanvas(
   return canvas;
 }
 
+/**
+ * 把设备内存与当前 JS 堆用量拼成一句可显示的诊断文本。
+ *
+ * 为什么要记这个：进程在推理时静默消失，可能是被系统 OOM 杀的，
+ * 也可能是 WASM 侧的 abort。两者处理方式完全不同，而在没有控制台的情况下
+ * 唯一能区分的办法就是**把当时的机器内存状况一并记下来**，
+ * 让它出现在用户能看到的诊断轨迹里。
+ *
+ * `deviceMemory` 只有 Chromium 系提供（单位 GB，且会被取整到 0.25/0.5/1/2/4/8），
+ * `performance.memory` 更是 Chrome 专有 —— 两者都取不到时就不显示，不报错。
+ */
+function describeMemory(): string {
+  const parts: string[] = [];
+
+  const deviceMemory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory;
+  if (typeof deviceMemory === 'number') parts.push(`设备内存约 ${deviceMemory}GB`);
+
+  const perf = performance as Performance & {
+    memory?: { usedJSHeapSize: number; jsHeapSizeLimit: number };
+  };
+  if (perf.memory) {
+    const used = Math.round(perf.memory.usedJSHeapSize / 1024 / 1024);
+    const limit = Math.round(perf.memory.jsHeapSizeLimit / 1024 / 1024);
+    parts.push(`JS 堆 ${used}/${limit}MB`);
+  }
+
+  return parts.length ? ` · ${parts.join('，')}` : '';
+}
+
 export type { OcrLang, OcrPageResult, OcrProgress, OcrWord };
 export { OCR_LANG_OPTIONS } from '@/lib/ocrTypes';
 
@@ -381,7 +410,7 @@ class OcrEngine {
         }
 
         // 直接把画布交给 OCR（不再编码 PNG，见 toCanvas 的注释）
-        noteOcrStage('onnx', `第 ${pageNum} 页：${label} → 送入推理（${canvas.width}×${canvas.height}）`);
+        noteOcrStage('onnx', `第 ${pageNum} 页：${label} → 送入推理（${canvas.width}×${canvas.height}）${describeMemory()}`);
         const result = await this.service!.recognize(canvas, { flatten: true });
 
         noteOcrStage('onnx-done', `第 ${pageNum} 页：${label} → 推理返回`);
