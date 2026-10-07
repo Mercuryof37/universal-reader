@@ -99,6 +99,30 @@ const SCRIPT_SUB_BAND = 1.2;
 const SCRIPT_FRAGMENT_GAP = 0.6;
 /** 同一个上下标被切成多个词时，兄弟词之间的纵向错位上限（较小字高倍数） */
 const SCRIPT_FRAGMENT_DY = 0.5;
+/**
+ * 孤立成行的上下标候选，文本长度上限（字符）。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么「孤立的上下标」还要有一条长度判据
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * `attachDetachedScriptLines` 是「上下标被拆到另一行」时的最后补救，
+ * 它的几何判据本身**极弱**（方向对 + 行间距离 ≤ 0.9 倍参考字号 +
+ * 水平间隙 ≤ 0.6 倍较小字高），弱到能把**下一行的正文**整行吸上来：
+ *   · 参考字号 40 时上限是 36 —— 而正文行高 36 是常事（实测回归 C 的词 16
+ *     正是 36 高），「更小」这道闸对它形同虚设；
+ *   · 行间距离 17px ≤ 36px —— 普通行距本来就落在这个范围内；
+ *   · 水平间隙算出来是**负数**（225 − 778 = −553），因为两行横向重叠 ——
+ *     `负数 > 上限` 恒为假，「水平紧邻」这道闸同样形同虚设。
+ * 三条判据全部形同虚设，于是实测里
+ * `验证随机变量 Z = √X2 + Y 的概率密度为`（22 字符、框宽 611px）
+ * 被当成词 15 的下标挂了上去，**两行正文并成一行**。
+ *
+ * 真正的上下标是**小片段**：实测合法形态是 `-(x+y)`（6 字符，见文件顶部）、
+ * `i`、`2`、`-`。取值 12 与 `looksLikeMathBranch` 的上限同口径 ——
+ * 同一个「多长还算片段」的定义不该有两套。
+ */
+const SCRIPT_MAX_FRAGMENT_CHARS = 12;
 /** 跨行构件合并：分支被主机包住时允许的外溢比例 */
 const CLUSTER_BRANCH_SLACK = 0.2;
 /** 跨行构件合并：分支宽度最多是主机的这个比例（更宽的就不是「分支」） */
@@ -753,6 +777,25 @@ function attachDetachedScriptLines(
     const only = line.words[0];
     if (!only || !only.text.trim()) continue;
     if (!(only.fontSize > 0) || only.fontSize > maxScriptHeight) continue;
+
+    /**
+     * 判据 0：孤立成行的上下标必须是个**小片段**（说明见 `SCRIPT_MAX_FRAGMENT_CHARS`）。
+     *
+     * 两条都要求：
+     *  · 文本够短（≤12 字符）—— 一整行正文（实测 22 字符）不是上下标；
+     *  · 含**实义字符**（字母/数字/汉字）—— 上下标是内容（指数、下标），
+     *    孤立的 `）`、`、` 这类标点不是。
+     *    （实义字符沿用 `WORD_CHAR_RE` 的定义，见文件下方「按字符类别决定
+     *    两段文本之间要不要插空格」一节 —— 同一个概念不该有两套写法。）
+     *
+     * ⚠️ 这里只**收紧**候选范围，不改动任何既有阈值：
+     * 过了这一关的候选，后面仍旧逐条走原来的方向 / 距离 / 水平间隙判据。
+     * 因此真正的孤立指数（`-(x+y)` 这种）行为完全不变。
+     */
+    const fragment = only.text.trim();
+    if (fragment.length > SCRIPT_MAX_FRAGMENT_CHARS) continue;
+    if (!WORD_CHAR_RE.test(fragment)) continue;
+
     candidates.push(line);
   }
 
@@ -1103,13 +1146,30 @@ function mergeContainedBranches(lines: OcrLine[], pageMainFontSize: number): Ocr
     if (!seed) continue;
 
     used[i] = true;
+
+    /**
+     * ═══════════════════════════════════════════════════════════════
+     * 成句的正文**不能当主机**（这是三个回归的共同根因）
+     * ═══════════════════════════════════════════════════════════════
+     *
+     * 依据与实测数字见 `looksLikeBodyProse`：宽度优先之后，
+     * 「页面上最宽的那行」通常就是正文行，它一旦当上主机，
+     * 邻近的正文行/孤立符号就会以「更窄 + 更近」的几何条件被吸收，
+     * 结果是**两个视觉行焊成一行**（实测 yRange 跨度从 62px 撑到 184px）。
+     *
+     * 判据放在这里（而不是逐条挪进 `canMergeAsBranch`）的原因：
+     * 主机身份是**整簇**的性质 —— 一旦这个种子被判为正文，它就不该吸收任何行；
+     * 而它自己仍然要作为一个独立的行留在结果里（下面照样 `out.push(seed)`），
+     * 不能因为「它不能当主机」就把这一行丢掉。
+     */
+    const canHost = !looksLikeBodyProse(seed);
     const cluster: OcrLine[] = [seed];
     let mergedSpan = horizontalSpanOf(seed);
     let mergedV = verticalSpanOf(seed);
     let refFont = Math.max(seed.fontSize, pageMainFontSize);
 
     // 反复扫描直到不再有新的行被并进来（一条分支下方可能还有分支）
-    let extended = true;
+    let extended = canHost;
     while (extended) {
       extended = false;
       for (let j = 0; j < byWidth.length; j++) {
@@ -1146,6 +1206,90 @@ function mergeContainedBranches(lines: OcrLine[], pageMainFontSize: number): Ocr
   return out;
 }
 
+/** 把一行的词拼成文本。构件合并之前 `line.text` 还没生成，只能按词拼。 */
+function lineTextOf(line: OcrLine): string {
+  return line.words.map((w) => w.text).join('').trim();
+}
+
+/**
+ * ═══════════════════════════════════════════════════════════════
+ * 这一行是不是「一整句正文」
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 为什么必须有这条判据（用户真实数据的三个回归）
+ * ───────────────────────────────────────────────────────────────
+ *
+ * 上一轮为了让「跨行大括号 / 堆叠分数」能合并，把构件合并改成了
+ * **宽度大的行先当主机**（见 `mergeContainedBranches`）。而页面上最宽的行
+ * 恰恰是**正文行**，于是它成了主机，邻近的正文行在几何上又完全满足
+ * 「比主机窄 + 纵向间隔在 1.4 倍字号带内」—— 就被当成「分支」吸收了：
+ *
+ *  · **B（最严重）**：词 19 `我们称 Z 服从参数 为σ(σ > 0) 的瑞利(Rayleigh)
+ *    分布.`（38 字符 / 13 个汉字，x166–918、宽 752、字号 37）当上主机后，
+ *    把上方的公式检测框 `fz(e)= 0`（x255–739、宽 484、字号 121）并了进来 ——
+ *    横向比值 **484 / 752 = 0.64 ≥ 0.60**，正好越过「横向压得实」那道闸
+ *    （判据 2），纵向间隔只有 26px。两行于是焊成一行（yRange 跨度 184px）。
+ *  · **A**：词 13 `(1)问 X 和 Y 是否相互独立？`（17 字符 / 8 个汉字）当上主机后，
+ *    把上一行掉下来的孤立 `）`（x433–477、宽 44、字号 36）吸了进来，
+ *    两者间隔只有 25px（1097→1122）—— 走的是判据 3。
+ *  · **C**：词 15 `28. 设 X,Y…概率密度为`（61 字符 / 33 个汉字）成为主机后，
+ *    `mergeContainedBranches` 判不进来（横向比值 553/956 = 0.58 < 0.60，
+ *    且 22 字符的候选过不了 `looksLikeMathBranch` 的 12 字符上限），
+ *    但下面的 `attachDetachedScriptLines` 把词 16
+ *    `验证随机变量 Z = √X2 + Y 的概率密度为` 当成词 15 的**下标**挂了上去
+ *    （见那里的判据）：它只查「方向 + 行间距离 + 水平间隙」，而两行横向重叠时
+ *    水平间隙算出来是负数（225 − 778 = −553），判据形同虚设。
+ *
+ * 几何判据本身分不清这两种情况 —— 因为**它们的几何确实一样**：
+ * 「跨行大括号的分支」与「同一段的下一行正文」都是「更窄、更近」。
+ * 但文本不一样：**构件的主干是式子或短标签，不是一句成句的正文**。
+ *
+ * 判据：两条独立证据，满足**任一条**即认定为成句正文 ——
+ *
+ *  一. **以句末标点收尾，且句中有实义汉字**：一句话到这里说完了。
+ *      实测 A 的主机 `(1)问 X 和 Y 是否相互独立？`（8 个汉字 + `？`）正属此类。
+ *      要求「有实义汉字」是为了不误伤纯符号的式子（`X = Y.` 这类不该被拒）。
+ *
+ *  二. **够长（≥ 24 字符）且汉字够密（≥ 10 个）**。
+ *      实测两条正文主机分别长 38 字符 / 13 个汉字、61 字符 / 33 个汉字；
+ *      而同一份数据里真正当主机的式子都在 19 字符以内 ——
+ *      尤其是 `其中λ>0，μ>0是常数.引入随机变量`（19 字符 / 11 个汉字），
+ *      它是词 4/5/6 那一组的主机，**必须继续能当主机**（既有行为，不许弄坏）。
+ *      门槛取 24 就落在 19 与 38 中间，两侧各留 5 / 14 个字符的余量。
+ *      「汉字 ≥ 10」是防误伤的第二道：长**式子**（`f(x,y)=1/2(x+y)e^{-(x+y)}`
+ *      这类 20+ 字符的纯公式）字符数不少但汉字为 0，不该被判成正文。
+ *
+ * 与已有的 `looksLikeMathBranch` 分工：那条判**分支**（短片段），
+ * 这条判**主干**（成句正文）。两者都只看文本，不看几何 ——
+ * 几何在这一层已经证明分不开了。
+ *
+ * ⚠️ 代价是刻意接受的：一句很长的中文**公式**（≥24 字符、≥10 个汉字）当主机时
+ * 不再吸收下方的分支。按本文件一贯的取舍，宁可漏合并（少一层排版还原），
+ * 也不能把两行无关文字焊成一行 —— 后者用户读到的内容是错的。
+ */
+const SENTENCE_END_RE = /[。！？!?.;；]$/;
+/** 成句正文的长度门槛（字符）：19（必须放过的公式主机）< 24 < 38（实测的正文主机） */
+const PROSE_MIN_LENGTH = 24;
+/** 成句正文的汉字密度门槛：实测正文主机 13 / 33 个汉字，公式主机最多 11 个 */
+const PROSE_MIN_CJK = 10;
+/** 「以句末标点收尾」这条证据要求的最小汉字数（防纯符号式子被误判） */
+const SENTENCE_MIN_CJK = 4;
+/** 与文件下方的 `CJK_CHAR_RE` 是同一组区间，这里是**计数**用的全局版本 */
+const CJK_COUNT_RE = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/g;
+
+function cjkCountOf(text: string): number {
+  return text.match(CJK_COUNT_RE)?.length ?? 0;
+}
+
+function looksLikeBodyProse(line: OcrLine): boolean {
+  const text = lineTextOf(line);
+  if (!text) return false;
+
+  const cjk = cjkCountOf(text);
+  if (SENTENCE_END_RE.test(text) && cjk >= SENTENCE_MIN_CJK) return true;
+  return text.length >= PROSE_MIN_LENGTH && cjk >= PROSE_MIN_CJK;
+}
+
 /**
  * 「像公式/数值的片段」而不是普通正文。
  *
@@ -1166,7 +1310,7 @@ const ASCII_FRAGMENT_RE = /^[\x20-\x7e]+$/;
 const SHORT_FRAGMENT_MAX_CHARS = 3;
 
 function looksLikeMathBranch(line: OcrLine, pageMainFontSize: number): boolean {
-  const text = line.words.map((w) => w.text).join('').trim();
+  const text = lineTextOf(line);
   if (!text) return false;
   // 太长的一段文字就不是「分支」了
   if (text.length > 12) return false;
@@ -1191,6 +1335,16 @@ function canMergeAsBranch(
   const span = horizontalSpanOf(cand);
   const spanWidth = span.x1 - span.x0;
   if (spanWidth <= 0) return false;
+
+  // ── 前置判据：成句的正文**不是分支** ─────────────────────────
+  //
+  // 与主机那条判据（见 `looksLikeBodyProse`）同源、方向相反：
+  // 主机不能是成句正文，分支也不能是成句正文 —— 「构件」这个概念本身就
+  // 要求两侧都是式子/片段。缺了这条，判据 1（纵向重叠）与判据 2
+  // （横向压得实）就成了**成句正文互相吞并**的通道：
+  // 实测回归 B 里 `我们称 Z 服从参数 为σ(σ > 0) 的瑞利(Rayleigh) 分布.`
+  // 与 `fz(e)= 0` 的横向比值是 0.64，正好从判据 2 进来。
+  if (looksLikeBodyProse(cand)) return false;
 
   // 前提：分支被主机「包住」（允许 20% 的外溢，因为括线常探出主式一点）
   const slack = spanWidth * CLUSTER_BRANCH_SLACK;

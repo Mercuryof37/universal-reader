@@ -1087,3 +1087,311 @@ describe('真实文档回归：跨行构件内的词序必须按 y', () => {
     expect(blocks[0]?.content).toBe('甲乙丙丁戊己庚辛壬');
   });
 });
+
+// ═══════════════════════════════════════════════════════════════
+// 以下内容追加到 src/lib/ocrPostProcess.test.ts 的**文件末尾**
+//（该文件里已有 `w` / `pageResult` / `REAL_CANVAS_HEIGHT` 三个 helper，
+// 这里直接复用，不再声明 —— 重名会直接编译不过）
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * ═══════════════════════════════════════════════════════════════
+ * 用户那份习题 PDF 第 1 页的**完整真实导出**
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 23 个词、15 条 line、14 个 block（`canvasHeight: 2223`、
+ * 导出的 `dominantFontSize: 43`）。坐标、字号全部照抄 `ocr-structure` JSON，
+ * 一个数都没有改；词序就是导出里的 `i`。
+ *
+ * ⚠️ 最容易搞错的一个量：导出里的 `dominantFontSize: 43` 是**行字号的中位数**
+ * （`ocrResultToBlocks` 传给 `buildOcrStructure` 的就是 `medianFontSize`），
+ * 而 `groupWordsIntoLines` 内部真正用的是**词高的众数**
+ * `dominantFontSize(words)`。这一页的众数是 **36**（36 高有 5 个词：
+ * 0/2/10/13/16；43 高只有 4 个），所以 `0.9 × 36 = 32.4` ——
+ * 36 高的词 10 / 13 / 16 **都进不了上下标候选**。这一点必须照实复现，
+ * 否则整页会走成另一条完全不同的路径（把参考字号当成 40 时，
+ * 词 16 会被 `attachDetachedScriptLines` 当成词 15 的下标挂上去）。
+ */
+const branchRealWord = (
+  text: string,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  fontSize: number,
+) => ({ text, confidence: 90, bbox: { x0, y0, x1, y1 }, fontSize });
+
+const BRANCH_REAL_WORDS = [
+  branchRealWord('概率论与数理统计习题5', 657, 44, 1010, 80, 36),
+  branchRealWord(
+    '17. 设 随机 变量 (X ,Y) 具有 分 布律 P {X = x ,Y = y} = p (1 − p )x+y−2 ,0 < p < 1,x ,y 均为 正',
+    225,
+    212,
+    1604,
+    255,
+    43,
+  ),
+  branchRealWord('整数，问X，Y是否相互独立.', 147, 266, 573, 302, 36),
+  branchRealWord('20. 设 X和Y是相互独立的随机变量，其概率密度分别为', 225, 418, 1050, 460, 42),
+  branchRealWord('其中λ>0，μ>0是常数.引入随机变量', 162, 568, 752, 609, 41),
+  branchRealWord('Z= 当X>Y', 258, 599, 647, 723, 124),
+  branchRealWord('=10, 当X>Y', 343, 649, 628, 720, 71),
+  branchRealWord('(1） 求 条件 概率 密度 f x|Y(x |y).', 228, 720, 709, 763, 43),
+  branchRealWord('(2) 求 Z 的分布律和分布函数.', 231, 775, 681, 812, 37),
+  branchRealWord('24. 设随机变量(X,Y)的概率密度为', 211, 931, 756, 974, 43),
+  branchRealWord('）', 433, 1061, 477, 1097, 36),
+  branchRealWord('0，', 566, 1066, 639, 1120, 54),
+  branchRealWord('其他', 810, 1066, 912, 1120, 54),
+  branchRealWord('(1)问 X 和 Y 是否相互独立？', 218, 1122, 649, 1158, 36),
+  branchRealWord('(2) 求 Z = X + Y 的概率密度.', 215, 1170, 681, 1208, 38),
+  branchRealWord('28. 设 X,Y是相互独立的随机变量，它们都服从正态分布 N(0，σ²).试', 225, 1397, 1181, 1435, 38),
+  branchRealWord('验证随机变量 Z = √X2 + Y 的概率密度为', 167, 1452, 778, 1488, 36),
+  branchRealWord('fz(e)= 0', 255, 1482, 739, 1603, 121),
+  branchRealWord('0, 其他', 480, 1574, 709, 1628, 54),
+  branchRealWord('我们称 Z 服从参数 为σ(σ > 0) 的瑞利(Rayleigh) 分布.', 166, 1629, 918, 1666, 37),
+  branchRealWord(
+    '35. 设 X,Y是相互独立的随机变量,X ∼ b(n1,p),Y∼ b(n2,p),证明Z = X +Y∼b(n1+n₂,',
+    215,
+    1826,
+    1519,
+    1869,
+    43,
+  ),
+  branchRealWord('P).', 140, 1868, 231, 1926, 58),
+  branchRealWord('单周周一下午2点前交作业', 634, 2149, 1035, 2191, 42),
+];
+
+type BranchLine = {
+  text: string;
+  y: number;
+  fontSize: number;
+  wordIndices: number[];
+  xRange: [number, number];
+  yRange: [number, number];
+  hasScripts: boolean;
+};
+
+type BranchStructure = {
+  dominantFontSize: number;
+  lines: BranchLine[];
+  blocks: { type: string; content: string }[];
+};
+
+function branchStructureOf(words: Parameters<typeof pageResult>[0]['words']): BranchStructure {
+  let captured: BranchStructure | undefined;
+  ocrResultToBlocks(pageResult({ words }), REAL_CANVAS_HEIGHT, (s) => {
+    captured = s as unknown as BranchStructure;
+  });
+  if (!captured) throw new Error('导出回调没有被调用');
+  return captured;
+}
+
+/** 取「包含某个词」的那一条 line（下标就是导出里的 `i`，直接写真实数字） */
+const branchLineWith = (structure: BranchStructure, index: number) =>
+  structure.lines.find((line) => line.wordIndices.includes(index));
+
+/** 整页的真实结构（每个用例都重新算一次，避免相互污染） */
+const branchRealPage = () => branchStructureOf(BRANCH_REAL_WORDS);
+
+/**
+ * ═══════════════════════════════════════════════════════════════
+ * 真实文档回归：构件合并不得把正文行焊成一行
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 上一轮为了让「跨行大括号 / 堆叠分数」能合并，把 `mergeContainedBranches`
+ * 改成了**宽度大的行先当主机**。而页面上最宽的行恰恰是**正文行**，
+ * 于是它成了主机，邻近的正文行在几何上又完全满足「比主机窄 +
+ * 纵向间隔在 1.4 倍字号带内」—— 就被当成「分支」吸收了。
+ * 下面用的就是导出里那几行，`wordIndices` / `yRange` 都照抄导出。
+ */
+describe('真实文档回归：构件合并不得把正文行焊成一行', () => {
+  it('A：孤立的 `）`（词 10）不得被并进下一行正文（词 13）', () => {
+    // 回归时（实测导出）：一条 line 的 wordIndices = [10, 13]、yRange = [1061, 1158]
+    const structure = branchRealPage();
+
+    expect(branchLineWith(structure, 13)?.wordIndices).toEqual([13]);
+    expect(branchLineWith(structure, 13)?.yRange).toEqual([1122, 1158]);
+    expect(branchLineWith(structure, 10)?.wordIndices).toEqual([10]);
+    expect(branchLineWith(structure, 10)?.yRange).toEqual([1061, 1097]);
+
+    // 块一级：孤立符号与下一行各自成块（导出里它们是同一个 block）
+    expect(structure.blocks.find((b) => b.content === '）')).toBeDefined();
+    expect(
+      structure.blocks.some((b) => b.content === '(1)问 X 和 Y 是否相互独立？'),
+    ).toBe(true);
+  });
+
+  it('B：整句正文（词 19）不得被公式块吞掉', () => {
+    // 回归时（实测导出）：一条 line 的 wordIndices = [17, 18, 19]、
+    // yRange = [1482, 1666]（跨度 184px）、fontSize 70.7
+    const structure = branchRealPage();
+
+    expect(branchLineWith(structure, 19)?.wordIndices).toEqual([19]);
+    expect(branchLineWith(structure, 19)?.yRange).toEqual([1629, 1666]);
+    expect(branchLineWith(structure, 19)?.fontSize).toBe(37);
+    expect(
+      structure.blocks.some(
+        (b) => b.content === '我们称 Z 服从参数 为σ(σ > 0) 的瑞利(Rayleigh) 分布.',
+      ),
+    ).toBe(true);
+
+    // 公式那一对（跨行大括号的下分支）**仍然要合并** —— 修的是过度合并，不是禁止合并
+    expect(branchLineWith(structure, 17)?.wordIndices).toEqual([17, 18]);
+    expect(branchLineWith(structure, 17)?.yRange).toEqual([1482, 1628]);
+  });
+
+  it('C：两行普通正文（词 15 / 词 16）不得互相并', () => {
+    // ⚠️ 诚实说明：**在这份导出里 C 并没有发生** —— 词 15（yRange [1397,1435]）
+    // 与词 16（yRange [1452,1488]）本来就是两条 line（只在同一个 block 里）。
+    // 原因是这一页的词高众数是 36，而 `attachDetachedScriptLines` 要求候选
+    // `fontSize ≤ 0.9 × 参考字号 = 32.4` —— 36 高的词 16 根本进不了候选。
+    // 所以这条是**守卫用例**（防止以后被回归引入），不是复现用例；
+    // 同一条判据真正的漏洞见下面那条构造用例。
+    const structure = branchRealPage();
+
+    expect(branchLineWith(structure, 15)?.wordIndices).toEqual([15]);
+    expect(branchLineWith(structure, 16)?.wordIndices).toEqual([16]);
+    expect(branchLineWith(structure, 16)?.yRange).toEqual([1452, 1488]);
+  });
+
+  it('整页不变量：17 组词的真实分组、页眉页脚、以及「不产生假公式」', () => {
+    // 这一条把**整页**的真实分组钉死：修好之后 15 条 line 变 17 条，
+    // 多出来的正是 A 与 B 拆开的那两条 —— 别的地方一个都不许动。
+    const structure = branchRealPage();
+    const groups = structure.lines.map((line) => line.wordIndices.join(','));
+
+    expect(groups).toEqual([
+      '1',
+      '2',
+      '3',
+      '4,5,6',
+      '7',
+      '8',
+      '9',
+      '10',
+      '11,12',
+      '13',
+      '14',
+      '15',
+      '16',
+      '17,18',
+      '19',
+      '20',
+      '21',
+    ]);
+
+    // 页眉（词 0）与页脚（词 22）必须仍然被滤掉，一个字都不许进正文
+    const text = structure.lines.map((line) => line.text).join('\n');
+    expect(text).not.toContain('概率论与数理统计习题5');
+    expect(text).not.toContain('单周周一下午2点前交作业');
+    // 这一页没有任何真正的上下标，因此不许凭空出现 `$`（渲染层按 `$...$` 切分）
+    expect(text).not.toContain('$');
+    expect(structure.lines.every((line) => line.hasScripts === false)).toBe(true);
+  });
+});
+
+/**
+ * ═══════════════════════════════════════════════════════════════
+ * `attachDetachedScriptLines` 的漏洞（构造用例）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 这条补救路径原来的三条几何判据**全部形同虚设**：
+ *   · `fontSize ≤ 0.9 × 参考字号`：参考字号 40 时上限正好是 36 —— 正文行高 36；
+ *   · 行间距离 ≤ 36px：普通行距本来就落在里面（实测 17px）；
+ *   · 水平间隙：两行横向重叠时算出来是**负数**（225 − 778 = −553），
+ *     `负数 > 上限` 恒为假。
+ * 于是**一整行正文**能被当成上一行的下标挂上去。
+ *
+ * ⚠️ 触发前提：词高众数必须 ≥ 40（否则 36 高的候选进不了门 —— 这一页的
+ * 众数是 36，所以真实导出里没触发，见上面那条 C 守卫用例）。
+ * 下面用一个众数 40 的页面把漏洞钉住：坐标仍用导出里词 15 / 词 16 的真实框。
+ */
+describe('孤立上下标补救路径：一整行正文不得被当成下标', () => {
+  it('词 16（22 字符的正文行）不得被挂成词 15 的下标', () => {
+    /** 定众数用的正文行：宽度一致 → 相互之间过不了「分支必须明显更窄」那道闸 */
+    const bodyLine = (y: number) => [
+      w('17.', 225, y, 40, 60, 90),
+      w('设随机变量(X,Y)具有分布律', 300, y, 40, 500, 90),
+      w('P{X=x,Y=y}=p(1−p)x+y−2', 820, y, 40, 400, 90),
+    ];
+    const denseBody = [...bodyLine(212), ...bodyLine(257), ...bodyLine(302), ...bodyLine(347)];
+
+    // 真实坐标：词 15 x225–1181 / y1397–1435（宽 956、高 38）
+    const upper = w('28. 设 X,Y是相互独立的随机变量，它们都服从正态分布 N(0，σ²).试', 225, 1397, 38, 956, 90);
+    // 真实坐标：词 16 x167–778 / y1452–1488（宽 611、高 36），只隔 17px
+    const lower = w('验证随机变量 Z = √X2 + Y 的概率密度为', 167, 1452, 36, 611, 90);
+    const words = [...denseBody, upper, lower];
+    const upperIndex = words.indexOf(upper);
+    const lowerIndex = words.indexOf(lower);
+
+    const structure = branchStructureOf(words);
+
+    // 回归时（众数 40）：一条 line 的 wordIndices = [12, 13]（≡ 真实 [15, 16]）
+    expect(branchLineWith(structure, upperIndex)?.wordIndices).toEqual([upperIndex]);
+    expect(branchLineWith(structure, lowerIndex)?.wordIndices).toEqual([lowerIndex]);
+  });
+});
+
+/**
+ * ═══════════════════════════════════════════════════════════════
+ * 判据的另一半：整句正文当**候选**时同样不能被吞（构造用例）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 回归 B 里那句真实正文是**主机**（它最宽）。把角色对调 —— 公式行最宽、
+ * 正文行落在它的跨度之内 —— 同样的横向比值（0.68 ≥ 0.60）会让正文行从
+ * 「横向压得实」那道闸（判据 2）被吞掉。判据必须是对称的：
+ * **主机不能是成句正文，分支也不能是成句正文。**
+ *
+ * ⚠️ 数据来源：候选用的是 B 里那句真实正文的真实框（x166–918 / y1629–1666，
+ * 宽 752、高 37）；主机那一行的**框宽是推的**（1100px，一个 33 字符、
+ * 0 汉字的公式行在 1379px 版心里的合理宽度）—— 这一页里没有这种组合。
+ */
+describe('成句正文当候选时也不得被并（判据必须对称）', () => {
+  it('公式主机（1100px）不得吞掉紧随其后的整句正文（752px / 比值 0.68）', () => {
+    const host = w('P{X=x,Y=y}=p(1−p)x+y−2,0<p<1', 150, 200, 40, 1100, 90);
+    const sentence = w(
+      '我们称 Z 服从参数 为σ(σ > 0) 的瑞利(Rayleigh) 分布.',
+      166,
+      260,
+      37,
+      752,
+      90,
+    );
+    const words = [host, sentence];
+
+    const structure = branchStructureOf(words);
+
+    expect(branchLineWith(structure, words.indexOf(sentence))?.wordIndices).toEqual([
+      words.indexOf(sentence),
+    ]);
+    expect(branchLineWith(structure, words.indexOf(host))?.wordIndices).toEqual([
+      words.indexOf(host),
+    ]);
+  });
+});
+
+/**
+ * ═══════════════════════════════════════════════════════════════
+ * 反面：这些合并**必须继续成立**（防「一刀切禁掉构件合并」）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 词 4/5/6 这一组是上一轮修好的词序，它与三个回归**在几何上无法区分**：
+ * 同样是「一行更宽的式子 + 更窄更近的邻居」，区别只在**文本** ——
+ * `其中λ>0，μ>0是常数.引入随机变量`（19 字符 / 11 个汉字）是式子，
+ * 而 `我们称 Z 服从参数 为σ(σ > 0) 的瑞利(Rayleigh) 分布.`（38 字符 /
+ * 13 个汉字、以 `.` 收尾）是成句正文。新判据的两道门槛（≥24 字符且
+ * ≥10 汉字 / 句末标点且 ≥4 汉字）必须正好把这两类分开 ——
+ * 19 与 24 之间只隔 5 个字符，这条余量就是靠这一组守住的。
+ */
+describe('真实文档回归：公式主干（含中文的式子）仍然可以当主机', () => {
+  it('词 4/5/6 合为一行，且顺序为 [4, 5, 6]', () => {
+    const structure = branchRealPage();
+    const line = branchLineWith(structure, 4);
+
+    expect(line?.wordIndices).toEqual([4, 5, 6]);
+    expect(line?.text).toBe('其中λ>0，μ>0是常数.引入随机变量Z= 当X>Y=10, 当X>Y');
+    expect(line?.yRange).toEqual([568, 723]);
+    // 字号是三个词的加权平均，导出里是 78.7
+    expect(line?.fontSize).toBeCloseTo(78.7, 1);
+  });
+});
