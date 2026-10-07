@@ -149,28 +149,54 @@ export function getLastReloadReason(): { label: string; at: number } | null {
 }
 
 /**
- * OCR 的阶段性里程碑。
+ * OCR 的阶段性里程碑（保留最近若干条）。
  *
- * 内存不足导致标签页被回收时**不会留下任何 JS 痕迹**（没有异常、没有日志），
+ * 内存不足 / 进程被回收时**不会留下任何 JS 痕迹**（没有异常、没有日志），
  * 所以只能靠「最后走到哪一步」反推它死在哪里：
  *   · 死在 render 之前/之中 → 画布太大
- *   · 死在 recognize 之中   → ONNX 推理阶段的内存
+ *   · 死在 recognize 之中   → 推理阶段（显存 / 内存 / 后端）
  *   · 死在 save 之后        → 与内存无关，是别的问题
+ *
+ * **保留多条**而不是只留最后一条：画布尺寸是在 `render` 阶段记的，
+ * 一旦被后一条 `recognize` 覆盖，就再也看不到「当时到底是多大的画布」了 ——
+ * 那正是判断要不要继续砍内存的关键数字（这个坑已经踩过一次）。
  */
+const STAGE_HISTORY = 5;
+
 export function noteOcrStage(stage: string, detail?: string): void {
-  write(STAGE_KEY, JSON.stringify({ stage, detail, at: Date.now() }));
+  const history = getOcrStageHistory();
+  history.push({ stage, detail, at: Date.now() });
+  write(STAGE_KEY, JSON.stringify(history.slice(-STAGE_HISTORY)));
 }
 
-export function getLastOcrStage(): { stage: string; detail?: string } | null {
+function getOcrStageHistory(): { stage: string; detail?: string; at?: number }[] {
   const raw = read(STAGE_KEY);
-  if (!raw) return null;
+  if (!raw) return [];
   try {
-    const parsed = JSON.parse(raw) as { stage: string; detail?: string; at?: number };
-    if (Date.now() - (parsed.at ?? 0) > STALE_MS) return null;
-    return { stage: parsed.stage, detail: parsed.detail };
+    const parsed = JSON.parse(raw);
+    // 兼容早期只存单条对象的格式
+    if (Array.isArray(parsed)) return parsed;
+    if (parsed && typeof parsed === 'object') return [parsed];
+    return [];
   } catch {
-    return null;
+    return [];
   }
+}
+
+/** 最近一次记录的阶段（用于「中断前最后走到」） */
+export function getLastOcrStage(): { stage: string; detail?: string } | null {
+  const history = getOcrStageHistory();
+  const last = history[history.length - 1];
+  if (!last) return null;
+  if (typeof last.at === 'number' && Date.now() - last.at > STALE_MS) return null;
+  return { stage: last.stage, detail: last.detail };
+}
+
+/** 完整的阶段轨迹，按时间先后 —— 界面会把它们列出来 */
+export function getOcrStageTrail(): { stage: string; detail?: string }[] {
+  const history = getOcrStageHistory();
+  const fresh = history.filter((h) => typeof h.at !== 'number' || Date.now() - h.at <= STALE_MS);
+  return fresh.map((h) => ({ stage: h.stage, detail: h.detail }));
 }
 
 /** 识别正常收尾时一并清掉阶段记录 */

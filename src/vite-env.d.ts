@@ -15,6 +15,14 @@ interface ImportMetaEnv {
    * 也可以填 `/ocr-models` 走自托管（把三个文件放进 public/ocr-models/）。
    */
   readonly VITE_OCR_MODEL_BASE?: string;
+  /**
+   * 是否允许 OCR 使用 WebGPU 推理（默认关闭）。
+   *
+   * 关着的时候只用 WASM：慢一些，但**不会因为显卡驱动把整个页面弄崩**。
+   * 开着会优先 WebGPU（`['webgpu','wasm']`），在稳定的机器上更快，
+   * 但若出现过「识别时页面突然刷新、且没有任何报错」，请保持关闭。
+   */
+  readonly VITE_OCR_USE_WEBGPU?: string;
 }
 
 interface ImportMeta {

@@ -12,6 +12,7 @@ import { errorReport } from '@/lib/diagnostics';
 import { recognizeFormula } from '@/services/formulaOcrService';
 import { useSettingsStore } from '@/store/settingsStore';
 import { OCR_MODEL_BASE, OCR_MODEL_FILES, buildOcrModel } from '@/lib/ocrModelSource';
+import { resolveExecutionProviders } from '@/lib/ocrExecutionProvider';
 
 // Force ONNX Runtime to load WASM from CDN instead of bundling locally.
 // The .wasm file is ~28MB which exceeds Cloudflare Pages' 25MB limit.
@@ -205,15 +206,25 @@ class OcrEngine {
     // 模型来源见 lib/ocrModelSource.ts：内置预设指向 huggingface.co，
     // 而国内访问不了它 —— 那会让 OCR 永远停在初始化、一页都识别不出来。
     const model = buildOcrModel();
+    const executionProviders = resolveExecutionProviders();
     console.info(
       `[ocrEngine] 模型来源：${OCR_MODEL_BASE}\n` +
-        `  · 检测模型 ${(9.52).toFixed(2)}MB · 识别模型 20.30MB · 字典 0.07MB（合计约 29.9MB）\n` +
-        `  · 首次使用需完整下载，之后会被缓存，离线可用`,
+        `  · 检测模型 9.52MB · 识别模型 20.30MB · 字典 0.07MB（合计约 29.9MB）\n` +
+        `  · 首次使用需完整下载，之后会被缓存，离线可用\n` +
+        `  · 推理后端：${executionProviders.join(' → ')}`,
     );
 
     const service = new PaddleOcrService({
       model,
       processing: { engine: 'canvas-native' },
+      session: {
+        executionProviders,
+        // 如果首选后端建会话失败，库会自动退回安全后端 —— 记下来，
+        // 否则「硬件加速被静默丢弃」这件事永远没人知道
+        onSessionFallback: (err: unknown) => {
+          console.warn('[ocrEngine] 首选推理后端不可用，已回退：', err);
+        },
+      },
     });
 
     const t0 = Date.now();

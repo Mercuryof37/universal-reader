@@ -3,8 +3,8 @@ import { useLibraryStore } from '@/store/libraryStore';
 import { FileUploadZone } from '@/components/FileUploadZone';
 import {
   getInterruptedOcr,
-  getLastOcrStage,
   getLastReloadReason,
+  getOcrStageTrail,
   getReloadCount,
 } from '@/lib/sessionDiagnostics';
 
@@ -41,7 +41,7 @@ export function DocumentLibrary({ onOpen }: { onOpen?: () => void }) {
   const reloadCount = getReloadCount();
   const interrupted = getInterruptedOcr();
   const lastReload = getLastReloadReason();
-  const lastStage = getLastOcrStage();
+  const stageTrail = getOcrStageTrail();
   const showDiagnostics = reloadCount > 1 || interrupted !== null;
 
   return (
@@ -83,10 +83,17 @@ export function DocumentLibrary({ onOpen }: { onOpen?: () => void }) {
                 —— 已识别完成的部分已保存在本机，重新打开那本书即可看到
               </li>
             )}
-            {lastStage && (
+            {stageTrail.length > 0 && (
               <li>
-                中断前最后走到：<b>{lastStage.stage}</b>
-                {lastStage.detail ? ` —— ${lastStage.detail}` : ''}
+                中断前走过的步骤：
+                <ul className="mt-0.5 list-inside list-disc space-y-0.5 opacity-90">
+                  {stageTrail.map((s, i) => (
+                    <li key={`${s.stage}-${i}`}>
+                      {s.stage}
+                      {s.detail ? ` —— ${s.detail}` : ''}
+                    </li>
+                  ))}
+                </ul>
               </li>
             )}
           </ul>
