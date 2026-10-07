@@ -95,6 +95,53 @@ export const OCR_RENDER_DPI = 300;
  */
 export const OCR_MAX_PIXELS = 40_000_000;
 
+/**
+ * 计算「为了不超过像素上限，实际该用多大的渲染缩放」。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么必须在**渲染之前**算，而不是渲染完再缩
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * `OCR_MAX_PIXELS` 原先只在 OCR 引擎内部生效（`factorForMaxPixels`），
+ * 也就是说：**先把整页按 300 DPI 画出来，再缩到 40 MP**。
+ *
+ * 问题在于那张「先画出来」的画布是按原始尺寸分配的：
+ * 20.7×27 英寸的页面 = 6200×8100 ≈ 50 MP ≈ **200MB 单张画布**。
+ * 峰值内存出现在缩放之前，而下采样并不能把峰值降下来 ——
+ * 它只是让**下游**拿到一张小图。
+ *
+ * 后果是真实存在的：在内存受限的设备（手机浏览器尤其明显）上，
+ * 标签页会被系统直接回收 —— 表现为**页面莫名其妙自己刷新**、
+ * 一直转圈、并且识别结果一个字都没留下。用户报的正是这个现象，
+ * 而且只在扫描版 PDF 上出现（只有这条路径会渲染这种大画布）。
+ *
+ * 这里改成**先算好缩放再渲染**：最终交给 OCR 的图与原来**完全等价**
+ * （同样受 40 MP 上限约束），但峰值内存从 200MB 降到 160MB 以下，
+ * 更重要的是不再有「先分配 200MB 再丢掉」这一步。
+ *
+ * @param baseWidth  页面在 scale=1 时的宽度（PDF 点）
+ * @param baseHeight 页面在 scale=1 时的高度（PDF 点）
+ * @returns 实际使用的缩放系数
+ */
+export function renderScaleFor(
+  baseWidth: number,
+  baseHeight: number,
+  dpi = OCR_RENDER_DPI,
+  maxPixels = OCR_MAX_PIXELS,
+): number {
+  const ideal = dpi / 72;
+  if (!Number.isFinite(baseWidth) || !Number.isFinite(baseHeight)) return ideal;
+  if (baseWidth <= 0 || baseHeight <= 0) return ideal;
+
+  const width = baseWidth * ideal;
+  const height = baseHeight * ideal;
+  const pixels = width * height;
+  if (!Number.isFinite(pixels) || pixels <= maxPixels) return ideal;
+
+  // 等比降采样：面积比开平方就是线性比例
+  return ideal * Math.sqrt(maxPixels / pixels);
+}
+
 /** 超过该比例判定为空白页，直接跳过 OCR（扫描书里有大量空白页与插图页） */
 export const OCR_BLANK_LUMA_THRESHOLD = 250;
 

@@ -1,6 +1,7 @@
 import { FileText, Trash2, BookOpen, AlertTriangle, X } from 'lucide-react';
 import { useLibraryStore } from '@/store/libraryStore';
 import { FileUploadZone } from '@/components/FileUploadZone';
+import { getInterruptedOcr, getReloadCount } from '@/lib/sessionDiagnostics';
 
 const FORMAT_LABEL: Record<string, string> = {
   markdown: 'MD',
@@ -21,6 +22,21 @@ export function DocumentLibrary({ onOpen }: { onOpen?: () => void }) {
   const ocrSummary = useLibraryStore((s) => s.ocrSummary);
   const cancelOcr = useLibraryStore((s) => s.cancelOcr);
 
+  /**
+   * 会话诊断：把「页面被刷新过几次」「上次识别断在第几页」**显示在界面上**。
+   *
+   * 这不是给开发者看的调试信息，而是**唯一能在没有控制台的情况下
+   * 区分三种故障形态**的手段（用户很可能在手机 / iOS Safari 上，那里没有 DevTools）：
+   *   - 刷新次数 > 1  → 页面确实在被反复重载，问题在重载；
+   *   - 有中断记录    → 重载发生在识别途中，且能看出跑到多远；
+   *   - 两者都没有    → 页面没重载，问题在识别或入库本身。
+   *
+   * 只在确有异常时才显示，正常使用看不到它。
+   */
+  const reloadCount = getReloadCount();
+  const interrupted = getInterruptedOcr();
+  const showDiagnostics = reloadCount > 1 || interrupted !== null;
+
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 p-6">
       <header className="flex items-baseline justify-between">
@@ -37,6 +53,29 @@ export function DocumentLibrary({ onOpen }: { onOpen?: () => void }) {
       {error && (
         <Banner tone="error" onClose={clearError}>
           {error}
+        </Banner>
+      )}
+
+      {showDiagnostics && (
+        <Banner tone="warn">
+          <p className="font-medium">检测到上次会话异常中断</p>
+          <ul className="mt-1 list-inside list-disc space-y-0.5">
+            {reloadCount > 1 && (
+              <li>
+                本页已被加载 <b>{reloadCount}</b> 次 —— 说明页面被自动刷新过
+                （浏览器在内存不足时也会这样，且不会有任何提示）
+              </li>
+            )}
+            {interrupted && (
+              <li>
+                上次扫描版 PDF 识别进行到第 <b>{interrupted.pageNum}</b> / {interrupted.total} 页时被打断
+                —— 已识别完成的部分已保存在本机，重新打开那本书即可看到
+              </li>
+            )}
+          </ul>
+          <p className="mt-1 text-[11px] opacity-80">
+            关掉标签页后这条提示会消失。若反复出现，说明识别过程被系统中断了。
+          </p>
         </Banner>
       )}
 
@@ -154,7 +193,8 @@ function Banner({
 }: {
   tone: 'error' | 'warn';
   children: React.ReactNode;
-  onClose: () => void;
+  /** 可选：会话诊断条没有「关闭」语义（关掉标签页它自然消失），因此不强制提供 */
+  onClose?: () => void;
 }) {
   const color =
     tone === 'error'

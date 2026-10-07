@@ -4,6 +4,7 @@ import { deleteDocument, listDocuments, loadDocument, saveDocument, type Documen
 import { parseFiles, isScannedPdfError } from '@/parsers';
 import { errorReport, describeUnknownError } from '@/lib/diagnostics';
 import { resolvePageLimit, type OcrLang, type OcrProgress } from '@/lib/ocrTypes';
+import { clearOcrAttempt, noteOcrProgress } from '@/lib/sessionDiagnostics';
 
 /**
  * 文档库 store。
@@ -190,7 +191,12 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
         {
           lang,
           maxPages,
-          onProgress: (p: OcrProgress) => set({ ocrProgress: p }),
+          onProgress: (p: OcrProgress) => {
+            set({ ocrProgress: p });
+            // 记进 sessionStorage：万一页面被系统回收/重载，重载后能告诉用户
+            // 「上次识别到第几页断了」—— 用户打不开控制台时这是唯一的线索
+            if (p.status === 'recognizing') noteOcrProgress(p.pageNum, p.total);
+          },
           /**
            * 中途落盘。
            *
@@ -212,6 +218,8 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       );
 
       await saveDocument(result.document);
+      // 走到这里说明整次识别正常收尾：清掉中断记录，免得下次打开误报
+      clearOcrAttempt();
       set({
         documents: await listDocuments(),
         currentDocId: result.document.id,

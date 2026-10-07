@@ -3,6 +3,7 @@ import {
   OCR_BLANK_LUMA_THRESHOLD,
   OCR_MAX_PIXELS,
   OCR_RENDER_DPI,
+  renderScaleFor,
   resolvePageLimit,
 } from '@/lib/ocrTypes';
 
@@ -33,6 +34,63 @@ describe('OCR 渲染参数', () => {
     // 太宽松会把浅色正文页误判为空白；太严格则跳不掉真正的空白页
     expect(OCR_BLANK_LUMA_THRESHOLD).toBeGreaterThan(200);
     expect(OCR_BLANK_LUMA_THRESHOLD).toBeLessThanOrEqual(255);
+  });
+});
+
+/**
+ * 渲染缩放必须在**画布分配之前**算好。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 这组断言对应「扫描版 PDF 识别时页面自己刷新」的故障
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 原来 `OCR_MAX_PIXELS` 只在 OCR 引擎内部生效：先把整页按 300 DPI
+ * **画出来**，再缩到 40 MP。而那张画布是按原始尺寸分配的 ——
+ * 20.7×27 英寸的页面就是 6200×8100 ≈ 50 MP ≈ **200MB**。
+ * 峰值内存出现在缩放之前，下采样根本救不了它。
+ *
+ * 内存受限的设备（手机浏览器最明显）会直接回收标签页，
+ * 表现为「页面莫名其妙自己刷新、结果全没了」，而且不会有任何报错。
+ */
+describe('renderScaleFor：把内存峰值压下来', () => {
+  const A4 = { w: 8.27 * 72, h: 11.69 * 72 }; // PDF 点
+  const HUGE = { w: 20.7 * 72, h: 27 * 72 }; // 触发过真实故障的尺寸
+
+  it('正常尺寸不降采样 —— 快路径不受影响', () => {
+    const scale = renderScaleFor(A4.w, A4.h);
+    expect(scale).toBeCloseTo(OCR_RENDER_DPI / 72, 6);
+  });
+
+  it('大页面被压到像素上限以内（这是修法的核心）', () => {
+    const scale = renderScaleFor(HUGE.w, HUGE.h);
+    const pixels = HUGE.w * scale * (HUGE.h * scale);
+
+    expect(pixels).toBeLessThanOrEqual(OCR_MAX_PIXELS);
+    // 原来的行为会分配 50 MP ≈ 200MB，现在不能超过上限
+    expect(HUGE.w * (OCR_RENDER_DPI / 72) * (HUGE.h * (OCR_RENDER_DPI / 72))).toBeGreaterThan(
+      OCR_MAX_PIXELS,
+    );
+  });
+
+  it('降采样保持等比 —— 不能把页面拉变形', () => {
+    const scale = renderScaleFor(HUGE.w, HUGE.h);
+    const ratioBefore = HUGE.w / HUGE.h;
+    const ratioAfter = (HUGE.w * scale) / (HUGE.h * scale);
+    expect(ratioAfter).toBeCloseTo(ratioBefore, 10);
+  });
+
+  it('非法尺寸退回理想缩放，而不是算出 NaN/负数把画布搞崩', () => {
+    for (const [w, h] of [
+      [0, 100],
+      [100, 0],
+      [-5, 100],
+      [Number.NaN, 100],
+      [Number.POSITIVE_INFINITY, 100],
+    ]) {
+      const scale = renderScaleFor(w as number, h as number);
+      expect(Number.isFinite(scale)).toBe(true);
+      expect(scale).toBeGreaterThan(0);
+    }
   });
 });
 

@@ -4,7 +4,13 @@ import { checkPdfSupport } from '@/lib/polyfills';
 import { errorReport, describeUnknownError } from '@/lib/diagnostics';
 import { createPdfDocumentParams, pdfjsLib } from '@/parsers/pdfRuntime';
 import { ScannedPdfError } from '@/parsers/scannedPdfError';
-import { OCR_CONTINUE_ON_PAGE_ERROR, OCR_RENDER_DPI, resolvePageLimit, shouldCheckpoint } from '@/lib/ocrTypes';
+import {
+  OCR_CONTINUE_ON_PAGE_ERROR,
+  OCR_RENDER_DPI,
+  renderScaleFor,
+  resolvePageLimit,
+  shouldCheckpoint,
+} from '@/lib/ocrTypes';
 import type { OcrLang, OcrProgress } from '@/lib/ocrTypes';
 import { ocrResultToBlocks } from '@/lib/ocrPostProcess';
 
@@ -455,7 +461,6 @@ export async function ocrParsePdf(
 
   // 页数计算与 store 共用同一个函数，避免两处口径不一致导致进度条与实际处理量对不上
   const totalPages = resolvePageLimit(doc.numPages, maxPages);
-  const scale = OCR_RENDER_DPI / 72;
 
   // OCR 引擎按需加载：PaddleOCR 依赖的 ONNX Runtime WASM 约 28MB、模型约 10MB，
   // 体积依然很大，只有真的执行 OCR 时才需要它。
@@ -501,12 +506,32 @@ export async function ocrParsePdf(
     let blocksThisPage = false;
     try {
       const page = await doc.getPage(pageNum);
+
+      /**
+       * 缩放必须在**渲染之前**定下来（见 `renderScaleFor` 的注释）：
+       * 先把整页按 300 DPI 画出来再缩，会先分配一张可达 200MB 的画布 ——
+       * 在内存受限的设备上标签页会被系统直接回收，
+       * 表现为「页面自己刷新了、结果全没了」。
+       */
+      const baseViewport = page.getViewport({ scale: 1 });
+      const scale = renderScaleFor(baseViewport.width, baseViewport.height);
       const viewport = page.getViewport({ scale });
 
       // 注意：变量名避开 `document`，否则会遮蔽全局的 document 对象
       pageCanvas = document.createElement('canvas');
       pageCanvas.width = Math.ceil(viewport.width);
       pageCanvas.height = Math.ceil(viewport.height);
+
+      const pagePixels = pageCanvas.width * pageCanvas.height;
+      if (scale < OCR_RENDER_DPI / 72) {
+        console.info(
+          `[ocrParsePdf] 第 ${pageNum} 页尺寸较大（${Math.round(baseViewport.width)}×` +
+            `${Math.round(baseViewport.height)} pt），已把渲染缩放从 ` +
+            `${(OCR_RENDER_DPI / 72).toFixed(2)} 降到 ${scale.toFixed(2)}，` +
+            `画布 ${pageCanvas.width}×${pageCanvas.height}（${(pagePixels / 1e6).toFixed(1)} MP，` +
+            `约 ${Math.round((pagePixels * 4) / 1e6)}MB）以避免内存峰值`,
+        );
+      }
       const ctx = pageCanvas.getContext('2d');
       if (!ctx) {
         throw new Error('浏览器未提供 2D 画布上下文（可能因显存不足或标签页被降级）');
