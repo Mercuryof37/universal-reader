@@ -2,6 +2,7 @@ import type { ContentBlock, DocDocument, FileParser } from '@/types/content';
 import { buildDocument, uid } from '@/lib/utils';
 import { checkPdfSupport } from '@/lib/polyfills';
 import { errorReport, describeUnknownError } from '@/lib/diagnostics';
+import { noteOcrStage } from '@/lib/sessionDiagnostics';
 import { createPdfDocumentParams, pdfjsLib } from '@/parsers/pdfRuntime';
 import { ScannedPdfError } from '@/parsers/scannedPdfError';
 import {
@@ -523,6 +524,8 @@ export async function ocrParsePdf(
       pageCanvas.height = Math.ceil(viewport.height);
 
       const pagePixels = pageCanvas.width * pageCanvas.height;
+      const canvasMB = Math.round((pagePixels * 4) / 1e6);
+      noteOcrStage('render', `第 ${pageNum} 页：画布 ${pageCanvas.width}×${pageCanvas.height}（${canvasMB}MB）`);
       if (scale < OCR_RENDER_DPI / 72) {
         console.info(
           `[ocrParsePdf] 第 ${pageNum} 页尺寸较大（${Math.round(baseViewport.width)}×` +
@@ -563,12 +566,14 @@ export async function ocrParsePdf(
             `尺寸=${ink.width}×${ink.height}`,
         );
       } else {
+        noteOcrStage('recognize', `第 ${pageNum} 页：开始识别`);
         const ocrResult = await ocrEngine.recognizePage(
           pageCanvas,
           pageNum,
           totalPages,
           onProgress,
         );
+        noteOcrStage('recognize-done', `第 ${pageNum} 页：识别完成，${ocrResult.words.length} 个词`);
         const blocks = ocrResultToBlocks(ocrResult, pageCanvas.height);
         if (blocks.length) {
           allDrafts.push(...blocks);

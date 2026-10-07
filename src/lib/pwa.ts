@@ -26,6 +26,7 @@ import { useState } from 'react';
 import { useRegisterSW } from 'virtual:pwa-register/react';
 
 import { seedNavigationFallback } from '@/lib/pwaOffline';
+import { noteReloadReason } from '@/lib/sessionDiagnostics';
 import { useLibraryStore } from '@/store/libraryStore';
 
 export interface PwaState {
@@ -111,6 +112,7 @@ export function usePwa(): PwaState {
       }
 
       console.info('[pwa] 新版本已接管，当前空闲，立即刷新。');
+      noteReloadReason('sw-update');
       window.location.reload();
     },
   });
@@ -122,6 +124,7 @@ export function usePwa(): PwaState {
       setOfflineReady(false);
     },
     reloadNow: () => {
+      noteReloadReason('manual');
       window.location.reload();
     },
   };

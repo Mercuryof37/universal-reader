@@ -29,6 +29,8 @@
  * 如果刷新后依然失败，说明不是版本错配，此时才提示用户。
  */
 
+import { noteReloadReason } from '@/lib/sessionDiagnostics';
+
 /** 会话级标记：避免"刷新 → 又失败 → 又刷新"的死循环 */
 const RELOAD_FLAG = 'universal-reader:chunk-reload';
 
@@ -114,6 +116,7 @@ export function installPreloadErrorRecovery(): void {
     markReloaded();
     console.info('[preloadRecovery] 检测到资源版本错配，正在自动刷新以载入最新版本…');
     showNotice('正在载入最新版本…');
+    noteReloadReason('preload-error');
     window.location.reload();
   });
 

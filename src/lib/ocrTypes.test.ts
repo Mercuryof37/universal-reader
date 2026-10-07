@@ -20,14 +20,28 @@ describe('OCR 渲染参数', () => {
     // 6200 × 8100 = 50.2 MP —— 这是触发故障的真实尺寸
     const failingPixels = 6200 * 8100;
     expect(OCR_MAX_PIXELS).toBeLessThan(failingPixels);
-    // 但也不能小到影响识别率：OCR 在 200 DPI 左右接近上限，
-    // 40 MP 相当于 A4 上约 550 DPI，余量充足
-    expect(OCR_MAX_PIXELS).toBeGreaterThan(20_000_000);
   });
 
-  it('300 DPI 下 A4 尺寸不触发降采样（正常文档走快路径）', () => {
+  it('上限要按**内存**约束来定：单张画布不超过 100MB', () => {
+    /**
+     * 上限原先只按「不超过下游图像库的处理能力」定（40 MP），
+     * 没有把内存算进去。而 40 MP 的画布 = 40e6 × 4 = **160MB**，
+     * 再叠加约 30MB 模型、约 28MB ONNX WASM、PNG blob 与 ONNX 张量 ——
+     * 结果就是用户实测到的：识别第 1 页时**标签页被浏览器回收**，
+     * 没有任何报错，只表现为「页面自己刷新了、结果全没了」。
+     *
+     * 所以这里把内存约束**写成断言**，避免以后又只按图像库的限制去调大它。
+     */
+    const worstCaseCanvasBytes = OCR_MAX_PIXELS * 4; // RGBA
+    expect(worstCaseCanvasBytes).toBeLessThanOrEqual(100 * 1024 * 1024);
+  });
+
+  it('上限也不能小到影响常规页面：A4 @300 DPI 必须碰不到它', () => {
     const a4At300 = Math.round((8.27 * OCR_RENDER_DPI) * (11.69 * OCR_RENDER_DPI));
+    // 约 8.7 MP —— 常规页面完全不该被降采样
     expect(a4At300).toBeLessThan(OCR_MAX_PIXELS);
+    // 留出足够余量：上限至少是 A4@300 的两倍，否则稍大的书页就会被压
+    expect(OCR_MAX_PIXELS).toBeGreaterThan(a4At300 * 2);
   });
 
   it('空白判定阈值处于合理区间', () => {

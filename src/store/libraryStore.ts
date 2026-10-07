@@ -4,7 +4,7 @@ import { deleteDocument, listDocuments, loadDocument, saveDocument, type Documen
 import { parseFiles, isScannedPdfError } from '@/parsers';
 import { errorReport, describeUnknownError } from '@/lib/diagnostics';
 import { resolvePageLimit, type OcrLang, type OcrProgress } from '@/lib/ocrTypes';
-import { clearOcrAttempt, noteOcrProgress } from '@/lib/sessionDiagnostics';
+import { clearOcrAttempt, clearOcrStage, noteOcrProgress, noteOcrStage } from '@/lib/sessionDiagnostics';
 
 /**
  * 文档库 store。
@@ -183,6 +183,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
 
     try {
       // 动态导入避免 pdfParser 被静态引入导致 chunk 合并
+      noteOcrStage('engine-init', '开始初始化 OCR 引擎（首次需下载约 30MB 模型）');
       const { ocrParsePdf } = await import('@/parsers/pdfParser');
       const result = await ocrParsePdf(
         pending.buffer,
@@ -218,8 +219,11 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       );
 
       await saveDocument(result.document);
-      // 走到这里说明整次识别正常收尾：清掉中断记录，免得下次打开误报
+      // 走到这里说明整次识别正常收尾：清掉中断记录，免得下次打开误报。
+      // 注意**不要**再写一个 'saved' 阶段 —— 那会让下次打开时看到一条
+      // 早已成功的旧阶段，反而误导。
       clearOcrAttempt();
+      clearOcrStage();
       set({
         documents: await listDocuments(),
         currentDocId: result.document.id,

@@ -1,7 +1,12 @@
 import { FileText, Trash2, BookOpen, AlertTriangle, X } from 'lucide-react';
 import { useLibraryStore } from '@/store/libraryStore';
 import { FileUploadZone } from '@/components/FileUploadZone';
-import { getInterruptedOcr, getReloadCount } from '@/lib/sessionDiagnostics';
+import {
+  getInterruptedOcr,
+  getLastOcrStage,
+  getLastReloadReason,
+  getReloadCount,
+} from '@/lib/sessionDiagnostics';
 
 const FORMAT_LABEL: Record<string, string> = {
   markdown: 'MD',
@@ -35,6 +40,8 @@ export function DocumentLibrary({ onOpen }: { onOpen?: () => void }) {
    */
   const reloadCount = getReloadCount();
   const interrupted = getInterruptedOcr();
+  const lastReload = getLastReloadReason();
+  const lastStage = getLastOcrStage();
   const showDiagnostics = reloadCount > 1 || interrupted !== null;
 
   return (
@@ -62,14 +69,24 @@ export function DocumentLibrary({ onOpen }: { onOpen?: () => void }) {
           <ul className="mt-1 list-inside list-disc space-y-0.5">
             {reloadCount > 1 && (
               <li>
-                本页已被加载 <b>{reloadCount}</b> 次 —— 说明页面被自动刷新过
-                （浏览器在内存不足时也会这样，且不会有任何提示）
+                本页已被加载 <b>{reloadCount}</b> 次 —— 刷新来源：
+                <b>
+                  {lastReload
+                    ? lastReload.label
+                    : '不是应用发起的（三条刷新路径都没有记录，最可能是浏览器自身回收了标签页，通常是内存不足）'}
+                </b>
               </li>
             )}
             {interrupted && (
               <li>
                 上次扫描版 PDF 识别进行到第 <b>{interrupted.pageNum}</b> / {interrupted.total} 页时被打断
                 —— 已识别完成的部分已保存在本机，重新打开那本书即可看到
+              </li>
+            )}
+            {lastStage && (
+              <li>
+                中断前最后走到：<b>{lastStage.stage}</b>
+                {lastStage.detail ? ` —— ${lastStage.detail}` : ''}
               </li>
             )}
           </ul>

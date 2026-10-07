@@ -24,6 +24,8 @@
 
 const RELOAD_KEY = 'universal-reader:reload-count';
 const OCR_KEY = 'universal-reader:ocr-attempt';
+const REASON_KEY = 'universal-reader:reload-reason';
+const STAGE_KEY = 'universal-reader:ocr-stage';
 
 /** 超过这个时长就不再提示上次中断 —— 避免几天前的记录一直挂在界面上 */
 const STALE_MS = 30 * 60 * 1000;
@@ -101,4 +103,77 @@ export function getInterruptedOcr(): OcrAttempt | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * 重载原因。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么必须记这个
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 代码里只有三处会重载页面：SW 新版本接管（`pwa.ts`）、
+ * chunk 加载失败的自愈（`preloadRecovery.ts`）、以及用户点「立即刷新」。
+ * 如果这些都记下来，那么「页面被刷新了」就能立刻区分成：
+ *   · 是我这三条路径之一干的（能进一步知道是哪条、当时忙不忙）；
+ *   · **哪条都没记 → 刷新不是应用发起的**，那就是浏览器自身
+ *     （内存不足回收标签页最典型），此时再怎么改应用逻辑都没用，
+ *     必须去降内存占用。
+ *
+ * 这个区分是靠猜做不到的，而用户又没有控制台可看 —— 所以写进存储、显示在界面上。
+ */
+export type ReloadReason = 'sw-update' | 'preload-error' | 'manual';
+
+const REASON_LABEL: Record<ReloadReason, string> = {
+  'sw-update': '应用检测到新版本并自动刷新（SW 接管）',
+  'preload-error': '应用检测到资源加载失败并自动刷新（chunk 自愈）',
+  manual: '你点了「立即刷新」',
+};
+
+/** 在**真正调用 reload 之前**记下原因 */
+export function noteReloadReason(reason: ReloadReason): void {
+  write(REASON_KEY, JSON.stringify({ reason, at: Date.now() }));
+}
+
+/** 读取上次重载的原因；没有记录说明刷新不是应用发起的 */
+export function getLastReloadReason(): { label: string; at: number } | null {
+  const raw = read(REASON_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as { reason: ReloadReason; at: number };
+    if (Date.now() - (parsed.at ?? 0) > STALE_MS) return null;
+    return { label: REASON_LABEL[parsed.reason] ?? parsed.reason, at: parsed.at };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * OCR 的阶段性里程碑。
+ *
+ * 内存不足导致标签页被回收时**不会留下任何 JS 痕迹**（没有异常、没有日志），
+ * 所以只能靠「最后走到哪一步」反推它死在哪里：
+ *   · 死在 render 之前/之中 → 画布太大
+ *   · 死在 recognize 之中   → ONNX 推理阶段的内存
+ *   · 死在 save 之后        → 与内存无关，是别的问题
+ */
+export function noteOcrStage(stage: string, detail?: string): void {
+  write(STAGE_KEY, JSON.stringify({ stage, detail, at: Date.now() }));
+}
+
+export function getLastOcrStage(): { stage: string; detail?: string } | null {
+  const raw = read(STAGE_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as { stage: string; detail?: string; at?: number };
+    if (Date.now() - (parsed.at ?? 0) > STALE_MS) return null;
+    return { stage: parsed.stage, detail: parsed.detail };
+  } catch {
+    return null;
+  }
+}
+
+/** 识别正常收尾时一并清掉阶段记录 */
+export function clearOcrStage(): void {
+  remove(STAGE_KEY);
 }
