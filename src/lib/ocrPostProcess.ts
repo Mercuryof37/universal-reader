@@ -13,7 +13,7 @@
  *    证明不了「它是标题」——扫描件里公式的检测框会把字号抬得很高）。
  */
 import type { ContentBlock } from '@/types/content';
-import type { OcrWord, OcrPageResult } from '@/lib/ocrTypes';
+import type { OcrChar, OcrWord, OcrPageResult } from '@/lib/ocrTypes';
 import { buildOcrStructure, type OcrStructure } from '@/lib/ocrStructure';
 import {
   detectColumns,
@@ -21,6 +21,12 @@ import {
   readingOrderKeys,
   type LayoutRegion,
 } from '@/lib/layoutAnalysis';
+import {
+  classifyCharsByGeometry,
+  getAttachedChars,
+  groupScriptFragments,
+  type CharScript,
+} from '@/lib/ocrCharBoxes';
 
 interface OcrLine {
   words: OcrWord[];
@@ -1190,6 +1196,101 @@ function centerY(word: OcrWord): number {
   return (word.bbox.y0 + word.bbox.y1) / 2;
 }
 
+// ───────────────────────────────────────────────────────────────
+// 字符级上下标（渐进增强；拿不到字符框时这一整节都不参与）
+// ───────────────────────────────────────────────────────────────
+
+/**
+ * 取一个词身上的字符框与判定结果。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么必须在**这一层**再对一次账
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 字符框来自**第二次识别**（为了拿 CTC 的时间步，见 `lib/ocrCharBoxes.ts`），
+ * 与产出 `OcrWord.text` 的那一次在空白、全角半角上可能有分歧。
+ * `attachCharBoxes()` 里已经做过一轮对账，这里再查一次**最硬的那条**：
+ * 把所有字符拼起来必须**逐字符等于** `word.text.trim()`。
+ *
+ * 不等就返回 null —— 宁可退回词级判据（可能判不出上下标），
+ * 也绝不能让字符下标错位：错位会把 `x` 的上标判到 `y` 头上，
+ * 输出的公式是**错的**，比不处理更糟。
+ */
+function resolveCharScripts(
+  word: OcrWord,
+): { chars: OcrChar[]; scripts: CharScript[] } | null {
+  const attached = getAttachedChars(word);
+  if (!attached) return null;
+
+  const target = word.text.trim();
+  if (!target) return null;
+  const { chars, measurements } = attached;
+  if (chars.length !== target.length) return null;
+  if (chars.map((c) => c.char).join('') !== target) return null;
+
+  const scripts = classifyCharsByGeometry(measurements);
+  return scripts.length ? { chars, scripts } : null;
+}
+
+/**
+ * 按字符级判据拼一个词：把连续同类的上下标字符包成 `$^{...}$` / `$_{...}$`。
+ *
+ * 与词级路径的关键差别：**切分点在词内部**。
+ * 实测第 17 题的整行词里 `p (1 − p )x+y−2 ,0 < p < 1,…` 是一个词，
+ * 词级判据看到的只是「一个框」，而这里能算出 `x+y−2` 五个字符整体
+ * 更高、更小 —— 于是输出 `p(1−p)$^{x+y-2}$ ,0 < p < 1,…`。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 两条不变量（违反任何一条就退回原文）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 1. **不吞字**：输出的可见文字必须与原词逐字符相同，只是多了 `$` 包装。
+ *    片段下标越界时跳过该片段，末尾剩下的字符一律原样补回。
+ * 2. **间距按原样**：拼接**在原始文本串上做切片**，不重新拼词。
+ *    理由是本函数必须与「拿不到字符框」的原路径**只在包装上有差别**：
+ *    原路径对词内空格的处理（`appendWithJoin`、`word.text.trim()`）
+ *    已经有一堆测试盯着，这里若自己拼一遍，同一份输入会因为
+ *    「有没有字符框」而输出不同的空格 —— 那种差异没人能解释。
+ */
+function emitWordWithCharScripts(
+  rawText: string,
+  attached: { chars: OcrChar[] },
+  scripts: CharScript[],
+): { text: string; scriptCount: number } {
+  const trimmed = rawText.trim();
+  // 原始串里第一个非空白字符的位置：`OcrWord.text` 常常带前导空格
+  const offset = rawText.indexOf(trimmed.charAt(0));
+  const start = offset >= 0 ? offset : 0;
+  const chars = attached.chars;
+  const fragments = groupScriptFragments(chars, scripts);
+  if (!fragments.length) return { text: trimmed, scriptCount: 0 };
+
+  let text = '';
+  let cursor = 0;
+  let scriptCount = 0;
+
+  for (const fragment of fragments) {
+    if (fragment.from < cursor || fragment.to >= chars.length) continue;
+
+    const headEnd = start + fragment.from;
+    if (headEnd > start + cursor) text += rawText.slice(start + cursor, headEnd);
+
+    const latex = fragmentToLatex(fragment.text);
+    if (latex) {
+      text += `$${fragment.kind === 'super' ? '^' : '_'}{${latex}}$`;
+      scriptCount++;
+    } else {
+      // 转义后为空（理论上不会）：把原字符原样写回，保证不丢字
+      text += fragment.text;
+    }
+    cursor = fragment.to + 1;
+  }
+
+  // 尾部原样补回（含词内的空格与标点）：`slice` 到串尾，不再裁剪
+  text += rawText.slice(start + cursor);
+  return { text, scriptCount };
+}
+
 /** 一个桶在纵向上的跨度（构件合并的纵向间隙判据要用真实边沿，不是中心） */
 function verticalSpanOf(line: OcrLine): { y0: number; y1: number } {
   let y0 = Infinity;
@@ -1950,6 +2051,27 @@ function assembleLineText(
          */
         text = appendWithJoin(text, plainInline(word.text));
       }
+      continue;
+    }
+
+    /*
+     * ═══════════════════════════════════════════════════════════
+     * 先看这个词有没有**字符级**坐标（渐进增强的第一优先生效点）
+     * ═══════════════════════════════════════════════════════════
+     *
+     * 词级判据（`findScriptAnchors`）只能看到「两个词框」，而真实扫描件里
+     * 指数常常与整行**同框**：实测第 17 题 `p (1 − p )x+y−2` 的 `x+y−2`
+     * 就在 bbox [225,212,1604,255] 这一个词里，任何词级几何都判不出来。
+     *
+     * `lib/ocrCharBoxes.ts` 给出的逐字符框能直接量出「x 比主字小、
+     * 而且底边高出基线」，于是这里优先按字符切分。
+     * **拿不到字符框的词走下面的原路径，输出与改动前逐字符一致。**
+     */
+    const charScripts = resolveCharScripts(word);
+    if (charScripts) {
+      const emitted = emitWordWithCharScripts(word.text, charScripts, charScripts.scripts);
+      text = appendWithJoin(text, emitted.text);
+      scriptCount += emitted.scriptCount;
       continue;
     }
 

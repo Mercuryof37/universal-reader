@@ -1397,3 +1397,196 @@ describe('真实文档回归：公式主干（含中文的式子）仍然可以�
 });
 
 import '@/lib/ocrPostProcess.layout.test';
+
+// ═══════════════════════════════════════════════════════════════
+// 字符级上下标：真实扫描件里「指数与整行同框」这个死角
+// ═══════════════════════════════════════════════════════════════
+//
+// 用户那份习题 PDF 第 17 题实测导出：
+//
+//   词 1: "17. 设 随机 变量 (X ,Y) 具有 分 布律 P {X = x ,Y = y}
+//          = p (1 − p )x+y−2 ,0 < p < 1,x ,y 均为 正"
+//          bbox [225, 212, 1604, 255]   fontSize 43
+//
+// 指数 `x+y−2` 与整行**同在这一个检测框里**。词级判据（比两个词框的
+// 高度与中心）对这种形态完全无能为力 —— 阈值怎么调都判不出来，
+// 因为「指数」与「整行」在词级几何里是同一个东西。
+//
+// 这组测试用**真实的词框几何 + 真实的字体比例**（内部真正生效的词高
+// 众数是 36，不是被公式撑大的 43），验证字符级判据真的把指数切了出来。
+// 其中「控制实验」一条是**可证伪**的关键：同一段文本、同一个词框、
+// 同一批字符框，只把纵向位置从「抬高」改成「坐在基线上」，
+// `^{}` 必须消失 —— 说明断言是那些纵向数值驱动的。
+
+import { attachCharsToWord, type AttachedChars } from '@/lib/ocrCharBoxes';
+import type { OcrChar } from '@/lib/ocrTypes';
+
+/** 第 17 题的真实词框与字号（用户导出，可直接采信） */
+const S17_BBOX = { x0: 225, y0: 212, x1: 1604, y1: 255 };
+const S17_MAIN_FONT = 36;
+
+/** 第 17 题整行词的**真实文本**（用户导出，一字不改） */
+const S17_TEXT =
+  '17. 设 随机 变量 (X ,Y) 具有 分 布律 P {X = x ,Y = y} = p (1 - p )x+y-2 ,0 < p < 1,x ,y 均为 正';
+
+/** 指数 `x+y-2` 在这段文本里的字符下标（含两端） */
+const S17_EXP_FROM = S17_TEXT.indexOf('x+y-2');
+const S17_EXP_TO = S17_EXP_FROM + 'x+y-2'.length - 1;
+
+/**
+ * 造一个词的字符框。
+ *
+ * 纵向按**真实排版比例**给（都以词框高度 36px 归一）：
+ *  · 正文字符：墨迹高 0.72、底边坐在基线 0.72 上；
+ *  · 上标字符：墨迹高 0.48（= 0.67 倍正文）、底边抬高 0.14，
+ *    这正是中文数学排版里 `p (1 − p )^{x+y−2}` 的常见取值。
+ * 横向按字符顺序均匀铺开。
+ */
+function s17Chars(expFrom: number, expTo: number): AttachedChars {
+  const chars = [...S17_TEXT];
+  const charW = (S17_BBOX.x1 - S17_BBOX.x0) / chars.length;
+  const out: OcrChar[] = [];
+  const measurements: AttachedChars['measurements'] = [];
+
+  for (let i = 0; i < chars.length; i++) {
+    const isExp = i >= expFrom && i <= expTo;
+    const h = isExp ? 0.48 : 0.72;
+    const y1 = isExp ? 0.72 - 0.14 : 0.72;
+    const y0 = y1 - h;
+    out.push({
+      char: chars[i] ?? '',
+      x0: S17_BBOX.x0 + i * charW,
+      y0: S17_BBOX.y0 + y0 * S17_MAIN_FONT,
+      x1: S17_BBOX.x0 + (i + 1) * charW,
+      y1: S17_BBOX.y0 + y1 * S17_MAIN_FONT,
+    });
+    measurements.push({ y0, y1, h });
+  }
+  return { chars: out, measurements };
+}
+
+/**
+ * 词的**字符框**全部坐在同一条基线上（哪怕更小）。
+ *
+ * 这是控制实验的形态：位移为 0，字符级判据此时**不该**报出任何上下标，
+ * 于是输出必须与「没有字符框」的原路径逐字符一致。
+ */
+function s17CharsFlatBaseline(): AttachedChars {
+  const chars = [...S17_TEXT];
+  const charW = (S17_BBOX.x1 - S17_BBOX.x0) / chars.length;
+  const out: OcrChar[] = [];
+  const measurements: AttachedChars['measurements'] = [];
+  for (let i = 0; i < chars.length; i++) {
+    const h = i % 3 === 0 ? 0.72 : 0.5;
+    out.push({
+      char: chars[i] ?? '',
+      x0: S17_BBOX.x0 + i * charW,
+      y0: S17_BBOX.y0 + (0.72 - h) * S17_MAIN_FONT,
+      x1: S17_BBOX.x0 + (i + 1) * charW,
+      y1: S17_BBOX.y0 + 0.72 * S17_MAIN_FONT,
+    });
+    measurements.push({ y0: 0.72 - h, y1: 0.72, h });
+  }
+  return { chars: out, measurements };
+}
+
+const s17Word = () =>
+  w(S17_TEXT, S17_BBOX.x0, S17_BBOX.y0, S17_MAIN_FONT, S17_BBOX.x1 - S17_BBOX.x0, 92);
+
+const s17Page = () => pageResult({ words: [s17Word()] });
+
+describe('字符级上下标：指数与整行同框时，词级几何永远判不出来', () => {
+  it('先确认词级路径**确实**判不出来（否则这组测试没有意义）', () => {
+    // 不带字符框：词级判据看不到任何「更小且更偏上」的另一个词
+    const blocks = ocrResultToBlocks(s17Page());
+    expect(blocks[0]?.content).toContain('p (1 - p )x+y-2');
+    // 没有 `^{}`：这正是第 17 题现在的输出
+    expect(blocks[0]?.content).not.toContain('^{');
+  });
+
+  it('拿到字符框后，指数 `x+y-2` 被包成一个 `$^{...}$`', () => {
+    const word = s17Word();
+    attachCharsToWord(word, s17Chars(S17_EXP_FROM, S17_EXP_TO));
+
+    const content = ocrResultToBlocks(pageResult({ words: [word] }))[0]?.content ?? '';
+
+    // 指数被切成**一个**片段（不是五个并列公式）
+    expect(content).toContain('$^{x+y-2}$');
+    expect(content).not.toContain('$^{x}$$^{+}$');
+    // 指数之前与之后的原文都必须还在（切片最容易丢的就是首尾）
+    expect(content).toContain('= p (1 - p )');
+    expect(content).toContain(',0 < p < 1,x ,y 均为 正');
+  });
+
+  it('控制实验：把同一批字符框改成「全坐在基线上」，输出必须回到原样', () => {
+    const word = s17Word();
+    attachCharsToWord(word, s17CharsFlatBaseline());
+
+    const content = ocrResultToBlocks(pageResult({ words: [word] }))[0]?.content ?? '';
+
+    /**
+     * ⚠️ 这就是「关掉新判据，测试会变红」的可证形式。
+     *
+     * 同一段文本、同一个词框、同一批字符框，**只把纵向位置从
+     * 「抬高 0.14」改成「全部坐在基线上」**，`^{}` 就消失了 ——
+     * 说明上面那条断言是**这些纵向数值**驱动的，
+     * 而不是「加了字符框就总会包一层 `^{}`」的装饰性行为。
+     */
+    expect(content).not.toContain('^{');
+    expect(content).not.toContain('$');
+    expect(content).toContain('p (1 - p )x+y-2');
+  });
+
+  it('字符框与词文本对不上时**整段放弃**，绝不产出错位的公式', () => {
+    const word = s17Word();
+    const bogus = s17Chars(S17_EXP_FROM, S17_EXP_TO);
+    // 把第一个字符改掉：字符序列与词文本不再一致
+    attachCharsToWord(word, {
+      chars: [{ ...bogus.chars[0]!, char: 'X' }, ...bogus.chars.slice(1)],
+      measurements: bogus.measurements,
+    });
+
+    const content = ocrResultToBlocks(pageResult({ words: [word] }))[0]?.content ?? '';
+    expect(content).not.toContain('^{');
+    expect(content).toContain('p (1 - p )x+y-2');
+  });
+
+  it('字符数不一致时同样放弃（错位的框比没有更糟）', () => {
+    const word = s17Word();
+    const bogus = s17Chars(S17_EXP_FROM, S17_EXP_TO);
+    attachCharsToWord(word, {
+      chars: bogus.chars.slice(0, bogus.chars.length - 1),
+      measurements: bogus.measurements.slice(0, bogus.measurements.length - 1),
+    });
+
+    const content = ocrResultToBlocks(pageResult({ words: [word] }))[0]?.content ?? '';
+    expect(content).not.toContain('^{');
+  });
+
+  it('指数**结尾紧跟空格**时不能把空格也吞进 `^{}`', () => {
+    /**
+     * ═══════════════════════════════════════════════════════════
+     * 这条是从真实数据的实际输出里发现的边界
+     * ═══════════════════════════════════════════════════════════
+     *
+     * `... (1 - p )x+y-2 ,0 ...` 里指数后面紧跟一个空格，
+     * 而字符级判定（只看纵向几何）**会把那个空格也标成上标** ——
+     * 空格也「更小（没墨迹）且更高」。
+     *
+     * 危险在于拼装：片段文本必须**不含尾随空格**，而且游标要落在空格**之前**，
+     * 否则 ` ,0` 会连同空格一起被吞掉，输出变成 `$^{x+y-2,0}$`。
+     * `groupScriptFragments` 的「空白打断」与 `emitWordWithCharScripts`
+     * 的「游标只到片段末字符」共同保证这一点，这条测试把它钉住。
+     */
+    const word = s17Word();
+    const built = s17Chars(S17_EXP_FROM, S17_EXP_TO + 1); // 把紧随的空格也标成上标
+    attachCharsToWord(word, built);
+
+    const content = ocrResultToBlocks(pageResult({ words: [word] }))[0]?.content ?? '';
+    expect(content).toContain('$^{x+y-2}$ ,0');
+    // 空格与后面的 `,0` 一个都不能少
+    expect(content).not.toContain('$^{x+y-2 ,0');
+    expect(content).not.toContain('$^{x+y-2,0');
+  });
+});
+

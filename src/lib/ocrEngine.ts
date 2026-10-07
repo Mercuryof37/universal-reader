@@ -7,6 +7,12 @@
  * - ONNX Runtime Web (WASM) 运行，纯浏览器端。
  */
 import { PaddleOcrService } from 'ppu-paddle-ocr/web';
+// 结果类型**必须显式导入**，不能靠 `ReturnType<PaddleOcrService['recognize']>`：
+// `recognize` 是重载函数，`ReturnType` 只会取到其中一个重载的返回类型
+// （实测取到的是 `PaddleOcrResult`，即按行分组、带 `lines` 的那一支），
+// 而本文件**始终**以 `{ flatten: true }` 调用，运行时拿到的是扁平结果（带 `results`）。
+// 两者对不上就会报「`results` 不存在」——之前那版正是这样留下 4 个类型错误。
+import type { FlattenedPaddleOcrResult } from 'ppu-paddle-ocr/web';
 import * as ort from 'onnxruntime-web';
 import { errorReport } from '@/lib/diagnostics';
 import { recognizeFormula } from '@/services/formulaOcrService';
@@ -14,11 +20,16 @@ import { useSettingsStore } from '@/store/settingsStore';
 import { OCR_MODEL_BASE, OCR_MODEL_FILES, buildOcrModel } from '@/lib/ocrModelSource';
 import { resolveExecutionProviders } from '@/lib/ocrExecutionProvider';
 import { noteOcrStage } from '@/lib/sessionDiagnostics';
+import { attachCharBoxes, createWordCharBoxRecognizer } from '@/lib/ocrCharBoxes';
+import type { OcrCanvasLike } from '@/lib/ocrCharBoxes';
 import {
   detectMissedInkRegionsFromCanvas,
   overlapRatio,
   type MissedInkRegion,
 } from '@/lib/ocrInkRegions';
+
+/** 「裁剪 → 字符框」的识别器；建不起来时是 null（见 `ensureCharBoxRecognizer`） */
+type CharBoxRecognizer = Awaited<ReturnType<typeof createWordCharBoxRecognizer>>;
 
 // Force ONNX Runtime to load WASM from CDN instead of bundling locally.
 // The .wasm file is ~28MB which exceeds Cloudflare Pages' 25MB limit.
@@ -267,6 +278,23 @@ export { OCR_LANG_OPTIONS } from '@/lib/ocrTypes';
 class OcrEngine {
   private service: PaddleOcrService | null = null;
   private initialized = false;
+  /**
+   * 字符框识别器（懒建、只建一次）。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * 为什么要单独一个会话，以及为什么是懒的
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 逐字符的横向位置只存在于识别模型的 logits 里（CTC 的 `positions`，
+   * 见 `lib/ocrCharBoxes.ts` 顶部的完整推导），而 `PaddleOcrService`
+   * 的 session 是 private 字段、公开 API 只给成品文本 —— 所以必须自建一个
+   * 识别会话（**同一份 21.29MB 模型被加载两次**，这是有意的取舍）。
+   *
+   * 懒建的理由：不用字符框的路径（例如只要纯文本）不该为此多付
+   * 20MB 内存与一次模型反序列化。真正要用时（第一次识别到词之后）才建。
+   */
+  private charBoxRecognizer: CharBoxRecognizer | null = null;
+  private charBoxRecognizerPromise: Promise<CharBoxRecognizer> | null = null;
 
   async initialize(_lang: OcrLang = 'chi_sim+eng'): Promise<void> {
     if (this.initialized) return;
@@ -333,7 +361,11 @@ class OcrEngine {
 
     onProgress?.({ pageNum, total, status: 'recognizing' });
 
-    const result = await this.recognizeWithFallback(imageData, pageNum, total);
+    const { result, canvas: recognizedCanvas, factor } = await this.recognizeWithFallback(
+      imageData,
+      pageNum,
+      total,
+    );
 
     const words: OcrWord[] = [];
     for (const item of result.results) {
@@ -350,6 +382,45 @@ class OcrEngine {
         },
         fontSize: item.box.height,
       });
+    }
+
+    /**
+     * ═══════════════════════════════════════════════════════════════
+     * 字符级坐标：上下标能不能真正解决，全看这一步
+     * ═══════════════════════════════════════════════════════════════
+     *
+     * 词级框判不出「同框内部的指数」（实测第 17 题 `p (1 − p )x+y−2`
+     * 的指数就在整行框里）。`lib/ocrCharBoxes.ts` 用 CTC 的时间步拿到
+     * 每个字符的横向位置、再用逐列墨迹分析拿到纵向范围，于是
+     * 「更小 + 更高」变成可测事实，`ocrPostProcess` 据此按**字符**切分。
+     *
+     * ⚠️ **渐进增强**，三层兜底（少任何一层都会让这一页整个失败）：
+     *  1. 识别器建不起来 → `attachCharBoxes` 收到 null，直接返回 0；
+     *  2. 单个词失败 → 只是这个词没有字符框（`ocrCharBoxes` 内部 try/catch）；
+     *  3. 整段失败 → 这里再兜一层 catch。
+     * 三种情况下 `words` 与改动前**逐字节一致**，识别结果一个字都不会少。
+     */
+    if (words.length) {
+      try {
+        const recognizer = await this.ensureCharBoxRecognizer();
+        const attachedCount = await attachCharBoxes(words, recognizer, {
+          canvas: recognizedCanvas as unknown as OcrCanvasLike,
+          scale: factor < 0.999 ? factor : 1,
+          onSkip: (word, reason) => {
+            console.warn(
+              `[ocrEngine] 第 ${pageNum} 页词「${word.text.slice(0, 20)}」未取到字符级坐标：${reason}`,
+            );
+          },
+        });
+        if (attachedCount) {
+          console.info(
+            `[ocrEngine] 第 ${pageNum} 页 ${attachedCount}/${words.length} 个词取到字符级坐标` +
+              `（上下标按逐字符几何判定）`,
+          );
+        }
+      } catch (err) {
+        console.warn('[ocrEngine] 字符级坐标附加失败（识别结果不受影响）：', err);
+      }
     }
 
     if (!words.length) {
@@ -419,7 +490,37 @@ class OcrEngine {
     imageData: ImageData | HTMLCanvasElement | OffscreenCanvas,
     pageNum: number,
     total: number,
-  ) {
+  ): Promise<{
+    /**
+     * ⚠️ 这里必须写**扁平**结果类型，不能写 `ReturnType<PaddleOcrService['recognize']>`。
+     *
+     * `recognize` 是重载函数，`ReturnType` 只会取到其中一个重载的返回类型 ——
+     * 实测取到的是 `PaddleOcrResult`（按行分组、带 `lines`）。
+     * 而本函数**始终**以 `{ flatten: true }` 调用（见下面第 532 行附近），
+     * 运行时拿到的必然是扁平结果（带 `results`）。
+     *
+     * 类型与实际不符的后果不是运行时报错，而是**编译期**报一堆
+     * 「`results` 不存在于 `PaddleOcrResult`」—— 之前那版正是这样
+     * 留下 4 个类型错误、过不了 CI 门禁。
+     */
+    result: FlattenedPaddleOcrResult;
+    /**
+     * 真正喂给识别的画布，以及它相对原图的缩放系数。
+     *
+     * ═══════════════════════════════════════════════════════════════
+     * 为什么必须把它带出来（字符框会不会贴错地方全看这个）
+     * ═══════════════════════════════════════════════════════════════
+     *
+     * `result.results[].box` 的坐标是**在这张画布上**量到的，而不是原图的。
+     * 一旦走了降档（0.7 / 0.5 / 0.35 —— 内存不足时真的会走），
+     * 拿这些框去原图上裁剪，裁到的就是**错位的内容**：
+     * 裁错内容 → 识别出别的字 → 字符框与 `OcrWord.text` 对不上 →
+     * （对账逻辑会拦住，所以不会写错坐标）每个词都白跑一次推理。
+     * 所以字符框一律用**这张画布**，坐标天然一致。
+     */
+    canvas: HTMLCanvasElement;
+    factor: number;
+  }> {
     const maxPixelFactor = factorForMaxPixels(imageData, OCR_MAX_PIXELS);
     const factors = [maxPixelFactor, 0.7, 0.5, 0.35].filter(
       (f, i, arr) => f > 0 && arr.indexOf(f) === i,
@@ -452,7 +553,7 @@ class OcrEngine {
         if (factor < 0.999) {
           console.info(`[ocrEngine] 第 ${pageNum} 页以「${label}」识别成功`);
         }
-        return result;
+        return { result, canvas, factor };
       } catch (err) {
         lastError = err;
         console.warn(`[ocrEngine] 第 ${pageNum} 页「${label}」识别失败：`, err);
@@ -462,9 +563,43 @@ class OcrEngine {
     throw new Error(errorReport(`识别第 ${pageNum} 页（共 ${total} 页）失败`, lastError));
   }
 
+  /**
+   * 懒建字符框识别器；建不起来返回 null（**永不抛**）。
+   *
+   * 三重保险，任何一层失败都只是「这一页没有字符级坐标」：
+   *  1. 会话/字典建不起来（模型拿不到、WASM 被拦、浏览器不支持）→ null；
+   *  2. 上一次已经失败过 → 记下 null，不再重试（否则每页都白等一次超时）；
+   *  3. 调用方 `attachCharBoxes` 内部对每个词单独 try/catch。
+   */
+  private async ensureCharBoxRecognizer(): Promise<CharBoxRecognizer> {
+    if (this.charBoxRecognizer) return this.charBoxRecognizer;
+    if (!this.charBoxRecognizerPromise) {
+      const t0 = Date.now();
+      this.charBoxRecognizerPromise = createWordCharBoxRecognizer()
+        .then((recognizer) => {
+          if (recognizer) {
+            console.info(
+              `[ocrEngine] 字符级坐标已启用（识别会话就绪，用时 ${((Date.now() - t0) / 1000).toFixed(1)} 秒）` +
+                ` —— 上下标将按**逐字符**的真实几何判定`,
+            );
+          } else {
+            console.info('[ocrEngine] 字符级坐标不可用，上下标退回词级判据（行为与以前一致）');
+          }
+          return recognizer;
+        })
+        .catch((err: unknown) => {
+          console.warn('[ocrEngine] 字符级坐标初始化失败，退回词级判据：', err);
+          return null;
+        });
+    }
+    return this.charBoxRecognizerPromise;
+  }
+
   async terminate(): Promise<void> {
     this.service = null;
     this.initialized = false;
+    this.charBoxRecognizer = null;
+    this.charBoxRecognizerPromise = null;
   }
 
   get isReady(): boolean {
