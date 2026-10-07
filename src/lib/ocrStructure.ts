@@ -83,6 +83,8 @@ export interface OcrStructureLine {
 export interface OcrStructure {
   kind: 'universal-reader/ocr-structure';
   version: 1;
+  /** 构建标识（每次构建不同）—— 用来判断这份导出是哪一版跑出来的 */
+  buildId: string;
   pageNum: number;
   /** 画布高度（像素）；判页眉页脚时用的是它 */
   canvasHeight?: number;
@@ -324,6 +326,20 @@ export function buildOcrStructure(input: {
   return {
     kind: 'universal-reader/ocr-structure',
     version: 1,
+    /**
+     * 构建标识。**这一行是为了不让"你跑的是哪一版"变成猜测。**
+     *
+     * 实测撞上过：修复已部署（`1deb6c1`，Cloudflare Pages 与 verify 均 success），
+     * 但用户导出的结构里仍是修复前的行为（等号被包成 `$^{=}$`）——
+     * 唯一解释是浏览器还在用上一版构建（Service Worker 停在中间那一版）。
+     *
+     * 没有这个字段时，我分不清「修复没生效」与「你还没拿到修复」，
+     * 而那两者的下一步动作完全相反：前者要继续改代码，
+     * 后者只要刷新。把它写进导出，一眼就能分辨。
+     *
+     * 取值由 `vite.config.ts` 注入（每次构建不同），因此能唯一对应一次部署。
+     */
+    buildId: typeof __BUILD_ID__ === 'string' ? __BUILD_ID__ : 'unknown',
     pageNum: input.pageNum,
     canvasHeight: input.canvasHeight,
     dominantFontSize: round(input.dominantFontSize),
