@@ -911,3 +911,179 @@ describe('真实文档回归：整页不得被合并成一行', () => {
   });
 });
 
+// ═══════════════════════════════════════════════════════════════
+// 以下内容追加到 src/lib/ocrPostProcess.test.ts 的**文件末尾**
+//（该文件里已有 `pageResult` 与 `w` 两个 helper，这里直接复用，不再声明）
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * 用户那份习题 PDF 第 1 页的**实测几何**（画布高 2223、中位字号 42）。
+ * 只列本组用例真正用到的那几个量：页眉、页脚、以及第 5 行的三个词。
+ */
+const REAL_CANVAS_HEIGHT = 2223;
+const REAL_HEADER = w('概率论与数理统计习题5', 440, 80, 36, 344, 95);
+const REAL_FOOTER = w('单周周一下午2点前交作业', 634, 2170, 42, 401, 100);
+
+/** 正文行：字高与真实页一致（42），宽度取真实首题量到的 1379 */
+const realBodyLine = (text: string, y: number, width: number) => w(text, 225, y, 42, width, 92);
+
+const REAL_17 =
+  '17. 设 随机 变量 (X ,Y) 具有 分 布律 P {X = x ,Y = y} = p (1 − p )x+y−2 ,0 < p < 1';
+const REAL_19 = '19. 设X的分布函数为F(x)，求它的概率密度函数。';
+const REAL_20 = '20. 已知X服从二项分布b(n,p)，求X的分布律。';
+const REAL_21 = '21. 设X与Y相互独立，都服从参数p的几何分布。';
+const REAL_24 = '24. 设总体X的概率密度函数为p(1-p)x+y-2，求参数p的矩估计。';
+
+function realPage() {
+  const body = [
+    realBodyLine(REAL_17, 250, 1379),
+    realBodyLine(REAL_19, 314, 900),
+    realBodyLine(REAL_20, 378, 880),
+    realBodyLine(REAL_21, 442, 950),
+  ];
+  return { body, words: [REAL_HEADER, ...body, REAL_FOOTER] };
+}
+
+describe('真实文档回归：页眉/页脚不得出现在 blocks 里', () => {
+  it('页眉「概率论与数理统计习题5」（y=80 / 字号 36）被滤掉', () => {
+    const { words } = realPage();
+    const blocks = ocrResultToBlocks(pageResult({ words }), REAL_CANVAS_HEIGHT);
+
+    expect(blocks.some((b) => b.content.includes('概率论与数理统计习题5'))).toBe(false);
+    expect(blocks[0]?.content.startsWith('17.')).toBe(true);
+  });
+
+  it('页脚「单周周一下午2点前交作业」（y=2170 / 字号 42，与正文同字号）被滤掉', () => {
+    const { words } = realPage();
+    const blocks = ocrResultToBlocks(pageResult({ words }), REAL_CANVAS_HEIGHT);
+
+    expect(blocks.some((b) => b.content.includes('交作业'))).toBe(false);
+  });
+
+  it('页眉页脚被滤掉之后正文一个词都不能少', () => {
+    const { body, words } = realPage();
+    const blocks = ocrResultToBlocks(pageResult({ words }), REAL_CANVAS_HEIGHT);
+    const text = blocks.map((b) => b.content).join('\n');
+
+    for (const line of body) {
+      expect(text, `${line.text.slice(0, 8)}… 消失了`).toContain(line.text.slice(0, 12));
+    }
+    expect(blocks.length).toBeGreaterThan(0);
+  });
+});
+
+describe('真实文档回归：公式检测框撑大的行不得判成 heading', () => {
+  /** 真实数据：字号 78.7 / 87.5 / 58，该页中位字号 42（门槛 54.6） */
+  const REAL_HEADING_LINES = [
+    'Z= 当X>Y 其中λ>0，μ>0是常数.引入随机变量=10, 当X>Y',
+    'fz(e)= 0 0, 其他',
+    'P).',
+  ];
+
+  function headingPage() {
+    return [
+      realBodyLine(REAL_19, 165, 900),
+      realBodyLine(REAL_20, 225, 880),
+      realBodyLine(REAL_21, 285, 950),
+      w(REAL_HEADING_LINES[0] ?? '', 225, 296, 78.7, 700, 88),
+      w(REAL_HEADING_LINES[1] ?? '', 225, 470, 87.5, 260, 88),
+      realBodyLine(REAL_24, 560, 940),
+      w(REAL_HEADING_LINES[2] ?? '', 225, 790, 58, 70, 88),
+      realBodyLine('以下为下一节的正文，用来把整页的中位字号钉在 42 上。', 900, 700),
+    ];
+  }
+
+  it('三行真实数据都不得是 heading', () => {
+    const blocks = ocrResultToBlocks(pageResult({ words: headingPage() }), REAL_CANVAS_HEIGHT);
+    const headings = blocks.filter((b) => b.type === 'heading').map((b) => b.content);
+    const text = blocks.map((b) => b.content).join('\n');
+
+    for (const line of REAL_HEADING_LINES) {
+      expect(headings, `「${line.slice(0, 12)}…」不应是 heading`).not.toContain(line);
+      expect(headings.some((h) => h.includes(line.slice(0, 10)))).toBe(false);
+      expect(text).toContain(line);
+    }
+  });
+
+  it('真正的章节标题仍然判成 heading —— 防「一刀切禁掉标题」', () => {
+    const words = [
+      w('第一章 绪论', 225, 120, 78.7, 116, 92),
+      realBodyLine(REAL_19, 260, 900),
+      realBodyLine(REAL_20, 325, 880),
+      realBodyLine(REAL_21, 390, 950),
+      w('小标题甲', 225, 470, 58, 116, 88),
+    ];
+    const blocks = ocrResultToBlocks(pageResult({ words }), REAL_CANVAS_HEIGHT);
+
+    expect(blocks[0]?.type).toBe('heading');
+    expect(blocks[0]?.content).toBe('第一章 绪论');
+    // 反面：字号同量级但没有标题形态的短行不得被一并放过
+    expect(blocks.find((b) => b.content === '小标题甲')?.type).toBe('paragraph');
+  });
+});
+
+describe('真实文档回归：跨行构件内的词序必须按 y', () => {
+  it('构件里的行序必须按 y：主行在下时不得被提到最前', () => {
+    // ⚠️ 这个形状是**实测扫出来的**，保证被测的正是「行序」这一条：
+    //   · 两个词的中心 y 差 55px → 各自成一个桶（容差 5px 挂不住）；
+    //   · 下面那行（含 `=`）**又宽又高**（400×40 对 160×30），
+    //     正是 `pickPrimaryLine` 认定的「主行」；
+    //   · 它更高 → 横向包含判据不成立，因此它不会先去吃掉上面那行，
+    //     上面那行的桶先建好、主行再并进来 —— 与「谁先当主机」无关；
+    //   · 于是唯一的变数就是行序：主行的 y 比上面那行的桶中心低，
+    //     原来会被提到最前，读出来是 `=M 主行=B 承接上文`。
+    // 实测：这一形状在原逻辑下给出 wordIndices = [1, 0]（读成
+    // `=M 主行=B 承接上文`），修好后是 [0, 1]（换过 8 组其它形状都区分不出来）。
+    const upper = w('=B 承接上文', 300, 550, 30, 160, 90);
+    const main = w('=M 主行', 300, 600, 40, 400, 90);
+
+    expect((upper.bbox.y0 + upper.bbox.y1) / 2).toBe(565);
+    expect((main.bbox.y0 + main.bbox.y1) / 2).toBe(620);
+
+    let captured: Parameters<NonNullable<Parameters<typeof ocrResultToBlocks>[2]>>[0] | undefined;
+    const blocks = ocrResultToBlocks(
+      pageResult({ words: [upper, main] }),
+      REAL_CANVAS_HEIGHT,
+      (structure) => {
+        captured = structure;
+      },
+    );
+
+    const line = captured?.lines.find((l: { text: string }) => l.text.includes('承接上文'));
+    expect(line).toBeDefined();
+    expect(line?.wordIndices).toEqual([0, 1]);
+    expect(line?.text).toBe('=B 承接上文=M 主行');
+    expect(blocks[0]?.content).toContain('=B 承接上文=M 主行');
+  });
+
+  it('含 `=` 的行排在后面时同样不得被提到最前（全 ASCII 形状）', () => {
+    // 与上一条同一个机制，换成全 ASCII 文本，并且**只有下面那行含 `=`**：
+    // 上一条里两行都含 `=`，`pickPrimaryLine` 会挑中上面那行 —— 那是我第一版
+    // 用例的毛病（验到的是「谁含等号」而不是「主行排在哪」），这里避开。
+    const upper = w('AB CD EF GH', 100, 300, 20, 160, 90);
+    const main = w('X = Y', 100, 350, 30, 260, 90);
+
+    let captured: Parameters<NonNullable<Parameters<typeof ocrResultToBlocks>[2]>>[0] | undefined;
+    const blocks = ocrResultToBlocks(
+      pageResult({ words: [upper, main] }),
+      REAL_CANVAS_HEIGHT,
+      (structure) => {
+        captured = structure;
+      },
+    );
+
+    expect(captured?.lines[0]?.wordIndices).toEqual([0, 1]);
+    expect(blocks[0]?.content).toBe('AB CD EF GH X = Y');
+  });
+
+  it('同一行的词序不变（防「把词全按 y 重排」）', () => {
+    const words = [
+      w('甲乙丙', 40, 200, 20, 90),
+      w('丁戊己', 140, 200, 20, 90),
+      w('庚辛壬', 240, 200, 20, 90),
+    ];
+    const blocks = ocrResultToBlocks(pageResult({ words }), REAL_CANVAS_HEIGHT);
+
+    expect(blocks[0]?.content).toBe('甲乙丙丁戊己庚辛壬');
+  });
+});

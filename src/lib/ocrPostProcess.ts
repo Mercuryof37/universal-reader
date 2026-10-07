@@ -8,7 +8,9 @@
  * 3. 同一纵向区域内的多行构件（跨行大括号 / 堆叠分数）合并为一行，保住阅读顺序；
  * 4. 行内把绑定的上下标包成 `^{...}` / `_{...}`；
  * 5. 按行间距离分割段落（自适应中位数阈值）；
- * 6. 字号启发式标题检测（大于中位数 1.3 倍且文本较短 → heading）。
+ * 6. 字号启发式标题检测（大于中位数 1.3 倍、文本较短、**且文本本身像标题**
+ *    → heading；见 `looksLikeHeading` 上方的说明：字号只能证明「它被排得很大」，
+ *    证明不了「它是标题」——扫描件里公式的检测框会把字号抬得很高）。
  */
 import type { ContentBlock } from '@/types/content';
 import type { OcrWord, OcrPageResult } from '@/lib/ocrTypes';
@@ -22,6 +24,23 @@ interface OcrLine {
   avgConfidence: number;
   /** 该行文本里是否真的包进了几何判定的上下标（供诊断与测试观察） */
   hasScripts?: boolean;
+  /**
+   * 排序用的桶中心 y。
+   *
+   * `y` 会被构件合并改成「词框上沿」（见 combineCluster），
+   * 而段落切分、行距统计一直用桶中心 y —— 两类行混在一起排序时
+   * 必须有同一个口径，否则正文行的先后顺序会漂移。
+   * 纯桶行由 `groupWordsIntoLines` 填，合并出来的行不填（沿用 y）。
+   */
+  sortKey?: number;
+  /**
+   * 该行被判为页眉/页脚（页面家具）。
+   *
+   * 为什么不直接把它从行列表里删掉，而是留一个标记：
+   * 「这一行为什么没进正文」是排查页眉页脚时最常问的问题，
+   * 有标记才能把判断依据一并说清楚（见 `filterHeaderFooter`）。
+   */
+  isPageFurniture?: boolean;
 }
 
 const SAME_LINE_TOLERANCE = 5;
@@ -32,6 +51,26 @@ const HEADING_FONT_RATIO = 1.3;
 const HEADING_MAX_CHARS = 80;
 const HEADER_FOOTER_MARGIN_RATIO = 0.05;
 const HEADER_FOOTER_FONT_RATIO = 0.85;
+/**
+ * 页眉页脚判据（二）：与同侧相邻行的纵向隔离度（按**正文字号**归一）。
+ *
+ * 实测数据（用户那份习题 PDF 第 1 页，画布高 2223、正文字号 42）：
+ *   · 页眉 y=[62,98]、字号 36，与页面上最上面那行正文 y0=212 的空隙 **114px**
+ *     = **2.7 倍字号**；
+ *   · 页脚 y=2170、字号 42，与正文最低一行 y=1992 的空隙 **178px**
+ *     = **4.2 倍字号**。
+ * 而正常行距（真实页量到的行距中位数）只有 30–40px。
+ * 门槛取 1.4 倍**参考字号**（正文字号与该行自身字号取大者）：
+ *   · 页眉 36px 行：门槛 50.4，实测空隙 114px → 判为页面家具；
+ *   · 页脚 42px 行：门槛 58.8，实测空隙 178px → 判为页面家具；
+ *   · 版面顶部的章节标题（字号 78.7）：门槛 110.2，实测与下一行的空隙
+ *     只有 45px（大标题后面本来就留白）→ **不**判为页面家具。
+ * 若只按正文字号 42 归一（门槛 58.8），那个 45px 空隙的大标题就会被误删
+ * ——「按行自身字号取大者」正是为了挡住这一类误伤。
+ */
+const FURNITURE_GAP_FONT_RATIO = 1.4;
+/** 页眉页脚判据（三）：宽度不到**版心宽度**（页内最宽那行）的这个比例 */
+const FURNITURE_COLUMN_WIDTH_RATIO = 0.85;
 
 /**
  * 上下标判定阈值 —— 默认全部取「保守」方向：**不确定就不动**。
@@ -64,6 +103,12 @@ const SCRIPT_FRAGMENT_DY = 0.5;
 const CLUSTER_BRANCH_SLACK = 0.2;
 /** 跨行构件合并：分支宽度最多是主机的这个比例（更宽的就不是「分支」） */
 const CLUSTER_BRANCH_MAX_WIDTH_RATIO = 0.75;
+/**
+ * 跨行构件合并：候选横跨主机跨度的比例上限。
+ *
+ * 超过它就不是「分支」而是**并列的另一行**（见 canMergeAsBranch 的说明）。
+ */
+const CLUSTER_PEER_COVER_RATIO = 0.85;
 /** 跨行构件合并：较小行至少要有多大比例的宽度压在主机跨度上 */
 const CLUSTER_CONTAINMENT_RATIO = 0.6;
 /** 跨行构件合并（按分支判据 3）：纵向间隙上限（**主机**字高的倍数） */
@@ -159,7 +204,33 @@ function mergeShortChunks(chunks: string[], minLength = 20, maxMerged = 400): st
   return out;
 }
 
-/** 标题启发式：短、单行、以编号或章节词开头 */
+/**
+ * 标题启发式：短、单行、以编号或章节词开头。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么「字号大」不足以判标题（用户实测的第二个故障）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 词坐标路径原先的判据是「行字号 > 中位字号 × 1.3 且文本不超过 80 字」。
+ * 在扫描版数学材料上这条会稳定误判，因为**识别器给公式区域的检测框又高又怪**：
+ * 跨行大括号、分式、堆叠上下标的检测框会把"行字号"抬得很高，
+ * 而那一行根本不是被排版放大的标题。
+ *
+ * 实测（同一页，中位字号 42、门槛 54.6）这三行被判成了标题：
+ *   · `Z= 当X>Y 其中λ>0，μ>0是常数.引入随机变量=10, 当X>Y`（字号 78.7）
+ *   · `fz(e)= 0 0, 其他`（字号 87.5）
+ *   · `P).`（字号 58）
+ * 三行的共同点是**文本本身明摆着不是标题**：前两行含数学符号（`=`），
+ * 第三行只剩一堆标点。字号只能证明"它被排得很大"，证明不了"它是标题"
+ * —— 所以这条判据再要一份**文本证据**。
+ *
+ * 这条启发式对**两条路径**（纯文本兜底 / 词坐标）同时生效，
+ * 口径一致才能保证同一份内容走哪条路都一样。
+ *
+ * 代价是刻意接受的：没编号、又不以章节词开头的普通大字号行（居中书名等）
+ * 会退化成段落。宁可漏判标题（只是少一层视觉层级），
+ * 也不能把公式渲染成二级标题（视觉上完全错误，还会污染大纲）。
+ */
 function looksLikeHeading(text: string): boolean {
   if (text.length > 40) return false;
   if (/[。！？!?]$/.test(text)) return false;
@@ -212,7 +283,7 @@ export function ocrResultToBlocks(
     return fallback;
   }
 
-  const lines = groupWordsIntoLines(result.words);
+  const lines = groupWordsIntoLines(result.words, pageHeight);
   if (!lines.length) return ocrTextToBlocks(result.pageText ?? '');
 
   const gaps: number[] = [];
@@ -222,18 +293,22 @@ export function ocrResultToBlocks(
   const medianGap = median(gaps) || 0;
   const medianFontSize = median(lines.map((l) => l.fontSize)) || 12;
 
-  // Filter out header/footer lines: in top/bottom margin with small font
-  const filteredLines = filterHeaderFooter(lines, pageHeight, medianFontSize);
-
   const blocks: Omit<ContentBlock, 'id'>[] = [];
   let currentText = '';
   let currentConfSum = 0;
   let currentConfCount = 0;
   let currentFontSize = 0;
   let currentScripts = 0;
+  /**
+   * 本块**第一行**的原文。
+   *
+   * 标题是单行的东西，判它必须看这一行，而不是看整块拼出来的文本：
+   * 一个块里可能第一行是公式、后面跟着正文，拿整段判就会两头都错。
+   */
+  let currentFirstText = '';
   let prevY: number | null = null;
 
-  for (const line of filteredLines) {
+  for (const line of lines) {
     const gap = prevY === null ? 0 : Math.abs(prevY - line.y);
     // 段间距阈值：取「中位行距的 1.2 倍」与「字号的 1.8 倍」中**较小**的那个。
     //
@@ -284,9 +359,13 @@ export function ocrResultToBlocks(
     if (isNewParagraph) {
       if (currentText.trim()) {
         const avgConf = currentConfCount > 0 ? currentConfSum / currentConfCount : 0;
+        // ⚠️ 这里用 currentFirstText（**本块第一行**）而不是 currentText：
+        // 标题是**单行**的东西，而拼到现在的整段文本可能已经把后面几行
+        // 并了进来。拿整段去判就会两头都错。
         const isHeading =
           currentFontSize > medianFontSize * HEADING_FONT_RATIO &&
-          currentText.trim().length <= HEADING_MAX_CHARS;
+          currentFirstText.trim().length <= HEADING_MAX_CHARS &&
+          looksLikeHeading(currentFirstText);
 
         blocks.push({
           type: isHeading ? 'heading' : 'paragraph',
@@ -303,6 +382,7 @@ export function ocrResultToBlocks(
         });
       }
       currentText = line.text;
+      currentFirstText = line.text;
       currentConfSum = line.avgConfidence * line.words.length;
       currentConfCount = line.words.length;
       currentFontSize = line.fontSize;
@@ -321,7 +401,8 @@ export function ocrResultToBlocks(
     const avgConf = currentConfCount > 0 ? currentConfSum / currentConfCount : 0;
     const isHeading =
       currentFontSize > medianFontSize * HEADING_FONT_RATIO &&
-      currentText.trim().length <= HEADING_MAX_CHARS;
+      currentFirstText.trim().length <= HEADING_MAX_CHARS &&
+      looksLikeHeading(currentFirstText);
 
     blocks.push({
       type: isHeading ? 'heading' : 'paragraph',
@@ -338,7 +419,7 @@ export function ocrResultToBlocks(
 
   // ── 导出识别结构（只在调用方要的时候才构造）────────────────────
   //
-  // 放在最后：`filteredLines` 是真正参与拼装的行（页眉页脚已经滤掉），
+  // 放在最后：`lines` 是真正参与拼装的行（页眉页脚已经滤掉），
   // `blocks` 是最终产物。两者与原始 `words` 一起交出去，
   // 收到的人才能拿真实词框去核对「这一行到底为什么没变成上下标」。
   if (onStructure) {
@@ -351,7 +432,9 @@ export function ocrResultToBlocks(
         canvasHeight: pageHeight,
         dominantFontSize: medianFontSize,
         words: result.words,
-        lines: filteredLines
+        // 页面家具已经在 `groupWordsIntoLines` 里摘掉了，因此这里直接用
+        // `lines`：导出要如实反映「哪些行真的参与了拼装」
+        lines: lines
           // 没有词的「行」在导出里没有意义（它的 wordIndices 会是空的）
           .filter((line) => line.words.length > 0)
           .map((line) => ({
@@ -387,23 +470,126 @@ export function ocrResultToBlocks(
  * Headers/footers typically sit in the top/bottom 5% of the page
  * and use smaller font than body text. Both conditions must be met
  * to avoid stripping legitimate short content near page edges.
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么「字号更小」这一条不够（用户实测的故障）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 用户那份扫描版习题 PDF（画布高 2223、正文字号 42）上：
+ *   · 页眉「概率论与数理统计习题5」y=[62,98]、字号 **36** ——
+ *     门槛是 `42 × 0.85 = 35.7`，**36 > 35.7**，于是它躲过了过滤，
+ *     作为正文第一段出现在阅读器里；
+ *   · 页脚「单周周一下午2点前交作业」y=2170、字号 **42** —— 与正文同字号，
+ *     「更小」这条判据**永远不可能**成立，它一直留在正文末尾。
+ *
+ * 根因是把「页眉页脚」与「小字号」当成了一回事。正文用 42px 的版面上，
+ * 页眉页脚同样是 36–42px —— 在扫描件里这不是异常，而是常态
+ * （渲染 DPI 一高，页眉页脚的字面高度就上来了，页脚还常被识别成与正文同高）。
+ * 而**小字号从来不是页眉页脚的本质**，本质是「它是页面家具，不属于正文流」：
+ *   · 它被排在页边距里（判据一，原有的位置判据）；
+ *   · 它与同侧的正文行之间有一道**明显大于行距的空档**（页面家具是孤立的）；
+ *   · 它的宽度**明显不到版心宽度**（正文行铺满版心，页眉页脚是居中的一小段）。
+ *
+ * 后两条是**结构**判据，与字号无关，因此同字号页脚也能被认出来。
+ * 三条判据是「或」的关系：小字号仍然照旧单独成立（保住既有行为），
+ * 结构判据补上「同字号但孤立且窄」这一大类。
+ *
+ * ⚠️ 两条防误伤的闸门（都会让判据放弃，宁可漏判）：
+ *   · 看起来像标题的行（编号 / 章节词开头、全大写短行）**不当作页面家具** ——
+ *     页面顶部/底部完全可能出现真正的标题（实测项目里就有
+ *     `第1章 计算机系统漫游` 这类居中大标题）；
+ *   · 找不到同侧邻居时（整页只有一行等）不判。
+ *
+ * ⚠️ 为什么留标记而不是就地删掉：判断依据要能被追问（见 `OcrLine`）。
  */
 function filterHeaderFooter(
   lines: OcrLine[],
   pageHeight: number | undefined,
   medianFontSize: number,
 ): OcrLine[] {
-  if (!pageHeight || pageHeight <= 0 || lines.length < 3) return lines;
+  // 复制成新对象再标记：`OcrLine` 后面会被 `combineCluster` 等复制，
+  // 就地改会让「谁被标过」变得难以追踪。
+  const marked = lines.map((line) => ({ ...line }));
+  if (!pageHeight || pageHeight <= 0 || marked.length < 3) return marked;
 
   const topThreshold = pageHeight * HEADER_FOOTER_MARGIN_RATIO;
   const bottomThreshold = pageHeight * (1 - HEADER_FOOTER_MARGIN_RATIO);
   const smallFontThreshold = medianFontSize * HEADER_FOOTER_FONT_RATIO;
+  const columnWidth = maxLineWidth(marked);
 
-  return lines.filter((line) => {
+  for (const line of marked) {
     const inMargin = line.y < topThreshold || line.y > bottomThreshold;
+    if (!inMargin) continue;
+
     const smallFont = line.fontSize < smallFontThreshold;
-    return !(inMargin && smallFont);
-  });
+    if (smallFont || isIsolatedFurniture(marked, line, medianFontSize, columnWidth)) {
+      line.isPageFurniture = true;
+    }
+  }
+
+  return marked.filter((line) => line.isPageFurniture !== true);
+}
+
+/**
+ * 页眉页脚的**结构**判据：孤立在页边距里、且明显窄于版心。
+ *
+ * 与字号无关，因此「页脚与正文同字号」（用户实测那一页正是如此）也能认出来。
+ *
+ * 邻居只跟**同一侧**的行比（上边距的邻居取自己下方、下边距取自己上方）：
+ * 页眉与页脚之间本来就隔着整页正文，那个距离没有任何判据价值。
+ * 走到这里时页眉页脚已经在前面被摘掉了，因此「隔着整页」这层顾虑
+ * 其实已经不存在，但留着这条可以让判据本身自洽、便于单测。
+ */
+function isIsolatedFurniture(
+  allLines: OcrLine[],
+  line: OcrLine,
+  medianFontSize: number,
+  columnWidth: number,
+): boolean {
+  // 闸门一：像标题的行一律不判 —— 排得大、又带编号/章节词，
+  // 那是内容而不是页面家具。
+  if (looksLikeHeading(line.words.map((word) => word.text).join(''))) return false;
+
+  // 判据三：正文行铺满版心，页面家具是居中的一小段。
+  // 版心宽度取页内最宽的那一行（实测本页 1379px）：
+  // 页眉量到 344px（25%）、页脚量到 401px（29%），都远在门槛（1172px）之下。
+  const span = horizontalSpanOf(line);
+  const width = span.x1 - span.x0;
+  if (!(columnWidth > 0) || width >= columnWidth * FURNITURE_COLUMN_WIDTH_RATIO) return false;
+
+  // 判据二：与同侧相邻行的纵向空档。
+  // 门槛按**参考字号**算 —— 正文字号与该行自身字号取**大者**：
+  //   · 取下限（正文字号）是因为页面家具的字号可能偏小，只用它自己的
+  //     字号会把门槛压得太低；
+  //   · 取上限（本行字号）是因为大标题后面本来就留白 —— 实测版面上那个
+  //     78.7px 的章节标题与下一行只隔 45px，若按正文字号 42 归一
+  //     （门槛 58.8），它会被当成页面家具删掉。
+  const lineFontSize = line.words.reduce((max, word) => Math.max(max, word.fontSize), 0);
+  const referenceFontSize = Math.max(medianFontSize, lineFontSize);
+  const lineV = verticalSpanOf(line);
+  let neighbourGap = Infinity;
+  for (const other of allLines) {
+    if (other === line || other.isPageFurniture) continue;
+    const otherV = verticalSpanOf(other);
+    const otherIsBelow = otherV.y0 >= lineV.y1;
+    const otherIsAbove = otherV.y1 <= lineV.y0;
+    if (!otherIsBelow && !otherIsAbove) continue;
+    neighbourGap = Math.min(neighbourGap, verticalGapOf(lineV, otherV));
+  }
+  // 闸门二：连一个同侧邻居都没有时不判（没有比较对象就没有依据）
+  if (!Number.isFinite(neighbourGap)) return false;
+
+  return neighbourGap >= referenceFontSize * FURNITURE_GAP_FONT_RATIO;
+}
+
+/** 页内最宽的那一行的宽度 —— 用来估「版心宽度」 */
+function maxLineWidth(lines: OcrLine[]): number {
+  let max = 0;
+  for (const line of lines) {
+    const span = horizontalSpanOf(line);
+    max = Math.max(max, span.x1 - span.x0);
+  }
+  return max;
 }
 
 /**
@@ -437,7 +623,7 @@ function filterHeaderFooter(
  * 合并条件刻意收紧（水平包含度 + 纵向间隙双重约束），
  * 因为**把两行无关文字并成一行**比不合并更糟。
  */
-function groupWordsIntoLines(words: OcrWord[]): OcrLine[] {
+function groupWordsIntoLines(words: OcrWord[], pageHeight?: number): OcrLine[] {
   if (!words.length) return [];
 
   // 参考字号：整页「正常文字」的字高，取**出现次数最多**的那个字高（众数）。
@@ -494,11 +680,23 @@ function groupWordsIntoLines(words: OcrWord[]): OcrLine[] {
     words: orderLineWords(group, words, anchors),
     text: '',
     y: bucketKeys[i] ?? 0,
+    // 排序键 = 桶中心 y。构件合并会把 y 改成词框上沿，
+    // 两类行必须留一个同口径的量才能稳定排序。
+    sortKey: bucketKeys[i] ?? 0,
     fontSize: group.reduce((sum, w) => sum + w.fontSize, 0) / group.length,
     avgConfidence: group.reduce((sum, w) => sum + w.confidence, 0) / group.length,
   }));
 
-  const merged = mergeContainedBranches(rawLines, pageMainFontSize)
+  // ⚠️ 顺序不能反：**先滤页面家具，再做构件合并**。
+  //  1) 构件合并会把额外的行并进来，先滤才不会把页眉页脚的文字
+  //     混进正文构件里；
+  //  2) 构件合并会把行的纵向跨度撑大（实测撑出过 1416px 的巨行），
+  //     拿撑大的跨度去算「与相邻行的隔离度」会得到偏小的空隙，
+  //     页眉页脚反而认不出来；
+  //  3) 版心宽度也必须按**合并没有参与**的原始行来量。
+  const contentLines = filterHeaderFooter(rawLines, pageHeight, pageMainFontSize);
+
+  const merged = mergeContainedBranches(contentLines, pageMainFontSize)
     .map((line) => ({ ...line, words: [...line.words] }));
   attachDetachedScriptLines(merged, pageMainFontSize, words, anchors);
 
@@ -508,7 +706,10 @@ function groupWordsIntoLines(words: OcrWord[]): OcrLine[] {
       return { ...line, text: assembled.text, hasScripts: assembled.scriptCount > 0 };
     })
     .filter((l) => l.text.length > 0)
-    .sort((a, b) => a.y - b.y);
+    // ⚠️ 排序键必须与段落切分、行距统计同口径（桶中心 y）：
+    // 合并出来的行 y 是「词框上沿」（见 combineCluster），
+    // 两类行混在一起排会让正文先后顺序整体漂移。
+    .sort((a, b) => (a.sortKey ?? a.y) - (b.sortKey ?? b.y));
 }
 
 /**
@@ -862,18 +1063,43 @@ function verticalGapOf(
 function mergeContainedBranches(lines: OcrLine[], pageMainFontSize: number): OcrLine[] {
   if (lines.length < 2) return lines;
 
+  // ═══════════════════════════════════════════════════════════════
+  // 先按「宽度从大到小」排，再做合并（**顺序决定结果**）
+  // ═══════════════════════════════════════════════════════════════
+  //
+  // `canMergeAsBranch` 的判据是**方向性**的：分支必须比主机窄
+  // （不超过主机跨度的 75%）。于是「谁先当上主机」直接决定能不能合并：
+  // 拿一行 60px 宽的小字去当host，400px 宽的主式就永远合并不进来。
+  //
+  // 实测（用户数据第 5 行 `[5, 4, 6]` 的那三个词，centerY 588.5 / 661 / 684.5）：
+  // 最上面那行只有 79px 高、跨度最小，却被先当成主机，
+  // 结果**中间那行（被撑大的检测框）反而合并不进来、单独成行**。
+  // 现在改成宽度大的先当主机：主式先吃掉它两侧的分支，这正是
+  // 「跨行大括号 / 堆叠分数」的真实结构。
+  //
+  // 行序不在这里定：调用方 groupWordsIntoLines 末尾统一按**桶中心 y**
+  // （sortKey）排一次 —— 排序键在合并前后必须同口径，否则正文行次序会漂移。
+  const byWidth = lines
+    .map((line, index) => ({ line, index }))
+    .sort((a, b) => {
+      const wa = horizontalSpanOf(a.line);
+      const wb = horizontalSpanOf(b.line);
+      return wb.x1 - wb.x0 - (wa.x1 - wa.x0) || a.index - b.index;
+    })
+    .map((entry) => entry.line);
+
   const gaps: number[] = [];
   for (let i = 1; i < lines.length; i++) {
     gaps.push(Math.abs((lines[i - 1]?.y ?? 0) - (lines[i]?.y ?? 0)));
   }
   const medianGap = median(gaps);
 
-  const used = new Array<boolean>(lines.length).fill(false);
+  const used = new Array<boolean>(byWidth.length).fill(false);
   const out: OcrLine[] = [];
 
-  for (let i = 0; i < lines.length; i++) {
+  for (let i = 0; i < byWidth.length; i++) {
     if (used[i]) continue;
-    const seed = lines[i];
+    const seed = byWidth[i];
     if (!seed) continue;
 
     used[i] = true;
@@ -886,9 +1112,9 @@ function mergeContainedBranches(lines: OcrLine[], pageMainFontSize: number): Ocr
     let extended = true;
     while (extended) {
       extended = false;
-      for (let j = 0; j < lines.length; j++) {
+      for (let j = 0; j < byWidth.length; j++) {
         if (used[j]) continue;
-        const cand = lines[j];
+        const cand = byWidth[j];
         if (!cand) continue;
         if (!canMergeAsBranch(cand, mergedSpan, mergedV, refFont, medianGap)) continue;
 
@@ -913,6 +1139,10 @@ function mergeContainedBranches(lines: OcrLine[], pageMainFontSize: number): Ocr
     out.push(cluster.length === 1 ? seed : combineCluster(cluster));
   }
 
+  // ⚠️ 这里**不**排序：主循环是按宽度跑的，回来的顺序也就是按宽度。
+  // 行序由调用方 `groupWordsIntoLines` 末尾那条 `sort((a, b) => a.y - b.y)`
+  // 统一决定（排序键是桶中心 y，不能在这里就地按词框上沿排 —— 两者
+  // 不是同一个量，会让正文行的先后顺序整体漂移）。
   return out;
 }
 
@@ -980,6 +1210,18 @@ function canMergeAsBranch(
   // 正是 1，于是被并成一行、`blocks.length` 从 2 变 1。
   const containmentRatio = overlap / mergedWidth;
 
+  // 近满宽度的候选不算「分支」：它横向几乎把主机铺满，说明两者是
+  // **并列的两行**，而不是主子关系。
+  //
+  // 实测（防「一刀切禁掉标题」的控制用例）：版面上那个 78.7px 的章节标题
+  // 只有 116px 宽（真实的大标题就是这么短），它下面是一行 900px 宽的正文 ——
+  // 只按「75%」那道闸，标题（占比 13%）确实会被并进正文，于是
+  // **标题整行被吞掉、成为段落的一部分**，判标题的时机也一并丢了。
+  // 真分支（0, 22px 对 130px、合计 56px 对 170px）的占比都在 33% 以下，
+  // 与这条门槛（85%）隔着很远。
+  const coveredRatio = overlap / mergedWidth;
+  if (coveredRatio >= CLUSTER_PEER_COVER_RATIO) return false;
+
   // 分支必须比主机**明显窄**。这条是防误并的第一道闸：
   // 跨行大括号的两侧分支（`0, 其他`）是被主式包住的一小段；
   // 而两段宽度相近的正文（实测那对等宽的上下两段）绝不是「同一块构件」。
@@ -1037,9 +1279,59 @@ function canMergeAsBranch(
  * 主行排最前（含 `=` 的赋值式主体），其余按 y 保持从上到下的相对顺序。
  */
 function combineCluster(cluster: OcrLine[]): OcrLine {
-  const sorted = [...cluster].sort((a, b) => a.y - b.y);
-  const primary = pickPrimaryLine(sorted);
-  const sequence = [...(primary ? [primary] : []), ...sorted.filter((l) => l !== primary)];
+  // ═══════════════════════════════════════════════════════════════
+  // 行序：**默认按上沿从上到下**；只有「有一行纵向跨住其余所有行」时才把它提到最前
+  // ═══════════════════════════════════════════════════════════════
+  //
+  // ⚠️ 两个坑都是实测踩出来的：
+  //  1. 排序键必须用**词框上沿**（topOf），不能直接用 y：构件合并是按上沿判的
+  //     （见 mergeContainedBranches），而纯桶行的 y 是**桶中心** ——
+  //     两个量混着排会把「合并进来的行」与「还没合并的行」次序颠倒。
+  //     实测（全 ASCII 形状：上行 y=[300,320]、主行 y=[350,380]）：主行的桶中心
+  //     是 365，比上行的桶中心 310 大，按桶中心排就把主行排到了后面。
+  //  2. 原来是无条件把主行（含 `=` 的行）提到最前。那在**主行确实跨住同伴**时
+  //     是对的（堆叠分数的分子分母、大括号两侧的分支本来就压在主机身上，主行先读），
+  //     但主行与同伴根本没有交集时（同上那组坐标），把它提到最前就是把上面
+  //     一整行挤到后面 —— 读出来是反的（`X = Y AB CD EF GH`）。
+  //
+  // 现在的判据只看**几何**，不看「哪一行含等号」：纵向跨住其余所有行的那一行
+  // 才是构件的主机。`z = 当X>Y…` 与它两侧的分支、`f(x,y) = …` 与 `0, 其他`
+  // 都是这种形状；而 `X = Y` 与 `AB CD EF GH` 各自成行、谁也不跨谁 ——
+  // 那就老老实实按上沿排。
+  const topOf = (line: OcrLine): number =>
+    line.words.length ? Math.min(...line.words.map((word) => word.bbox.y0)) : line.y;
+  const sorted = [...cluster].sort((a, b) => topOf(a) - topOf(b) || a.y - b.y);
+
+  const hosts = (line: OcrLine): boolean => {
+    const span = verticalSpanOf(line);
+    return sorted.every((other) => {
+      if (other === line) return true;
+      const v = verticalSpanOf(other);
+      const overlap = Math.min(span.y1, v.y1) - Math.max(span.y0, v.y0);
+      return overlap > 0 && span.y0 <= v.y0 && span.y1 >= v.y1;
+    });
+  };
+  /**
+   * 挑出「主机」：纵向跨住其余所有行的那一行。
+   *
+   * 跨得住的行可能不止一条（多层嵌套），这时按原来的偏好定：**含 \`=\` 的行
+   * 优先**（\`pickPrimaryLine\` 的评分口径），仍然并列就取最上面那条 ——
+   * 保证结果与输入顺序无关、可重现。
+   */
+  function pickHost(): OcrLine | undefined {
+    const candidates = sorted.length > 1 ? sorted.filter(hosts) : [];
+    if (!candidates.length) return undefined;
+    const preferred = pickPrimaryLine(candidates);
+    const scored = candidates.filter((line) => line === preferred);
+    const pool = scored.length ? scored : candidates;
+    return pool.reduce((best, line) => (topOf(line) < topOf(best) ? line : best));
+  }
+  const host = pickHost();
+
+  // ⚠️ 这里刻意用 if 而不是三元表达式：`cond ? a : [...b, ...c]` 会被解析成
+  // `(cond ? a : [...b]), ...c` —— 会把主机强行放到最前，判据形同虚设。
+  // 这个坑实测踩过一次（判据打印出来是 false、词序却仍然是反的）。
+  const sequence: OcrLine[] = host ? [host, ...sorted.filter((l) => l !== host)] : sorted;
 
   const words = sequence.flatMap((l) => l.words);
   const wordCount = words.length || 1;
