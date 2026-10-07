@@ -148,8 +148,12 @@ export default defineConfig({
             },
           },
           {
-            // PaddleOCR 模型文件（从 HuggingFace CDN 下载，约 10MB）
-            urlPattern: /^https:\/\/huggingface\.co\/.*/,
+            // PaddleOCR 模型文件（检测 + 识别 + 字典，合计约 30MB）
+            //
+            // 两个主机都要覆盖：默认走 hf-mirror.com（国内可达），
+            // 但 VITE_OCR_MODEL_BASE 可以把它换回官方 huggingface.co 或自托管路径。
+            // 漏掉任一来源，那批用户就会「用过一次也还是不能离线用」。
+            urlPattern: /^https:\/\/(huggingface\.co|hf-mirror\.com)\/.*/,
             handler: 'CacheFirst',
             options: {
               cacheName: 'ocr-models',

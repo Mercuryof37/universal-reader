@@ -4,14 +4,14 @@
  * 选用 ppu-paddle-ocr/web + PP-OCRv6 small 模型：
  * - 中文识别准确率远超 Tesseract（PP-OCR 专为中文训练）；
  * - 50+ 语言全字典，无需手动选语言包；
- * - ONNX Runtime Web (WASM) 运行，纯浏览器端；
- * - 模型从 HuggingFace CDN 下载并缓存。
+ * - ONNX Runtime Web (WASM) 运行，纯浏览器端。
  */
-import { PaddleOcrService, V6_SMALL_MODEL } from 'ppu-paddle-ocr/web';
+import { PaddleOcrService } from 'ppu-paddle-ocr/web';
 import * as ort from 'onnxruntime-web';
 import { errorReport } from '@/lib/diagnostics';
 import { recognizeFormula } from '@/services/formulaOcrService';
 import { useSettingsStore } from '@/store/settingsStore';
+import { OCR_MODEL_BASE, OCR_MODEL_FILES, buildOcrModel } from '@/lib/ocrModelSource';
 
 // Force ONNX Runtime to load WASM from CDN instead of bundling locally.
 // The .wasm file is ~28MB which exceeds Cloudflare Pages' 25MB limit.
@@ -202,24 +202,41 @@ class OcrEngine {
   async initialize(_lang: OcrLang = 'chi_sim+eng'): Promise<void> {
     if (this.initialized) return;
 
+    // 模型来源见 lib/ocrModelSource.ts：内置预设指向 huggingface.co，
+    // 而国内访问不了它 —— 那会让 OCR 永远停在初始化、一页都识别不出来。
+    const model = buildOcrModel();
+    console.info(
+      `[ocrEngine] 模型来源：${OCR_MODEL_BASE}\n` +
+        `  · 检测模型 ${(9.52).toFixed(2)}MB · 识别模型 20.30MB · 字典 0.07MB（合计约 29.9MB）\n` +
+        `  · 首次使用需完整下载，之后会被缓存，离线可用`,
+    );
+
     const service = new PaddleOcrService({
-      model: V6_SMALL_MODEL,
+      model,
       processing: { engine: 'canvas-native' },
     });
 
+    const t0 = Date.now();
     try {
       await withTimeout(
         service.initialize(),
         INIT_TIMEOUT_MS,
-        `OCR 引擎初始化超时（${INIT_TIMEOUT_MS / 1000} 秒）。` +
-          `首次使用需下载模型（约 10MB），请检查网络后重试。`,
+        `OCR 引擎初始化超时（${INIT_TIMEOUT_MS / 1000} 秒）。\n\n` +
+          `首次使用需要下载模型（约 30MB，来自 ${OCR_MODEL_BASE}）。\n` +
+          `· 若该域名在你的网络下不可达，模型会一直下不下来。\n` +
+          `· 可以用环境变量 VITE_OCR_MODEL_BASE 换成别的来源（详见构建说明）。`,
       );
     } catch (err) {
       throw new Error(
         errorReport('初始化 PaddleOCR 引擎失败', err) +
-          '\n\n若持续失败，说明模型文件无法下载。请检查网络连接。',
+          `\n\n模型来源：${OCR_MODEL_BASE}\n` +
+          `请在浏览器开发者工具的 Network 面板确认这三个文件是否下载成功：\n` +
+          Object.values(OCR_MODEL_FILES)
+            .map((f) => `  · ${OCR_MODEL_BASE}/${f}`)
+            .join('\n'),
       );
     }
+    console.info(`[ocrEngine] 引擎就绪，用时 ${((Date.now() - t0) / 1000).toFixed(1)} 秒`);
 
     this.service = service;
     this.initialized = true;
