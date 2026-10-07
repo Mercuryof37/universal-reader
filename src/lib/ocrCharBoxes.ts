@@ -1286,8 +1286,8 @@ export async function attachCharBoxes(
          */
         options.onSkip?.(
           word,
-          `字符序列与词文本不一致（重新识别得到「${recognized.text.slice(0, 40)}」，` +
-            `字符数 ${recognized.chars.length} / 期望 ${word.text.length}）`,
+          `字符序列与词文本不一致（重新识别得到「${recognized.text}」，` +
+            `期望「${word.text}」，字符数 ${recognized.chars.length} / ${word.text.length}）`,
         );
         continue;
       }
@@ -1363,23 +1363,51 @@ export function reconcileWithWordText(
   }
 
   /**
-   * 两次识别在**空白**上分歧很常见（库那边有 `injectGapSpaces` 会插入空格，
-   * 而本模块刻意不做，见 `decodeCtcWithSteps` 的说明）。忽略空白后再比一次，
-   * 全部一致才接受 —— 此时把空白字符从字符框里去掉，
-   * 这样 `chars` 与 `text` 仍然逐字符对齐。
+   * 归一化：去空白 + 全角转半角 + 忽略大小写。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * 为什么只去空白不够（用户真实数据，15 条实测）
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 原先这里只做 `replace(/\s+/g,'')`，实测 23 个词里有 **15 个**卡在
+   * 「字符序列与词文本不一致」。把两次识别结果并排看，差别**几乎全是格式**：
+   *
+   *   期望 `(1） 求 条件 概率 密度 f x|Y(x |y).`
+   *   得到 `（1）求条件概率密度 f x|Y(x |y).`      ← 半角括号变全角
+   *
+   *   期望 `24. 设随机变量(X,Y)的概率密度为`
+   *   得到 `24. 设随机变量(X，Y）的概率密度为`      ← 半角逗号/括号变全角
+   *
+   *   期望 `P).`   得到 `p).`                     ← 大小写
+   *
+   * **内容是对的**，只是两次独立识别在标点宽度与大小写上不一致。
+   * 于是「逐字符完全相同」这道闸把 15 个词全丢了 —— 包括含指数的第 1 词。
+   *
+   * 归一化后仍不匹配的**照样丢弃**，例如实测里的
+   * `）`→`1`、`0，`→`O，` —— 那是真的认错了字，
+   * 放行会让字符框对到别的字上，比没有更糟。
+   *
+   * 全角转半角用码位减法（U+FF01–U+FF5E → U+0021–U+007E），**逐字符一一对应**，
+   * 所以归一化后按下标对齐仍然成立。
    */
-  const dense = (s: string): string => s.replace(/\s+/g, '');
-  if (dense(trimmed.text) !== dense(target)) return null;
-  if (dense(recognizedText) !== dense(target)) return null;
+  const canonical = (s: string): string =>
+    s
+      .replace(/\s+/g, '')
+      .replace(/[\uFF01-\uFF5E]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+      .toLowerCase();
+
+  if (canonical(trimmed.text) !== canonical(target)) return null;
+  if (canonical(recognizedText) !== canonical(target)) return null;
 
   const keptChars: OcrChar[] = [];
   const keptMeasure: Array<InkMeasurement | null> = [];
   for (let i = 0; i < trimmed.chars.length; i++) {
     const c = trimmed.chars[i];
+    // 空白没有墨迹，去掉它才与 `target` 的非空白字符逐字符对齐
     if (!c || !c.char.trim()) continue;
     keptChars.push(c);
     keptMeasure.push(trimmed.measurements[i] ?? null);
   }
-  if (keptChars.map((c) => c.char).join('') !== dense(target)) return null;
+  if (canonical(keptChars.map((c) => c.char).join('')) !== canonical(target)) return null;
   return { chars: keptChars, measurements: keptMeasure };
 }
