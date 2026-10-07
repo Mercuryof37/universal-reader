@@ -15,12 +15,6 @@
 import type { ContentBlock } from '@/types/content';
 import type { OcrWord, OcrPageResult } from '@/lib/ocrTypes';
 import { buildOcrStructure, type OcrStructure } from '@/lib/ocrStructure';
-import {
-  detectColumns,
-  furnitureRegionOfLine,
-  readingOrderKeys,
-  type LayoutRegion,
-} from '@/lib/layoutAnalysis';
 
 interface OcrLine {
   words: OcrWord[];
@@ -294,18 +288,11 @@ function looksLikeHeading(text: string): boolean {
  *
  * 不传回调时**一个额外对象都不构造**：导出是诊断能力，不该给正常识别
  * 增加任何开销（一页上千个词，多构造一份词表就是实打实的成本）。
- *
- * @param layoutRegions 版面模型给出的区域（见 `lib/layoutAnalysis.ts`）。
- *   **不传 / 传空数组时，本函数的输出与接入前完全一致** —— 这是本方案的
- *   硬性不变量，由 `applyLayoutToLines` 的三条闸门保证。
- *   放在 `onStructure` **之后**：回调在前、可选增强在后，
- *   既有的三参数调用点一个都不用改。
  */
 export function ocrResultToBlocks(
   result: OcrPageResult,
   pageHeight?: number,
   onStructure?: (structure: OcrStructure) => void,
-  layoutRegions?: readonly LayoutRegion[],
 ): Omit<ContentBlock, 'id'>[] {
   // 关键兜底：拿不到词级坐标时，用纯文本也要产出内容。
   // 否则就会出现"识别出 7058 字却报告什么都没识别到"这种荒唐结果。
@@ -320,15 +307,8 @@ export function ocrResultToBlocks(
     return fallback;
   }
 
-  const heuristicLines = groupWordsIntoLines(result.words, pageHeight);
-  if (!heuristicLines.length) return ocrTextToBlocks(result.pageText ?? '');
-
-  // ── 版面分析（渐进增强）────────────────────────────────────────
-  //
-  // ⚠️ 这一行是**可选**的：`layoutRegions` 为空（模型没取到 / 推理失败 /
-  // 用户设了 VITE_OCR_LAYOUT=0）时 `applyLayoutToLines` 原样返回 `lines`，
-  // 下面的每一步都与接入前逐字节相同 —— 版面分析绝不参与「识别是否成功」。
-  const lines = applyLayoutToLines(heuristicLines, layoutRegions, pageHeight);
+  const lines = groupWordsIntoLines(result.words, pageHeight);
+  if (!lines.length) return ocrTextToBlocks(result.pageText ?? '');
 
   const gaps: number[] = [];
   for (let i = 1; i < lines.length; i++) {
@@ -572,127 +552,6 @@ function filterHeaderFooter(
   }
 
   return marked.filter((line) => line.isPageFurniture !== true);
-}
-
-/**
- * 用**版面模型的区域**取代几何启发式：页眉页脚判定 + 阅读顺序。
- *
- * ═══════════════════════════════════════════════════════════════
- * 为什么这一步是**纯函数**，而且与 `groupWordsIntoLines` 分开
- * ═══════════════════════════════════════════════════════════════
- *
- * 「用区域判页眉页脚」「按栏排阅读顺序」这两件事的全部逻辑都是
- * 「区域 + 行 → 行」的纯计算，**与 ONNX 推理无关**。把它从推理里剥出来，
- * 就能在跑不了推理的机器上用合成区域把边界情况全部钉死
- * （本机正是这种情况：`npx vitest run` 会死在 vite 的 `spawn EPERM`）。
- *
- * ═══════════════════════════════════════════════════════════════
- * 渐进增强：**没有版面信息时，返回的必须与输入逐字节相同**
- * ═══════════════════════════════════════════════════════════════
- *
- * 这是本次接入的硬性不变量。三条闸门保证它：
- *
- *  1. `regions` 为空 / 未定义 → 原样返回（连数组都不重建）；
- *  2. 只有**区域真的判为家具**的行才会被摘掉 —— 摘掉的行数由模型决定，
- *     而不是由本函数的任何阈值决定；
- *  3. **只有 `detectColumns` 确证多栏时**才重排行序。单栏文档一律
- *     保持既有行序 —— 分错栏会把两栏文字交错拼接，比不排更糟，
- *     而单栏排序对单栏文档毫无收益、只会引入差异。
- *
- * 与既有 `filterHeaderFooter` 的关系是**或**：启发式已经摘掉的行不会再回来，
- * 本函数只能**补充**摘掉启发式漏掉的（用户实测那两个页眉页脚正是这种），
- * 因此方向上只会「少留页面家具」，不会「多删正文」。
- *
- * @param lines    已成形的行（`groupWordsIntoLines` 的输出）
- * @param regions  版面模型给出的区域；空数组/undefined 表示不可用
- * @param pageWidth 页面画布宽度（像素），用于判栏
- */
-export function applyLayoutToLines(
-  lines: OcrLine[],
-  regions: readonly LayoutRegion[] | undefined,
-  pageWidth: number | undefined,
-): OcrLine[] {
-  if (!regions?.length || !lines.length) return lines;
-
-  // ── 1. 页眉页脚：由**区域类别**决定，不再看字号与宽度 ──────────
-  const kept: OcrLine[] = [];
-  const removedByLabel = new Map<string, number>();
-  for (const line of lines) {
-    const region = furnitureRegionOfLine(line, regions);
-    if (region) {
-      removedByLabel.set(region.label, (removedByLabel.get(region.label) ?? 0) + 1);
-      continue;
-    }
-    kept.push(line);
-  }
-  if (removedByLabel.size) {
-    console.info(
-      `[ocrPostProcess] 版面模型额外判定 ${[...removedByLabel.values()].reduce((a, b) => a + b, 0)}` +
-        ` 行为页面家具（启发式漏掉的）：` +
-        [...removedByLabel.entries()].map(([label, n]) => `${label}×${n}`).join('、'),
-    );
-  }
-
-  // ── 2. 阅读顺序：**只有确证多栏**时才重排 ───────────────────────
-  const width = pageWidth ?? 0;
-  if (!(width > 0)) return kept;
-
-  const columns = detectColumns(regions, width);
-  if (!columns) return kept;
-
-  const keys = readingOrderKeys(regions, width);
-  const spanOf = (line: OcrLine) => {
-    const x0 = Math.min(...line.words.map((w) => w.bbox.x0));
-    const x1 = Math.max(...line.words.map((w) => w.bbox.x1));
-    const y0 = Math.min(...line.words.map((w) => w.bbox.y0));
-    const y1 = Math.max(...line.words.map((w) => w.bbox.y1));
-    return { x0, x1, y0, y1 };
-  };
-
-  // 行 → 所属区域：取**覆盖该行最多**的区域（按行框面积算覆盖率）。
-  // 用行框而不是逐词投票：阅读顺序是「行属于哪一栏」的问题，
-  // 一行整体落在哪一栏比它某个词落在哪更稳定。
-  const regionOfLine = (line: OcrLine): LayoutRegion | undefined => {
-    const span = spanOf(line);
-    const area = (span.x1 - span.x0) * (span.y1 - span.y0);
-    if (!(area > 0)) return undefined;
-    let best: LayoutRegion | undefined;
-    let bestCoverage = 0;
-    for (const region of regions) {
-      const w = Math.min(span.x1, region.x1) - Math.max(span.x0, region.x0);
-      const h = Math.min(span.y1, region.y1) - Math.max(span.y0, region.y0);
-      if (w <= 0 || h <= 0) continue;
-      const coverage = (w * h) / area;
-      if (coverage > bestCoverage) {
-        bestCoverage = coverage;
-        best = region;
-      }
-    }
-    return best;
-  };
-
-  // 闸门：**每一行都能定位到区域**时才重排。
-  // 有行落在所有区域之外（模型没框住它）就说明这一页的版面结构没被
-  // 完整覆盖，此时重排的依据不完整 —— 宁可维持既有顺序。
-  const located = kept.map((line) => {
-    const region = regionOfLine(line);
-    if (!region) return null;
-    const index = regions.indexOf(region);
-    return { line, key: keys[index]! };
-  });
-  if (located.some((entry) => entry === null)) {
-    console.warn(
-      '[ocrPostProcess] 有行未被任何版面区域覆盖，本页不重排阅读顺序（保持既有顺序）',
-    );
-    return kept;
-  }
-
-  return located
-    .map((entry) => entry!)
-    .sort(
-      (a, b) => a.key[0]! - b.key[0]! || a.key[1]! - b.key[1]! || a.key[2]! - b.key[2]!,
-    )
-    .map((entry) => entry.line);
 }
 
 /**

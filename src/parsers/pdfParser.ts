@@ -14,7 +14,6 @@ import {
 } from '@/lib/ocrTypes';
 import type { OcrLang, OcrProgress } from '@/lib/ocrTypes';
 import { ocrResultToBlocks } from '@/lib/ocrPostProcess';
-import { analyzePageLayout } from '@/lib/layoutAnalysis';
 import type { OcrStructure } from '@/lib/ocrStructure';
 
 /**
@@ -589,36 +588,11 @@ export async function ocrParsePdf(
           onProgress,
         );
         noteOcrStage('recognize-done', `第 ${pageNum} 页：识别完成，${ocrResult.words.length} 个词`);
-
-        /**
-         * 版面分析（渐进增强）。
-         *
-         * ═══════════════════════════════════════════════════════════
-         * 为什么放在识别**之后**、而且失败不抛错
-         * ═══════════════════════════════════════════════════════════
-         *
-         * 它用的是与 OCR **同一张画布**（`pageCanvas`），因此区域坐标与
-         * `ocrResult.words` 的词框天然同一坐标系，不需要任何换算 ——
-         * 换算正是最容易悄悄出错的一环。
-         *
-         * 放在识别之后还有一个好处：模型没取到 / 推理抛错 / 结果异常时，
-         * `analyzePageLayout` 返回 null，这一页照常出结果，
-         * 只是退回既有的几何启发式。**版面分析没有能力让识别失败** ——
-         * 这是本方案的前提，也是它敢默认开启的理由。
-         */
-        noteOcrStage('layout', `第 ${pageNum} 页：版面分析`);
-        const layout = await analyzePageLayout(pageCanvas);
-        noteOcrStage(
-          'layout-done',
-          `第 ${pageNum} 页：版面分析${layout ? `得到 ${layout.regions.length} 个区域` : '不可用，回退几何启发式'}`,
-        );
-
         const blocks = ocrResultToBlocks(
           ocrResult,
           pageCanvas.height,
           // 只在有人要的时候才构造结构对象（见 `ocrResultToBlocks` 的说明）
           onPageStructure,
-          layout?.regions,
         );
         if (blocks.length) {
           allDrafts.push(...blocks);
