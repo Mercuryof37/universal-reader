@@ -54,9 +54,49 @@ export const OCR_MODEL_FILES = {
   charactersDictionary: 'recognition/ppocrv6_dict.txt',
 } as const;
 
+/**
+ * 版面分析模型相对于 base 的路径（见 `lib/layoutAnalysis.ts`）。
+ *
+ * ⚠️ 它**不在**上面那个对象里，因为它的来源仓库与那三个不同：
+ * `ppu-paddle-ocr-models` 只有 PP-DocLayoutV2/V3（实测 203.42 MiB / 123.90 MiB，
+ * 超 Cloudflare Pages 的 25 MiB 单文件上限 5–8 倍，发布不上去），
+ * 因此改用轻量版 PP-DocLayout-S（4.69 MiB）。
+ * 混进 `OCR_MODEL_FILES` 会让人误以为它和那三个同源，所以单列。
+ */
+export const LAYOUT_MODEL_FILES = {
+  layout: 'layout/PP-DocLayout-S.onnx',
+} as const;
+
+/**
+ * 版面模型的下载来源，按顺序尝试。
+ *
+ * 与 OCR 三件套一样是国内镜像优先、官方源兜底；
+ * 可用 `VITE_OCR_LAYOUT_MODEL_BASE` 覆盖（自建镜像时用）。
+ *
+ * 导出这两个常量是为了让测试能钉住「路径结构在三个来源之间可互换」——
+ * 这正是 `VITE_OCR_LAYOUT_MODEL_BASE` 能随时切换的前提。
+ */
+export const OFFICIAL_LAYOUT_MODEL_BASE =
+  'https://huggingface.co/stefanj0/PP-DocLayout-S-ONNX/resolve/main';
+export const MIRROR_LAYOUT_MODEL_BASE =
+  'https://hf-mirror.com/stefanj0/PP-DocLayout-S-ONNX/resolve/main';
+
+/** 版面模型实际使用的 base：环境变量优先，否则**同源**（构建时已取好） */
+export function resolveLayoutModelBase(): string {
+  const configured = import.meta.env?.VITE_OCR_LAYOUT_MODEL_BASE;
+  if (configured && configured.trim()) return configured.trim().replace(/\/+$/, '');
+  return SELF_HOSTED_MODEL_BASE;
+}
+
+/** 版面模型的完整同源 URL */
+export function buildLayoutModelUrl(base: string = resolveLayoutModelBase()): string {
+  return `${base.replace(/\/+$/, '')}/${LAYOUT_MODEL_FILES.layout}`;
+}
+
 /** 实际使用的 base：环境变量优先，否则**同源**（构建时已取好） */
 export function resolveModelBase(): string {
-  const configured = import.meta.env.VITE_OCR_MODEL_BASE;
+  // `?.` 不能省：测试环境（vitest/node）下 `import.meta.env` 可能整体不存在
+  const configured = import.meta.env?.VITE_OCR_MODEL_BASE;
   if (configured && configured.trim()) return configured.trim().replace(/\/+$/, '');
   return SELF_HOSTED_MODEL_BASE;
 }
