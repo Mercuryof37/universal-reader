@@ -17,18 +17,19 @@
 | 项 | 值 |
 |---|---|
 | 仓库 | `Mercuryof37/universal-reader`（分支 `main`） |
-| 当前提交 | **`780c54c`**（**最新一轮**：新增 `src/lib/ocrSupport.ts` —— **在开始 OCR 之前做能力检测**，把不受支持的内核在「开始识别」之前就认出来并给出可执行建议，而不是崩在推理里；新增 5 个用例。见 **§5.10**，即 `docs/03` 的**缺陷 22**）<br>**这一轮之前还落过几个提交**（模型改为同源自托管、只启用 WASM、`ort.env.wasm.numThreads = 1` 与去掉 `toBlob`、`OCR_RENDER_DPI` 300 → 200），它们的哈希本文未记录。**`780c54c` 的推送与部署状态本轮未核对** |
+| 当前提交 | **`c2a09b1`**（**最新提交**：① 新增 `src/lib/sessionDiagnostics.test.ts`（**11 个用例**），为**会话诊断模块**补上覆盖 —— 它是那次六轮排查**唯一能收敛的工具，而它自己此前没有测试**；② 修掉「模型约 10MB」的口径不一致，改为「**约 30MB**」。见 **§5.10.3** 与 **§5.10.7**）<br>它的**前一个提交**是 **`780c54c`**（新增 `src/lib/ocrSupport.ts` —— **在开始 OCR 之前做能力检测**，把不受支持的内核在「开始识别」之前就认出来并给出可执行建议，而不是崩在推理里；新增 5 个用例。见 **§5.10**，即 `docs/03` 的**缺陷 22**）<br>**`780c54c` 之前还落过几个提交**（模型改为同源自托管、只启用 WASM、`ort.env.wasm.numThreads = 1` 与去掉 `toBlob`、`OCR_RENDER_DPI` 300 → 200），它们的哈希本文未记录。**部署状态已核实**：`780c54c` 的 `verify` 与 `Cloudflare Pages` 两项 check **均为 success**；`c2a09b1` 是随后的一次提交 |
 | 部署 | Cloudflare Pages（静态）+ 可选 Cloudflare Worker（API 代理） |
 | 上一轮提交 | `fc79896`（「fix(ocr): stop losing a whole scan to a mid-run reload, and defer that reload」，即 §5.9 缺陷 21 的两条修法）＋ `ed66ba8`（只新增测试文件、**不影响产物**）：**二者均已推送到 `origin/main`**（`fc79896` 的 push 重试了 7 次，本机 `github.com:443` 时通时断，见 §10），**部署已确认** —— `verify` 与 `Cloudflare Pages` 两项 check 均为 **success**，线上入口 chunk 为 `assets/index-CiMmJIqw.js` |
 | 更早一轮提交 | `f549173`（三项决策）与 `f331393`（文档同步）：**二者均已部署**（`verify` 与 `Cloudflare Pages` 两项 check 均为 **success**，线上已服务于那一批产物） |
-| 代码规模 | `src/` **65 个文件 / 11,018 行** · `scripts/` 8 个 / 1,151 行 · `worker/` 1 个 / 453 行<br>（这是上一轮基线，**本轮新增若干文件后未复核**，不要直接引用） |
+| 代码规模 | `src/` **74 个文件 / 12,452 行** · `scripts/` 8 个 / 1,151 行 · `worker/` 1 个 / 453 行<br>**统计口径**：`src/` 下**全部文件**（含 `.ts` / `.tsx` / `.css`，**不排除测试文件**），用 `[System.IO.File]::ReadAllLines(...).Count` 逐文件累加。上一个提交时的构成是 62 个 `.ts` + 10 个 `.tsx` + 1 个 `.css` = **73**，`c2a09b1` 又新增了 `src/lib/sessionDiagnostics.test.ts`，故终值为 **74 个文件 / 12,452 行** —— 请以这个数字为准 |
 | 依赖 | **26** 个（dependencies 16 + devDependencies 10），本轮**不变**（上一轮由 29 降下来） |
-| 测试 | **24 个文件 / 246 个用例全部通过**（**最新一轮基线**；上一轮是 20 / 216） |
+| 测试 | **25 个文件 / 257 个用例全部通过**（**最新提交基线**；上一个提交 `780c54c` 是 24 / 246，再上一轮是 20 / 216） |
 | 门禁 | `tsc -b` ✅ · `vitest run` ✅ · `npm run build` ✅（含 ONNX WASM 清理 + 产物校验） |
 | 文档 | `README.md`（用户手册）· `docs/`（3 份专题）· 本文 |
 
 > **关于「本轮」这个词**：本文其余各节大量使用「本轮」，它们指的是 **`fc79896` + `ed66ba8` 那一轮**
-> （§5.9 缺陷 21）。**最新一轮是 `780c54c`（§5.10 缺陷 22）** —— 正文里凡涉及它的地方都会写明提交号。
+> （§5.9 缺陷 21）。**它之后的两轮是 `780c54c`（§5.10 缺陷 22 的能力检测）与 `c2a09b1`（最新提交：
+> 会话诊断测试 + 模型体积口径修正）** —— 正文里凡涉及它们的地方都会写明提交号。
 
 ---
 
@@ -99,7 +100,7 @@
 | `katex` | 0.19.0 | 数学公式渲染（`BlockRow.tsx` 区分 display / inline） | 导入含公式的文档 |
 | `pdfjs-dist` | 5.7.284 | PDF 解析（**含 WASM 解码器**） | 仅导入 PDF |
 | `epubjs` | 0.3.93 | EPUB 解析 | 仅导入 EPUB |
-| `ppu-paddle-ocr` | 6.6.0 | 浏览器端 OCR（PP-OCRv6 small，**替代原 Tesseract.js**） | 仅执行 OCR，模型约 10MB 运行时下载 |
+| `ppu-paddle-ocr` | 6.6.0 | 浏览器端 OCR（PP-OCRv6 small，**替代原 Tesseract.js**） | 仅执行 OCR，模型约 **30MB**（构建时取好、与站点同源发布，见 §5.10.7） |
 | `onnxruntime-web` | 1.30.0 | PaddleOCR 的 ONNX 推理运行时（WASM 约 28MB 由 CDN 提供） | 仅执行 OCR |
 
 > **本轮移除了 3 个「装了没用」的依赖**（依赖总数 **29 → 26**，即 dependencies 19 → 16、
@@ -146,7 +147,7 @@
 npm install          # 受限环境可用 --ignore-scripts
 npm run dev          # http://localhost:5173
 npm run build        # 完整构建（含 WASM 复制 + 图标生成 + ONNX WASM 清理 + 产物校验）
-npm test             # 24 个测试文件 / 246 个用例
+npm test             # 25 个测试文件 / 257 个用例
 npm run typecheck    # 三个 TS project：app / node / worker
 ```
 
@@ -217,7 +218,7 @@ Cleaned 1 ONNX WASM file(s) from dist.
 | 翻译缓存键与降级逻辑 | 单元测试 |
 | PWA 产物完整性 | 产物门禁 + `sw.js` 全文核对 |
 | 构建产物正确性 | 负向测试确认门禁有效 |
-| PWA 陈旧 chunk 修复（导航路由改 NetworkFirst、不再有 `navigateFallback`） | 线上 `sw.js` 直接抓取核对 + `src/lib/pwaOffline.test.ts` 8 个用例（读 `vite.config.ts` 把 `NAVIGATION_CACHE_NAME` 钉死）；`src/lib/preloadRecovery.ts` 另有 11 个用例。**这两个文件共 19 个用例，已计入当前 246 个用例的基线** |
+| PWA 陈旧 chunk 修复（导航路由改 NetworkFirst、不再有 `navigateFallback`） | 线上 `sw.js` 直接抓取核对 + `src/lib/pwaOffline.test.ts` 8 个用例（读 `vite.config.ts` 把 `NAVIGATION_CACHE_NAME` 钉死）；`src/lib/preloadRecovery.ts` 另有 11 个用例。**这两个文件共 19 个用例，已计入当前 257 个用例的基线** |
 | **OCR 中途落盘**（`shouldCheckpoint` 的边界规则） | 单元测试（`src/lib/ocrCheckpoint.test.ts` 9 个用例：末页必落盘、每 5 页一次、首页不落、丢失窗口有上界、非法输入返回 `false`）**＋ 源码断言**（parser 与 store 两端都钉）。**但真机中断场景未验证**，见 §4.2 与 §5.9 |
 
 #### 更早一轮（已提交 `f549173`、已部署）的实测证据
@@ -241,6 +242,8 @@ Cleaned 1 ONNX WASM file(s) from dist.
 
 #### 上一轮（已推送 `fc79896` + `ed66ba8`，**部署已确认**）的实测证据
 
+> 下表是**那一轮的实测值**（precache `3579.98 KiB`、产物 83 个文件 / 5.54 MB）；**最新实测值见下一小节**。
+
 | 检查 | 结果 |
 |---|---|
 | `npx tsc -b` | **exit 0** |
@@ -261,14 +264,14 @@ Cleaned 1 ONNX WASM file(s) from dist.
 > **错误结论**（第一次抓就是这么误判的）。这与 §5.6 记录的原始故障**是同一类错误**：
 > 读到了被缓存的旧产物。更稳的判据是抓响应头为 `must-revalidate` 的 `index.html`。
 
-#### 最新一轮（提交 `780c54c`）的实测证据
+#### 最新一轮（提交 `780c54c` + `c2a09b1`）的实测证据
 
 | 检查 | 结果 |
 |---|---|
-| `npx vitest run` | **246 passed / 24 files**（**最新基线**。上一轮记录是 216 passed / 20 files，现在共有 **24 个测试文件**） |
-| 新增测试 | `src/lib/ocrSupport.test.ts`（**5 个用例 / 68 行**）；同一轮里还有 `src/lib/ocrModelSource.test.ts` **7 例** · `src/lib/ocrExecutionProvider.test.ts` **4 例** · `src/lib/ocrRuntimeSafety.test.ts` **5 例**（见 §5.10.7） |
-| `npm run build` | **本轮未记录**（这次同步没有拿到该轮的构建输出）。注意 `verify-dist.mjs` 现在还多了一条**模型缺失就让构建硬失败**的检查（已做负向测试：移走目录 → **exit 1**，见 §5.10.7） |
-| 部署 / 线上哈希 | **本轮未核对**。⚠️ **不要**把上一轮的 `assets/index-CiMmJIqw.js` 当成这一轮的线上入口 chunk |
+| `npx vitest run` | **257 passed / 25 files**（**最新基线**。上一个提交 `780c54c` 是 246 passed / 24 files，再上一轮记录是 216 passed / 20 files） |
+| 新增测试 | `c2a09b1`：`src/lib/sessionDiagnostics.test.ts`（**11 个用例**，为会话诊断模块补覆盖，见 §5.10.3）；`780c54c`：`src/lib/ocrSupport.test.ts`（**5 个用例 / 68 行**）—— 同一轮里还有 `src/lib/ocrModelSource.test.ts` **7 例** · `src/lib/ocrExecutionProvider.test.ts` **4 例** · `src/lib/ocrRuntimeSafety.test.ts` **5 例**（见 §5.10.7） |
+| `npm run build` | `PWA v1.3.0  mode generateSW  precache 18 entries (3587.32 KiB)`；`[verify-dist] 构建产物校验通过` —— 产物共 **86 个文件 / 35.44 MB**，其中 **OCR 模型 3 个 / 29.90 MB**（模型改为构建时取好、与站点同源发布后进了产物，这正是体积比上一轮的 5.54 MB 大出一个量级的原因）。注意 `verify-dist.mjs` 现在还多了一条**模型缺失就让构建硬失败**的检查（已做负向测试：移走目录 → **exit 1**，见 §5.10.7） |
+| 部署 | **已核实**：`780c54c` 的 `verify` 与 `Cloudflare Pages` 两项 check **均为 success**；`c2a09b1` 是随后的一次提交 |
 
 > 更完整的证据与未验证项在 §5.10.9 与 §5.10.10 —— 其中最重要的一条是：
 > **能力检测本身没有在真机上验证过**（本机装不了 360），见 §4.2。
@@ -330,7 +333,7 @@ Cleaned 1 ONNX WASM file(s) from dist.
 | `src/lib/ocrPostProcess.ts` 里的历史叙述 | 描述「tesseract v7 把词输出从平铺改成嵌套」等过去故障成因的段落 | **保留**（是历史事实，不是错误） |
 | 旧的 `pdfWorker.ts` | 已删除，但 `docs/03` 里仍有它的历史记录 | **保留**（是历史，不是错误） |
 
-### 4.4 最近的提交做了什么（`cdf2957` → `780c54c`，HEAD = `780c54c`）
+### 4.4 最近的提交做了什么（`cdf2957` → `c2a09b1`，HEAD = `c2a09b1`）
 
 按时间升序排列（作者字段为提交里的原始值）。
 
@@ -347,12 +350,14 @@ Cleaned 1 ONNX WASM file(s) from dist.
 | `fc79896` | 2026-10-06 | — | fix(ocr): stop losing a whole scan to a mid-run reload, and defer that reload | **本轮第一个提交**：修 §5.9 缺陷 21 的两个修法 —— 导入/OCR 期间推迟自动刷新（`pwa.ts` + `PwaPrompt.tsx`）与 OCR 中途落盘（`ocrTypes.ts` + `pdfParser.ts` + `libraryStore.ts`），新增 `ocrCheckpoint.test.ts` 9 个用例 |
 | `ed66ba8` | 2026-10-06 | — | 补顺序守卫测试（推迟刷新） | **上一轮第二个提交**：新增 `src/lib/pwaReload.test.ts`（**当时 7 个用例 / 96 行**），针对「导入/OCR 期间**推迟刷新**」做**顺序**断言 —— 钉住「先检查 `importing`、再决定要不要 `reload()`」这一次序，以及「被推迟时置 `updatePending`」与「工作结束后 `PwaPrompt` 才调 `reloadNow`」。**只新增测试文件、不改产物**，因此它与 `fc79896` 的部署产物**完全相同** |
 | `780c54c` | — | — | **最新一轮**（提交主题与作者字段**未逐字复核**，本行按已知事实描述） | 新增 `src/lib/ocrSupport.ts`（**104 行**）+ `src/lib/ocrSupport.test.ts`（**68 行 / 5 个用例**）：**在 OCR 开始前做能力检测**（`WebAssembly` 是否存在 + WASM SIMD 是否支持，用一个最小的 `v128` 模块跑 `WebAssembly.validate`），不支持时在 OCR 对话框里直接说明原因并给出替代浏览器，且说明文字版 PDF 与 Markdown / TXT / EPUB 不受影响；`crossOriginIsolated` **只记录、不判定**。**这一轮之前还落过几个提交**（模型同源自托管、只启用 WASM、`numThreads = 1` 与去掉 `toBlob`、`OCR_RENDER_DPI` 300 → 200），**它们各自的哈希本文未记录**，改动内容见 §5.10 |
+| `c2a09b1` | — | — | **最新提交**（提交主题与作者字段**未逐字复核**，本行按已知事实描述） | 两件事：① 新增 `src/lib/sessionDiagnostics.test.ts`（**11 个用例**），为**会话诊断模块**补上覆盖 —— **它是那次六轮排查唯一能收敛的工具，而它自己此前没有测试**；**它一旦静默失灵，同类故障会重新变得无从下手**。重点钉住的语义：`getLastReloadReason()` 在没有记录时**必须返回 `null`**（这个 `null` 正是区分「浏览器回收标签页」与「应用自己刷新」的**唯一依据**）；阶段轨迹**必须保留多条**（只留最后一条会毁掉画布尺寸，**这个坑真踩过**）；轨迹有上限；`sessionStorage` 抛异常时全部接口**安全降级**。② 修掉模型体积的口径不一致：`FileUploadZone.tsx`（两处，**用户可见的 OCR 对话框文案**）、`ocrTypes.ts`（两处）、`pdfParser.ts`（一处）里的「约 10MB」全部改为「**约 30MB**」。写法上有一处细节值得记：写那条降级用例时**第一次失败**，因为 **vitest 跑在 node 环境下没有 `window`**，改用 `globalThis` 后才通过 |
 
 > 注：`a766d3f` / `aa8827a` 的作者是 `Universal Reader Dev`（其余几个是 `Mercuryof37`），
 > 主题前缀也因此从 `fix:` 变成 `fix(pwa):`。
 >
-> 注：`ed66ba8` 与 `780c54c` 的提交信息与作者字段未逐字复核，那两行按已知事实描述
-> （`ed66ba8` 只新增测试文件、与 `fc79896` 产物相同；`780c54c` 的改动内容见 §5.10）。
+> 注：`ed66ba8`、`780c54c`、`c2a09b1` 的提交信息与作者字段未逐字复核，那几行按已知事实描述
+> （`ed66ba8` 只新增测试文件、与 `fc79896` 产物相同；`780c54c` 的改动内容见 §5.10；
+> `c2a09b1` 新增 `src/lib/sessionDiagnostics.test.ts` 并修掉模型体积口径，见 §5.10.3 与 §5.10.7）。
 >
 > 注（**用例数会变，不要照抄旧数字**）：`src/lib/pwaReload.test.ts` 与 `src/lib/ocrCheckpoint.test.ts`
 > 现在**各有 10 个用例** —— 此后又补进了「**已导入但还没点开始识别的扫描件**也算忙」（`state.scannedPdfPending`）、
@@ -855,11 +860,13 @@ onnx —— 第 1 页：原始尺寸 → 送入推理（1667×2223） · 设备�
 | `src/lib/ocrTypes.ts` | `OCR_RENDER_DPI = 200`（原 300）、`OCR_MAX_PIXELS = 20_000_000`（原 40 MP） |
 | `.env.example` 与 `src/vite-env.d.ts` | 新增 `VITE_OCR_MODEL_BASE`、`VITE_OCR_USE_WEBGPU` 两个变量的说明与类型 |
 
-> **顺带发现、但还没有修的一处口径不一致**：模型三个文件合计 **29.9MB**
+> ✅ **已修复（`c2a09b1`）：模型体积的口径不一致。** 模型三个文件合计 **29.9MB**
 > （`src/lib/ocrEngine.ts` 自己的报错文案里写着 `检测模型 9.52MB · 识别模型 20.30MB · 字典 0.07MB（合计约 29.9MB）`，
 > `scripts/fetch-ocr-models.mjs` 里的期望字节数也是这三个），
-> **但界面与若干注释里仍写着「约 10MB」**（`FileUploadZone.tsx` 第 91、220 行，`ocrTypes.ts` 第 9、35 行，
-> `pdfParser.ts` 第 466 行的注释）。**29.9MB 才是实测值**，接手时请把 UI 文案改过来（这是一处应当修掉的不一致）。
+> 而**代码里仍写着「约 10MB」**（`FileUploadZone.tsx` 第 91、220 行 —— 这两处是**用户可见的 OCR 对话框文案**，
+> `ocrTypes.ts` 第 9、35 行，`pdfParser.ts` 第 466 行的注释），与实测值差了近三倍。
+> **`c2a09b1` 已把这五处统一改为「约 30MB」**（检测 9.52MB + 识别 20.30MB + 字典 0.07MB）。
+> **29.9MB 是实测值，约 30MB 是它对用户的口径** —— 这条**不再是待办**，接手时也不要改回 10MB。
 
 #### 5.10.8 一条反复踩到的工程教训：**注释里含有被断言的关键词**（本仓库踩了三次）
 
@@ -880,9 +887,11 @@ onnx —— 第 1 页：原始尺寸 → 送入推理（1667×2223） · 设备�
 
 | 检查 | 结果 |
 |---|---|
-| 提交 | **`780c54c`**（最新一轮的能力检测；这一轮之前还有几个提交，见 5.10.7，哈希本文未记录） |
-| `npx vitest run` | **246 passed / 24 files**（上一轮记录为 20 个文件 / 216 个用例；本轮新增 `src/lib/ocrSupport.test.ts` **5 个用例**，连同 5.10.7 里的几个测试文件一起计入这 24 个文件） |
-| 关键文件 | 新增 `src/lib/ocrSupport.ts`（**104 行**）· `src/lib/ocrSupport.test.ts`（**68 行**） |
+| 提交 | **`c2a09b1`**（**最新提交**：会话诊断测试 + 模型体积口径修正）；本条的能力检测在 **`780c54c`**，它之前还有几个提交，见 5.10.7，哈希本文未记录 |
+| `npx vitest run` | **257 passed / 25 files**（上一轮记录为 20 个文件 / 216 个用例；`780c54c` 新增 `src/lib/ocrSupport.test.ts` **5 个用例**，`c2a09b1` 又新增 `src/lib/sessionDiagnostics.test.ts` **11 个用例**，连同 5.10.7 里的几个测试文件一起计入这 **25** 个文件） |
+| `npm run build` | `PWA v1.3.0  mode generateSW  precache 18 entries (3587.32 KiB)`；`[verify-dist] 构建产物校验通过` —— 产物共 **86 个文件 / 35.44 MB**，其中 **OCR 模型 3 个 / 29.90 MB** |
+| 关键文件 | 新增 `src/lib/ocrSupport.ts`（**104 行**）· `src/lib/ocrSupport.test.ts`（**68 行**）· `src/lib/sessionDiagnostics.test.ts`（**11 个用例**） |
+| 部署状态 | **已核实**：`780c54c` 的 `verify` 与 `Cloudflare Pages` 两项 check **均为 success**；`c2a09b1` 是随后的一次提交 |
 | 浏览器基线（§2） | Chrome / Edge 119+、Firefox 121+、Safari 17.4+ —— 检测判据与这条基线一致（都落在 **WASM SIMD** 这一项上） |
 | 用户侧的真机结论 | 「Firefox、Chrome、Microsoft Edge 都可以正常使用，但是 360 不行」（**这是本故障唯一的真机旁证，也是它的定论**） |
 
@@ -891,10 +900,13 @@ onnx —— 第 1 页：原始尺寸 → 送入推理（1667×2223） · 设备�
 - **能力检测在真机上的表现没有验证过**：本机**装不了 360**，也没有其它内核过旧的外壳浏览器可用，
   所以「真机上会不会被正确拦下」只有 `ocrSupport.test.ts` 的 5 个用例与 Node 环境下的求值，
   **没有一次真实浏览器验证**。
-- **`src/lib/sessionDiagnostics.ts` 没有自动化测试**（5.10.3 里那张表全部是代码审阅的结论）。
+- **`src/lib/sessionDiagnostics.ts` 的自动化测试是 `c2a09b1` 才补上的**（`src/lib/sessionDiagnostics.test.ts`，
+  **11 个用例**）；它跑在 **Node（vitest 默认环境）**里 —— 写降级用例时因此不能用 `window`，改用 `globalThis`。
+  5.10.3 里那张表仍是**代码审阅**的结论：测试钉住的是模块的**接口语义**，**不等于**"真机上诊断一定显示正确"。
 - **PaddleOCR 在真实扫描件上的中文识别准确率仍未量化验证**（R1 依然成立）——
   已有的只是用户口径「Firefox、Chrome、Microsoft Edge 都可以正常使用」，**没有**证明"识别得准"。
-- 本轮这一系列改动的**部署状态未核对**（未执行 git、未抓线上资源）。
+- 部署状态**已核实**：`780c54c` 的 `verify` 与 `Cloudflare Pages` 两项 check 均为 **success**；
+  `c2a09b1` 是随后的一次提交。
 
 #### 5.10.11 教训
 
@@ -1026,8 +1038,8 @@ onnx —— 第 1 页：原始尺寸 → 送入推理（1667×2223） · 设备�
 2. 记录：成功率、失败页号、每页耗时、中文识别准确率（人眼比对）
 3. 若失败，**先看文档库顶部的黄色诊断横幅**（`getReloadCount()` / `getLastReloadReason()` /
    `getOcrStageTrail()`，见 §5.10.3），它不需要控制台；再看控制台的 `[ocrEngine]` 与 `[ocrParsePdf]` 诊断输出。
-   初始化超时阈值是 `INIT_TIMEOUT_MS = 180_000`（180 秒），引擎的报错文案会提示「首次使用需要下载模型（约 30MB）」
-   （⚠️ **界面上的文案仍写着「约 10MB」，那是过时的**，见 §5.10.7 末尾）
+   初始化超时阈值是 `INIT_TIMEOUT_MS = 180_000`（180 秒），引擎的报错文案与**界面文案都会提示「首次使用需要下载模型（约 30MB）」**
+   （界面那五处原先写着「约 10MB」，**`c2a09b1` 已统一改为「约 30MB」**，见 §5.10.7 末尾）
 4. 顺带验证 `3d4a2ad` 的**页眉页脚过滤**在真实扫描件上的效果
    （上下各 5% 边距 + 字号 < 全页中位数 0.85 倍 → 丢弃）
 5. 判断：整本 OCR 是否现实？若每页 >30 秒，833 页需要 7 小时，
@@ -1160,7 +1172,10 @@ node scripts/analyze-pdf-objects.mjs "book.pdf"
 | 刷新是不是应用发起的 | `getLastReloadReason()`：`sw-update`（SW 接管）/ `preload-error`（chunk 自愈）/ `manual`（用户点了立即刷新）。**三者都没有记录 ⇒ 不是应用发起的**，那就是宿主层（内核 / GPU 进程 / 标签页回收） |
 | 上次识别死在哪一步 | `getOcrStageTrail()`（**最近 5 条**）+ `getInterruptedOcr()` —— 例如「停在 `onnx`、没有 `onnx-done`」直接指向推理阶段 |
 
-⚠️ 这个模块**没有自动化测试**（见 §5.10.3 与 §5.10.10）。
+✅ 这个模块的自动化测试由 **`c2a09b1`** 补上：`src/lib/sessionDiagnostics.test.ts`（**11 个用例**），
+钉住「无记录时 `getLastReloadReason()` 必须返回 `null`」「阶段轨迹保留多条且有上限」
+「`sessionStorage` 抛异常时全部接口安全降级」。⚠️ 它跑在 **Node 环境**里（降级用例用的是 `globalThis`
+而不是 `window`），**不是浏览器行为**。见 §5.10.3 与 §5.10.10。
 
 ### 真实文件回归测试
 
@@ -1269,7 +1284,7 @@ npx wrangler deploy
    **另加两条**：§5.9（缺陷 21，「扫描结果全丢」）—— 它**没有**改变 §5.7 的决策，
    只是缓解了那条代价里最严重的一项；§5.10（缺陷 22，「OCR 第 1 页进程消失」）——
    它的结论是**应用本身没有问题**，崩的是**内核过旧的外壳浏览器**，修法是**开始前的能力检测**
-2. **先跑一遍 `npm run build` 和 `npm test`**，确认基线是绿的（应为 `246 passed / 24 files`）
+2. **先跑一遍 `npm run build` 和 `npm test`**，确认基线是绿的（应为 `257 passed / 25 files`）
 3. **再跑通一次真实扫描件的 OCR**（R1）—— 这是最大的未知数：PaddleOCR 的**识别准确率**至今没有量化数据。
    但**不要**重做 §5.10 那六轮实验：那些假设已经被证据逐一否掉了
 4. **读 `docs/03-踩坑与修复记录.md`** —— 22 个缺陷换来的经验都在那里
@@ -1286,6 +1301,7 @@ npx wrangler deploy
    **刷新来源**（三条路径有没有记录）+ **OCR 阶段轨迹**（最后走到哪一步）。
    这两条信息能把"应用的问题"与"宿主层的问题"直接分开。同时**问一句用户用的是什么浏览器** ——
    §5.10 那场六轮排查，最后就是被「Firefox、Chrome、Microsoft Edge 都可以正常使用，但是 360 不行」这一句收束的
-9. **改完记得确认产物相关的数字**：本轮基线是 `246 passed / 24 files`、precache
-   `18 entries (3579.98 KiB)`、依赖 26 个；`src/` 的「65 个文件 / 11,018 行」是**上一轮基线，本轮未复核**
-   （新增了 `ocrSupport.ts` / `ocrModelSource.ts` / `ocrExecutionProvider.ts` 等文件）。这些数字散落在本文多处，改动后要一起更新
+9. **改完记得确认产物相关的数字**：**当前基线**是 `257 passed / 25 files`、precache
+   `18 entries (3587.32 KiB)`、产物 **86 个文件 / 35.44 MB**（含 OCR 模型 **3 个 / 29.90 MB**）、依赖 26 个；
+   `src/` 是 **74 个文件 / 12,452 行**（**口径**：`src/` 下全部文件含 `.ts` / `.tsx` / `.css`、
+   **不排除测试文件**，用 `[System.IO.File]::ReadAllLines(...).Count` 逐文件累加）。这些数字散落在本文多处，改动后要一起更新

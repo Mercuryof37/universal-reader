@@ -35,9 +35,56 @@ import {
  * 如果它在没有记录时返回了默认值而不是 null，这个结论就会反过来。
  */
 
+/**
+ * 内存版 sessionStorage。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么必须自己造一个，而不是直接用全局的
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 这组测试第一版直接用全局 `sessionStorage`，**本地全过、CI 全挂**。
+ * 原因是环境差异，而且很隐蔽：
+ *   · 本地 Node **v25.2.1** —— `sessionStorage` 是全局对象；
+ *   · CI 用的是 **Node 22**（见 .github/workflows/ci.yml）—— 没有这个全局。
+ *
+ * 也就是说那条测试**依赖了开发机的 Node 版本**，换个环境就失效。
+ * 这正是本项目反复记录的那条教训：本地绿不等于 CI 绿，
+ * 要问「环境一样吗」。修法是让测试自带依赖 —— 与环境无关，且完全确定。
+ *
+ * （被测试的模块本身是安全的：它每次访问存储都包在 try/catch 里，
+ *   拿不到 `sessionStorage` 时按「记录失败」处理，不会抛。）
+ */
+class MemoryStorage {
+  private map = new Map<string, string>();
+
+  getItem(key: string): string | null {
+    return this.map.has(key) ? (this.map.get(key) as string) : null;
+  }
+
+  setItem(key: string, value: string): void {
+    this.map.set(key, String(value));
+  }
+
+  removeItem(key: string): void {
+    this.map.delete(key);
+  }
+
+  clear(): void {
+    this.map.clear();
+  }
+}
+
+/** 当前用例安装的存储实例（避免在断言里对 globalThis 做类型断言） */
+let storage: MemoryStorage;
+
 beforeEach(() => {
-  // 每个用例从干净的会话存储开始
-  sessionStorage.clear();
+  // 每个用例从干净的会话存储开始；显式安装，不依赖运行环境的 Node 版本
+  storage = new MemoryStorage();
+  Object.defineProperty(globalThis, 'sessionStorage', {
+    value: storage,
+    configurable: true,
+    writable: true,
+  });
 });
 
 describe('重载计数', () => {
@@ -73,7 +120,7 @@ describe('重载原因 —— 区分「应用刷新」与「浏览器回收」�
   it('三种原因都能记、且读回的文本互不相同', () => {
     const labels = new Set<string>();
     for (const reason of ['sw-update', 'preload-error', 'manual'] as const) {
-      sessionStorage.clear();
+      storage.clear();
       noteReloadReason(reason);
       const label = getLastReloadReason()?.label;
       expect(label).toBeTruthy();
