@@ -6,7 +6,7 @@
  * ═══════════════════════════════════════════════════════════════
  *
  * `ocrEngine.ts` 静态依赖 PaddleOCR（`ppu-paddle-ocr` + `onnxruntime-web`；
- * 模型约 10MB 从 HuggingFace CDN 下载，ONNX Runtime WASM 约 28MB 从 CDN 加载）。
+ * 模型约 30MB 与站点同源发布，ONNX Runtime WASM 约 28MB 从 CDN 加载）。
  * 但有两处只想要"类型或常量"：
  * - `FileUploadZone` 需要语言下拉框的选项列表；
  * - `pdfParser` / `ocrPostProcess` 需要类型定义。
@@ -32,7 +32,7 @@ export const OCR_LANG_OPTIONS: { value: OcrLang; label: string }[] = [
 export type OcrStatus =
   /**
    * 首次下载模型并初始化 ONNX Runtime WASM
-   * （PP-OCRv6 small 模型约 10MB 来自 HuggingFace CDN，ONNX WASM 约 28MB 来自 jsDelivr，这一步最慢）
+   * （PP-OCRv6 small 模型约 30MB，由站点同源提供；ONNX WASM 约 28MB 来自 jsDelivr，这一步最慢）
    */
   | 'initializing'
   | 'recognizing'

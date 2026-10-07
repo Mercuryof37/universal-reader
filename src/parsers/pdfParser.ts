@@ -463,7 +463,7 @@ export async function ocrParsePdf(
   // 页数计算与 store 共用同一个函数，避免两处口径不一致导致进度条与实际处理量对不上
   const totalPages = resolvePageLimit(doc.numPages, maxPages);
 
-  // OCR 引擎按需加载：PaddleOCR 依赖的 ONNX Runtime WASM 约 28MB、模型约 10MB，
+  // OCR 引擎按需加载：PaddleOCR 依赖的 ONNX Runtime WASM 约 28MB、模型约 30MB，
   // 体积依然很大，只有真的执行 OCR 时才需要它。
   const { ocrEngine, analyzeCanvasInk } = await import('@/lib/ocrEngine');
   await ocrEngine.initialize(lang);

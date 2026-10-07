@@ -88,7 +88,7 @@ export function FileUploadZone({ compact = false }: { compact?: boolean }) {
           <h3 className="text-base font-medium">检测到扫描版 PDF</h3>
           <p className="max-w-md text-sm text-[var(--reader-muted)]">
             「{scannedPdf.fileName}」共 {scannedPdf.pageCount} 页，全部为图片，没有可提取的文字层。
-            可以使用浏览器端 AI OCR 识别文字（首次需下载约 10MB 模型）。
+            可以使用浏览器端 AI OCR 识别文字（首次需下载约 30MB 模型）。
           </p>
 
           {!importing ? (
@@ -217,7 +217,7 @@ export function FileUploadZone({ compact = false }: { compact?: boolean }) {
 
               <p className="text-xs text-[var(--reader-muted)]">
                 {ocrProgress?.status === 'initializing'
-                  ? '首次使用需下载 AI 模型（约 10MB），请耐心等待'
+                  ? '首次使用需下载 AI 模型（约 30MB），请耐心等待'
                   : '识别期间请保持标签页在前台，后台标签页会被浏览器降频'}
               </p>
             </div>
