@@ -20,6 +20,22 @@
 
 export type OcrLang = 'chi_sim+eng' | 'chi_tra+eng' | 'jpn+eng' | 'kor+eng' | 'eng';
 
+/**
+ * 疑似「有墨迹但没被识别」的区域。
+ *
+ * 定义放在这里（而不是 `ocrEngine.ts`）的原因与文件顶部那段注释一致：
+ * `ocrTypes` 是跨模块共享类型的地方，而 `ocrEngine` 会静态拉进
+ * ONNX Runtime 与模型。字段形状与 `lib/ocrInkRegions.ts` 的同名接口一致。
+ */
+export interface MissedInkRegion {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  /** 该区域内深色像素占该区域面积的比例，0-1 */
+  inkRatio: number;
+}
+
 export const OCR_LANG_OPTIONS: { value: OcrLang; label: string }[] = [
   { value: 'chi_sim+eng', label: '简体中文 + English' },
   { value: 'chi_tra+eng', label: '繁體中文 + English' },
@@ -64,6 +80,31 @@ export interface OcrPageResult {
    * 因此是"识别出了文字但取不到坐标"时的兜底，也是重要诊断信息。
    */
   pageText?: string;
+  /**
+   * 「图像上有墨迹、却没有任何识别词覆盖」的区域。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * 为什么必须有这个字段（它对应的是一次真实的内容丢失）
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 用户在扫描版数学题 PDF 上实测到：跨行大括号里的主分支
+   * `f(x,y) = 1/2(x+y)e^{-(x+y)}` 整块从输出里消失，只剩 `0, 其他`。
+   * 核对过块组装（只做字符串拼接，不丢字），所以那块内容**不是后处理丢的**，
+   * 而是识别器对那种形状（跨行大括号、堆叠分数、指数上标）返回了空串，
+   * 被 `if (!text) continue` 跳过 —— `words` 里连痕迹都没有。
+   *
+   * 连锁反应是：公式增强（`detectFormulaRegions`）靠**已识别出的词**聚类
+   * 找候选，没有词就永远发现不了那块区域。所以需要一条**不依赖识别结果**的
+   * 判据：图像上有没有墨迹（见 `lib/ocrInkRegions.ts`）。
+   *
+   * ⚠️ 隐私：这里只是**坐标与统计量**，不含任何识别文本，
+   * 也不会因此发起网络请求；是否把这些区域送去 SimpleTex，
+   * 仍由 `settingsStore.formulaOcrEnabled`（默认关闭）决定。
+   *
+   * ⚠️ 诚实说明：这是**启发式**候选，它只能说明「这块有东西没被认出来」，
+   * 无法区分公式 / 插图 / 表格。
+   */
+  missedInkRegions?: MissedInkRegion[];
   /** 词提取的诊断信息，用于区分"真的一无所获"与"结构没匹配上" */
   extraction?: {
     source: 'flat-words' | 'nested-blocks' | 'page-text-only' | 'empty';

@@ -14,6 +14,11 @@ import { useSettingsStore } from '@/store/settingsStore';
 import { OCR_MODEL_BASE, OCR_MODEL_FILES, buildOcrModel } from '@/lib/ocrModelSource';
 import { resolveExecutionProviders } from '@/lib/ocrExecutionProvider';
 import { noteOcrStage } from '@/lib/sessionDiagnostics';
+import {
+  detectMissedInkRegionsFromCanvas,
+  overlapRatio,
+  type MissedInkRegion,
+} from '@/lib/ocrInkRegions';
 
 // Force ONNX Runtime to load WASM from CDN instead of bundling locally.
 // The .wasm file is ~28MB which exceeds Cloudflare Pages' 25MB limit.
@@ -358,8 +363,37 @@ class OcrEngine {
       ? words.reduce((sum, w) => sum + w.confidence, 0) / words.length
       : 0;
 
+    /**
+     * 找出「有墨迹但没有词覆盖」的区域。
+     *
+     * ═══════════════════════════════════════════════════════════════
+     * 为什么这一步必须**无条件**做（而不是只在公式增强开启时做）
+     * ═══════════════════════════════════════════════════════════════
+     *
+     * 用户的隐私开关默认关闭，所以这条信息在默认配置下**只用于诊断**：
+     * 它让「页面上一半内容没被识别出来」这件事**看得见** ——
+     * 而不是像现在这样，用户只能看到一段少了主分支的题目，
+     * 既不知道少了什么，也不知道为什么少。
+     *
+     * 同时它也是公式增强的候选来源：`detectFormulaRegions()` 靠已识别的词
+     * 聚类，公式整块没识别出来时它一个候选都提不出来
+     * （见 `lib/ocrInkRegions.ts` 顶部注释）。
+     *
+     * 成本：一次缩小采样 + 网格统计，纯本地像素运算，不联网。
+     * 失败时返回空数组，不影响识别结果。
+     */
+    const missedInkRegions = detectMissedInkRegionsFromCanvas(imageData, words);
+    if (missedInkRegions.length) {
+      console.warn(
+        `[ocrEngine] 第 ${pageNum} 页有 ${missedInkRegions.length} 处区域「有墨迹但没有识别词覆盖」，` +
+          `最大一处 ${Math.round(
+            Math.max(...missedInkRegions.map((r) => (r.x1 - r.x0) * (r.y1 - r.y0))),
+          )} 平方像素 —— 这块内容很可能是识别失败的公式/图表（文字已丢失，无法从词里恢复）`,
+      );
+    }
+
     // Enhance formula regions with SimpleTex cloud OCR
-    const enhancedWords = await this.enhanceFormulaRegions(words, imageData);
+    const enhancedWords = await this.enhanceFormulaRegions(words, imageData, missedInkRegions);
 
     onProgress?.({ pageNum, total, status: 'complete' });
 
@@ -368,6 +402,7 @@ class OcrEngine {
       words: enhancedWords,
       avgConfidence,
       pageText: result.text,
+      missedInkRegions: missedInkRegions.length ? missedInkRegions : undefined,
       extraction: {
         source: words.length ? 'flat-words' : result.text.trim() ? 'page-text-only' : 'empty',
         hasFlatWords: words.length > 0,
@@ -446,21 +481,33 @@ class OcrEngine {
    * ⚠️ 这是全应用**唯一**会把文档内容送出本机的路径，因此受
    * `settingsStore.formulaOcrEnabled` 控制，且该开关**默认关闭**。
    * 关闭时直接返回原始结果 —— 不发起任何网络请求。
+   *
+   * `missedInkRegions` 是「图像上有墨迹、却没有词覆盖」的区域
+   * （见 `lib/ocrInkRegions.ts`）。它们必须**并进候选**，否则会出现
+   * 一个死角：公式整块没被识别 → 没有词 → `detectFormulaRegions()` 提不出候选
+   * → 公式增强对它永远无能为力。这正是用户实测到的「主分支整块消失」。
    */
   private async enhanceFormulaRegions(
     words: OcrWord[],
     imageData: ImageData | HTMLCanvasElement | OffscreenCanvas,
+    missedInkRegions: MissedInkRegion[] = [],
   ): Promise<OcrWord[]> {
-    if (words.length < 3) return words;
+    // 注意：这里不能再用 `words.length < 3` 提前返回 ——
+    // 整页只认出一个词、其余全是漏识别区域时，恰恰是最需要增强的场景
+    if (!words.length && !missedInkRegions.length) return words;
 
     // 隐私开关：默认关闭，关闭时不联网（读 store 是为了让扫描件 OCR 这条
     // 非 React 链路也能拿到设置；ocrEngine 本身是按需动态 import 的）
     if (!useSettingsStore.getState().formulaOcrEnabled) return words;
 
-    const regions = detectFormulaRegions(words);
+    const textRegions = detectFormulaRegions(words);
+    const regions = mergeInkCandidates(textRegions, missedInkRegions, words);
     if (!regions.length) return words;
 
-    console.info(`[ocrEngine] 检测到 ${regions.length} 个公式候选区域，尝试 SimpleTex 增强`);
+    console.info(
+      `[ocrEngine] 公式候选 ${regions.length} 个（词聚类 ${textRegions.length} 个 + ` +
+        `漏识别区域补入 ${regions.filter((r) => r.fromInk).length} 个），尝试 SimpleTex 增强`,
+    );
 
     const canvas = ensureCanvas(imageData);
     if (!canvas) return words;
@@ -484,25 +531,37 @@ class OcrEngine {
         };
 
         // Mark original words for removal, insert replacement at first position
-        for (let i = 0; i < enhanced.length; i++) {
-          if (region.wordIndices.includes(i)) {
-            if (i === region.wordIndices[0]) {
-              enhanced[i] = replacement;
-            } else {
-              enhanced[i] = null as unknown as OcrWord;
+        if (!region.wordIndices.length) {
+          // 图像候选区域：它在 `words` 里**本来就没有对应词**（识别失败的正是它），
+          // 因此只需要把识别出的 LaTeX 追加成一个新词 —— 追加而不是插入，
+          // 位置由下面那一次按坐标排序统一决定。
+          enhanced.push(replacement);
+        } else {
+          for (let i = 0; i < enhanced.length; i++) {
+            if (region.wordIndices.includes(i)) {
+              if (i === region.wordIndices[0]) {
+                enhanced[i] = replacement;
+              } else {
+                enhanced[i] = null as unknown as OcrWord;
+              }
             }
           }
         }
 
         console.info(
-          `[ocrEngine] 公式增强成功：${region.originalText.slice(0, 40)}… → $${latex.slice(0, 40)}$`,
+          `[ocrEngine] 公式增强成功：${region.originalText.slice(0, 40) || '（漏识别区域）'}… → $${latex.slice(0, 40)}$`,
         );
       } catch (err) {
         console.warn('[ocrEngine] 公式增强失败（保留原始识别结果）：', err);
       }
     }
 
-    return enhanced.filter((w): w is OcrWord => w !== null);
+    return enhanced
+      .filter((w): w is OcrWord => w !== null)
+      // 追加进去的候选会排在末尾，而阅读顺序是按坐标决定的：
+      // 不排序的话公式会被拼到段落最后面。这里用与
+      // `ocrPostProcess.groupWordsIntoLines` 相同的「先上后下、先左后右」口径。
+      .sort((a, b) => a.bbox.y0 - b.bbox.y0 || a.bbox.x0 - b.bbox.x0);
   }
 }
 
@@ -519,6 +578,56 @@ interface FormulaRegion {
   bbox: { x0: number; y0: number; x1: number; y1: number };
   avgFontSize: number;
   originalText: string;
+  /** 该候选是否来自「有墨迹但没识别出词」的图像判定（而不是词聚类） */
+  fromInk?: boolean;
+}
+
+/**
+ * 把「图像候选区域」并进「词聚类候选区域」，并按重叠去重。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么必须去重，而且要用「重叠占较小者」来判
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 两条路径会找到**同一块**内容：一页公式识别得较差但仍有低置信度词时，
+ * 词聚类会圈出一块区域，而图像判定也会把这块「覆盖不足的墨迹」圈出来。
+ * 不去重就会对同一块内容发**两次**网络请求 ——
+ * 这是全应用唯一会把内容送出本机的路径，多发一次是实打实的隐私与费用成本。
+ *
+ * 用「重叠面积 ÷ 较小者面积」而不是 IoU：图像候选的框通常比词聚类的框
+ * 更紧（词框可能只盖住公式的一部分），IoU 会因此偏小、漏判重复。
+ *
+ * `avgFontSize` 只是给替换词用的一个估计值（后续的上下标判定读的是
+ * `bbox` 高度，不是它）：取「区域高度的一半」与「本页词框中位高度」的较小者，
+ * 这样既不会把整块公式的高度当成字号，也不会小到离谱。
+ */
+function mergeInkCandidates(
+  textRegions: FormulaRegion[],
+  missedInkRegions: MissedInkRegion[],
+  words: OcrWord[] = [],
+): FormulaRegion[] {
+  const merged = [...textRegions];
+  const heights = words.map((w) => w.fontSize).filter((h) => h > 0).sort((a, b) => a - b);
+  const medianWordHeight = heights.length ? heights[Math.floor(heights.length / 2)] ?? 0 : 0;
+
+  for (const ink of missedInkRegions) {
+    const duplicate = merged.some((r) => overlapRatio(r.bbox, ink) >= 0.5);
+    if (duplicate) continue;
+
+    const halfHeight = (ink.y1 - ink.y0) / 2;
+    const estimated = medianWordHeight > 0 ? Math.min(halfHeight, medianWordHeight) : halfHeight;
+
+    merged.push({
+      wordIndices: [],
+      bbox: { x0: ink.x0, y0: ink.y0, x1: ink.x1, y1: ink.y1 },
+      avgFontSize: Math.max(8, estimated),
+      originalText: '',
+      fromInk: true,
+    });
+  }
+
+  // 阅读顺序：先上后下、先左后右
+  return merged.sort((a, b) => a.bbox.y0 - b.bbox.y0 || a.bbox.x0 - b.bbox.x0);
 }
 
 /**
