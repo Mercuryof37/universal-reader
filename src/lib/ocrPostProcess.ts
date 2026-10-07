@@ -227,8 +227,33 @@ export function ocrResultToBlocks(
     );
     const endsSentence = currentText && /[。！？!?.;；]$/.test(currentText);
 
+    /**
+     * 以「题号」开头的行**一律另起一段**。
+     *
+     * ═══════════════════════════════════════════════════════════════
+     * 为什么必须有这条规则
+     * ═══════════════════════════════════════════════════════════════
+     *
+     * 用户实测：整份习题的题目**全部被并成了一段**，「17. …」「20. …」
+     * 「24. …」连成一整块，完全读不了。
+     *
+     * 原因是纯几何判据在这类版面上不够用：习题集的**题目之间与行之间
+     * 间距是一样的**，靠 `gap > breakGap` 区分不出来。
+     * 但有个几何之外的强信号一直被浪费了 —— **每一题都以编号开头**。
+     *
+     * 编号是排版意图的显式声明，比任何间距阈值都可靠：
+     * `17.` `20.` `24.` 这种形式在中文教材/习题集里没有歧义
+     * （它们不会出现在句子中间，也不像小数那样被误用）。
+     *
+     * 所以这里补上「结构信号优先于几何信号」这一层 ——
+     * 几何判不出来的时候，让文档自身的结构说话。
+     */
+    const NUMBERED_ITEM_RE = /^\s*\d{1,3}\s*[.、)）]\s*\S/;
+    const startsNumberedItem = NUMBERED_ITEM_RE.test(line.text);
+
     const isNewParagraph =
       !currentText ||
+      startsNumberedItem ||
       gap > breakGap ||
       Math.abs(line.fontSize - currentFontSize) > 2 ||
       (endsSentence && gap > line.fontSize * 0.95);
