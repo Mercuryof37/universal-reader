@@ -199,7 +199,9 @@ export function detectOcrSupport(input: OcrSupportInput = {}): OcrSupport {
       problemBrowser,
       reason:
         `上一次识别没有跑完，页面是被浏览器自己中断的（不是本应用发起的刷新）` +
-        (crashCount > 0 ? `，这类中断在**当前版本**上已累计 ${crashCount} 次` : '') +
+        // 注意：这里是**纯文本**，会被直接渲染出来 ——
+        // 不要写 Markdown 的 ** 加粗，那会原样显示成星号。
+        (crashCount > 0 ? `，这类中断在当前版本上已累计 ${crashCount} 次` : '') +
         '。这通常意味着当前浏览器无法稳定运行本功能' +
         (problemBrowser ? `，检测到你正在使用${problemBrowser}。` : '。') +
         (twice
