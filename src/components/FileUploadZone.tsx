@@ -5,7 +5,7 @@ import { useLibraryStore } from '@/store/libraryStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { OCR_LANG_OPTIONS, type OcrLang } from '@/lib/ocrTypes';
 import { detectOcrSupport } from '@/lib/ocrSupport';
-import { getInterruptedOcr, getLastReloadReason } from '@/lib/sessionDiagnostics';
+import { getInterruptedOcr, getLastReloadReason, getPersistentOcrCrash } from '@/lib/sessionDiagnostics';
 
 /**
  * 估算剩余时长。
@@ -50,7 +50,7 @@ export function FileUploadZone({ compact = false }: { compact?: boolean }) {
   const formulaOcrEnabled = useSettingsStore((s) => s.formulaOcrEnabled);
   const setFormulaOcrEnabled = useSettingsStore((s) => s.setFormulaOcrEnabled);
 
-  // 环境能力与「上次是否崩过」只判定一次，结果不会在会话中变化
+  // 环境能力与「这台机器上崩过几次」只判定一次，结果不会在会话中变化
   const [ocrSupport] = useState(() => {
     const interrupted = getInterruptedOcr();
     const lastReload = getLastReloadReason();
@@ -58,6 +58,9 @@ export function FileUploadZone({ compact = false }: { compact?: boolean }) {
       hadInterruptedRun: interrupted !== null,
       // 三条应用内刷新路径都没有记录 ⇒ 页面是被外部（浏览器）中断的
       interruptedByExternal: interrupted !== null && lastReload === null,
+      // 跨会话的持久记录：关掉标签页后 sessionStorage 就没了，
+      // 只有它能让用户「重开浏览器」之后仍然看到提醒
+      persistentCrashCount: getPersistentOcrCrash()?.count ?? 0,
     });
   });
 

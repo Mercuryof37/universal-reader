@@ -203,3 +203,90 @@ export function getOcrStageTrail(): { stage: string; detail?: string }[] {
 export function clearOcrStage(): void {
   remove(STAGE_KEY);
 }
+
+/**
+ * 「这个浏览器跑不了 OCR」的**持久**记忆。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么必须写进 localStorage，而不是 sessionStorage
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 经过：用户报告某浏览器（360）识别时页面消失。我们加了
+ * 「能力检测 + 上次崩过」的提醒，**但用户在 360 里根本看不到提醒**。
+ * 原因正是存储位置选错了：
+ *
+ *   · `sessionStorage` **只活在当前标签页**，关掉标签页即清空；
+ *   · 用户遇到崩溃后多半会**关掉再重新打开**浏览器/标签页 ——
+ *     于是崩溃记录早没了，判定成「一切正常」，提醒自然不出现；
+ *   · 而靠 UA 识别外壳浏览器又不可靠：360 极速版可能直接发送
+ *     标准 Chrome 的 UA，任何模式匹配都命中不了。
+ *
+ * 所以真正兜得住的是**实测事实 + 跨会话持久**：
+ * 崩溃发生后的那一次加载里，sessionStorage 仍留着「识别中断」记录
+ * （同一标签页内刷新不清），此时把它转写进 `localStorage`。
+ * 此后无论新开标签页还是重开浏览器，都还能知道「这台机器上它崩过」。
+ */
+const CRASH_KEY = 'universal-reader:ocr-crash';
+
+/** 崩溃记忆有效期（30 天）：太久以前的记录不再提示，免得误伤已升级的浏览器 */
+const CRASH_STALE_MS = 30 * 24 * 60 * 60 * 1000;
+
+export interface OcrCrashRecord {
+  /** 累计崩溃次数 */
+  count: number;
+  /** 最近一次的时间戳 */
+  at: number;
+}
+
+function readPersistent<T>(key: string): T | null {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writePersistent(key: string, value: unknown): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* 存储不可用就放弃记录，绝不影响使用 */
+  }
+}
+
+/**
+ * 应用启动时调用：上一次识别若是**被外部中断**的，就持久记下来。
+ *
+ * 判据与诊断横幅一致：`ocr-attempt` 里还留着「识别到第 N 页」，
+ * 且三条应用内刷新路径都没有记录 —— 也就是页面不是我们刷的。
+ */
+export function noteOcrCrashIfInterrupted(): void {
+  const interrupted = getInterruptedOcr();
+  if (!interrupted) return;
+  // 应用自己发起的刷新（版本更新 / chunk 自愈 / 手动刷新）不算浏览器的问题
+  if (getLastReloadReason() !== null) return;
+
+  const prev = getPersistentOcrCrash();
+  writePersistent(CRASH_KEY, {
+    count: (prev?.count ?? 0) + 1,
+    at: Date.now(),
+  });
+}
+
+/** 读取持久化的崩溃记录；没有或已过期则返回 null */
+export function getPersistentOcrCrash(): OcrCrashRecord | null {
+  const record = readPersistent<OcrCrashRecord>(CRASH_KEY);
+  if (!record || typeof record.count !== 'number') return null;
+  if (Date.now() - (record.at ?? 0) > CRASH_STALE_MS) return null;
+  return record;
+}
+
+/** 识别成功时清掉 —— 说明这个浏览器其实跑得通，不该继续提示 */
+export function clearPersistentOcrCrash(): void {
+  try {
+    localStorage.removeItem(CRASH_KEY);
+  } catch {
+    /* 同上 */
+  }
+}

@@ -4,7 +4,13 @@ import { deleteDocument, listDocuments, loadDocument, saveDocument, type Documen
 import { parseFiles, isScannedPdfError } from '@/parsers';
 import { errorReport, describeUnknownError } from '@/lib/diagnostics';
 import { resolvePageLimit, type OcrLang, type OcrProgress } from '@/lib/ocrTypes';
-import { clearOcrAttempt, clearOcrStage, noteOcrProgress, noteOcrStage } from '@/lib/sessionDiagnostics';
+import {
+  clearOcrAttempt,
+  clearOcrStage,
+  clearPersistentOcrCrash,
+  noteOcrProgress,
+  noteOcrStage,
+} from '@/lib/sessionDiagnostics';
 
 /**
  * 文档库 store。
@@ -224,6 +230,8 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       // 早已成功的旧阶段，反而误导。
       clearOcrAttempt();
       clearOcrStage();
+      // 识别成功说明这个浏览器其实跑得通：清掉持久崩溃记录，不再提示换浏览器
+      clearPersistentOcrCrash();
       set({
         documents: await listDocuments(),
         currentDocId: result.document.id,

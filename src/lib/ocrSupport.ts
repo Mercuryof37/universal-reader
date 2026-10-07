@@ -117,6 +117,15 @@ export interface OcrSupportInput {
   hadInterruptedRun?: boolean;
   /** 该中断是否**不是**应用自身发起的刷新（即外部原因，如浏览器回收页面） */
   interruptedByExternal?: boolean;
+  /**
+   * **跨会话**累计的崩溃次数（来自 localStorage）。
+   *
+   * 为什么还需要它：`hadInterruptedRun` 取自 sessionStorage，
+   * 而 sessionStorage 关掉标签页即清空 —— 用户遇到崩溃后重开浏览器，
+   * 那条记录就没了，提醒也不会出现（用户实测反馈正是如此）。
+   * 累计次数来自持久存储，因此下次新开标签页依然有效。
+   */
+  persistentCrashCount?: number;
   /** 覆盖 UA，便于测试 */
   userAgent?: string;
 }
@@ -156,17 +165,31 @@ export function detectOcrSupport(input: OcrSupportInput = {}): OcrSupport {
     };
   }
 
-  // ── 第 3 条（最硬的证据）：上次真的崩过 ────────────────────
-  // 能力都通过却仍然中断，且刷新不是应用发起的 —— 这是本机实测事实。
-  if (input.hadInterruptedRun && input.interruptedByExternal) {
+  // ── 第 3 条（最硬的证据）：这台机器上真的崩过 ──────────────
+  // 能力都通过却仍然中断，且刷新不是应用发起的 —— 本机实测事实，不是推断。
+  const crashCount = input.persistentCrashCount ?? 0;
+  const crashedBefore = crashCount > 0 || (input.hadInterruptedRun && input.interruptedByExternal);
+
+  if (crashedBefore) {
+    /**
+     * 崩过两次以上就直接挡住。
+     *
+     * 一次可能是偶然（内存紧张、同时开着的标签页太多），所以只提醒、仍允许重试；
+     * 两次独立崩溃基本可以确定这个环境跑不了 —— 再让用户点下去，
+     * 只是让他白等一场，而且可能连带丢掉刚导入的文件。
+     */
+    const twice = crashCount >= 2;
     return {
-      level: 'risky',
+      level: twice ? 'unsupported' : 'risky',
       problemBrowser,
       reason:
-        '上一次识别没有跑完，而且页面是被浏览器自己中断的（不是本应用发起的刷新）。' +
-        '这种情况通常意味着当前浏览器无法稳定运行本功能' +
+        `上一次识别没有跑完，页面是被浏览器自己中断的（不是本应用发起的刷新）` +
+        (crashCount > 0 ? `，这类中断在这台机器上已累计 ${crashCount} 次` : '') +
+        '。这通常意味着当前浏览器无法稳定运行本功能' +
         (problemBrowser ? `，检测到你正在使用${problemBrowser}。` : '。') +
-        '你可以再试一次；如果反复中断，请换浏览器。',
+        (twice
+          ? '连续多次中断，建议直接换用下面的浏览器。'
+          : '你可以再试一次；如果再次中断，请换用下面的浏览器。'),
       recommendation: BROWSER_RECOMMENDATION,
       details,
     };

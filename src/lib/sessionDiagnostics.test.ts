@@ -4,11 +4,14 @@ import {
   bumpReloadCount,
   clearOcrAttempt,
   clearOcrStage,
+  clearPersistentOcrCrash,
   getInterruptedOcr,
   getLastOcrStage,
   getLastReloadReason,
   getOcrStageTrail,
+  getPersistentOcrCrash,
   getReloadCount,
+  noteOcrCrashIfInterrupted,
   noteOcrProgress,
   noteOcrStage,
   noteReloadReason,
@@ -82,6 +85,12 @@ beforeEach(() => {
   storage = new MemoryStorage();
   Object.defineProperty(globalThis, 'sessionStorage', {
     value: storage,
+    configurable: true,
+    writable: true,
+  });
+  // localStorage 同样自带一份：崩溃记忆是跨会话的，必须落在这里
+  Object.defineProperty(globalThis, 'localStorage', {
+    value: new MemoryStorage(),
     configurable: true,
     writable: true,
   });
@@ -181,6 +190,64 @@ describe('OCR 进度与阶段轨迹', () => {
     clearOcrStage();
     expect(getOcrStageTrail()).toEqual([]);
     expect(getLastOcrStage()).toBeNull();
+  });
+});
+
+describe('跨会话的崩溃记忆（localStorage）', () => {
+  it('识别被外部中断时，把它持久记下来', () => {
+    noteOcrProgress(1, 1); // 留下"开始了但没走完"的痕迹
+    // 没有记过重载原因 ⇒ 刷新不是应用发起的
+    noteOcrCrashIfInterrupted();
+
+    const record = getPersistentOcrCrash();
+    expect(record).not.toBeNull();
+    expect(record?.count).toBe(1);
+  });
+
+  it('崩溃记忆必须能活过「关掉标签页」—— 这正是它在 360 上失效的原因', () => {
+    /**
+     * 用户实测反馈：加了提醒之后，在 360 里**根本看不到**。
+     * 原因就是第一版把记录放在 sessionStorage，而它关掉标签页即清空；
+     * 用户崩溃后重开浏览器，记录早没了，于是判定为「一切正常」。
+     *
+     * 这条断言模拟「关掉标签页、新开一个」：清空 sessionStorage 之后，
+     * 崩溃记忆仍然必须在。
+     */
+    noteOcrProgress(1, 1);
+    noteOcrCrashIfInterrupted();
+
+    sessionStorage.clear(); // ← 关掉标签页
+
+    expect(getPersistentOcrCrash()?.count).toBe(1);
+  });
+
+  it('应用自己发起的刷新不算崩溃（正常更新不该被当成浏览器有问题）', () => {
+    noteOcrProgress(1, 1);
+    noteReloadReason('sw-update'); // 我们自己的重载
+    noteOcrCrashIfInterrupted();
+
+    expect(getPersistentOcrCrash()).toBeNull();
+  });
+
+  it('没有中断记录时不写（避免每次打开都累计一次）', () => {
+    noteOcrCrashIfInterrupted();
+    expect(getPersistentOcrCrash()).toBeNull();
+  });
+
+  it('多次崩溃会累计次数', () => {
+    noteOcrProgress(1, 1);
+    noteOcrCrashIfInterrupted();
+    noteOcrCrashIfInterrupted();
+    expect(getPersistentOcrCrash()?.count).toBe(2);
+  });
+
+  it('识别成功后清掉 —— 说明这个浏览器跑得通，不该继续提示换浏览器', () => {
+    noteOcrProgress(1, 1);
+    noteOcrCrashIfInterrupted();
+    expect(getPersistentOcrCrash()).not.toBeNull();
+
+    clearPersistentOcrCrash();
+    expect(getPersistentOcrCrash()).toBeNull();
   });
 });
 

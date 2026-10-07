@@ -129,6 +129,28 @@ describe('三档判定', () => {
     expect(s.level).toBe('ok');
   });
 
+  it('跨会话累计崩过一次 → risky（提醒，但仍允许重试）', () => {
+    // 一次可能是偶然（内存紧张、标签页太多），不该直接剥夺重试的机会
+    const s = detectOcrSupport({ userAgent: CHROME_UA, persistentCrashCount: 1 });
+
+    expect(s.level).toBe('risky');
+    expect(s.reason).toMatch(/上一次识别没有跑完/);
+    expect(s.reason).toMatch(/你可以再试一次/);
+  });
+
+  it('跨会话累计崩过两次以上 → unsupported（直接挡住）', () => {
+    /**
+     * 两次独立崩溃基本可以确定这个环境跑不了。
+     * 再让用户点下去只是白等一场，还可能连带丢掉刚导入的文件。
+     */
+    const s = detectOcrSupport({ userAgent: CHROME_UA, persistentCrashCount: 2 });
+
+    expect(s.level).toBe('unsupported');
+    expect(s.reason).toContain('2 次');
+    expect(s.reason).toMatch(/建议直接换用/);
+    expect(s.recommendation).toMatch(/Chrome/);
+  });
+
   it('问题浏览器 + 崩过 → 仍然是 risky，且优先说明「崩过」这个更硬的事实', () => {
     const ua = 'Mozilla/5.0 Chrome/86.0 Safari/537.36 QIHU 360SE';
     const s = detectOcrSupport({
