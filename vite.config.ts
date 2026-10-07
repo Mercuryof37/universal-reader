@@ -148,12 +148,19 @@ export default defineConfig({
             },
           },
           {
-            // PaddleOCR 模型文件（检测 + 识别 + 字典，合计约 30MB）
-            //
-            // 两个主机都要覆盖：默认走 hf-mirror.com（国内可达），
-            // 但 VITE_OCR_MODEL_BASE 可以把它换回官方 huggingface.co 或自托管路径。
-            // 漏掉任一来源，那批用户就会「用过一次也还是不能离线用」。
-            urlPattern: /^https:\/\/(huggingface\.co|hf-mirror\.com)\/.*/,
+            /**
+             * PaddleOCR 模型文件（检测 + 识别 + 字典，合计约 30MB）。
+             *
+             * **默认来源是同源 `/ocr-models/`**（构建时由 fetch-ocr-models.mjs
+             * 取好放进 public/），因此这条同源规则才是实际生效的那条。
+             * 另外两个主机保留覆盖，是因为 `VITE_OCR_MODEL_BASE` 还能把来源
+             * 换回官方源或自建镜像 —— 漏掉任一来源，那批用户就会
+             * 「用过一次也还是不能离线用」。
+             *
+             * 不放进预缓存：30MB 会让首访安装体积暴涨，而 OCR 是可选功能。
+             * CacheFirst 让「用过一次之后离线也能用」。
+             */
+            urlPattern: /(\/ocr-models\/)|(^https:\/\/(huggingface\.co|hf-mirror\.com)\/)/,
             handler: 'CacheFirst',
             options: {
               cacheName: 'ocr-models',

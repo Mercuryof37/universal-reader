@@ -1,4 +1,4 @@
-﻿node_modules
+node_modules
 dist
 dist-ssr
 *.local
@@ -17,6 +17,17 @@ playwright-report
 # 从 node_modules 复制生成。不入库的理由：它是第三方二进制产物的搬运，
 # 入库会造成"版本升级后副本与依赖不一致"的隐患。
 public/pdfjs-wasm
+
+# PaddleOCR 的模型（约 30MB），由 scripts/fetch-ocr-models.mjs 在 predev/prebuild 时
+# 下载生成，与站点**同源**发布。
+#
+# 为什么不入库：与上面同理，它属于第三方依赖的产物，入库会在依赖升级后留下不一致的副本。
+#
+# 为什么必须自托管、不能让浏览器直接去第三方取：实测 hf-mirror.com 在
+# PowerShell / Node 下都通、响应还带正确的 CORS 头，**但用户的浏览器就是取不到**
+# （`TypeError: Failed to fetch`）；官方源 huggingface.co 在国内则完全不可达。
+# 同源请求不受这些差异影响。
+public/ocr-models
 
 # Wrangler 本地开发变量（含密钥，绝不入库）
 .dev.vars

@@ -2,26 +2,26 @@
  * OCR 模型的下载来源。
  *
  * ═══════════════════════════════════════════════════════════════
- * 为什么不能直接用包内置的 V6_SMALL_MODEL
+ * 默认：与站点同源（`/ocr-models/…`），不再让浏览器去第三方取
  * ═══════════════════════════════════════════════════════════════
  *
- * `ppu-paddle-ocr` 内置的 `V6_SMALL_MODEL` 三个文件**全部挂在 huggingface.co 上**：
+ * 这条结论是踩了三次坑才得到的，值得完整记下来：
  *
- *   https://huggingface.co/snowfluke/ppu-paddle-ocr-models/resolve/main/detection/ort/PP-OCRv6_small_det.ort
- *   https://huggingface.co/snowfluke/ppu-paddle-ocr-models/resolve/main/recognition/ort/PP-OCRv6_small_rec.ort
- *   https://huggingface.co/snowfluke/ppu-paddle-ocr-models/resolve/main/recognition/ppocrv6_dict.txt
+ * 1. `ppu-paddle-ocr` 内置的 `V6_SMALL_MODEL` 三个文件**全在 huggingface.co 上**。
+ *    本机实测 `huggingface.co:443` 与 `cdn-lfs.huggingface.co:443` **都不通** ——
+ *    模型一个字节都取不到，OCR 引擎永远初始化不了，扫描版 PDF 一页都识别不了。
+ * 2. 于是改用国内镜像 `hf-mirror.com`。PowerShell 探测通、Node 完整下载了 29.9MB、
+ *    响应还带着**正确的 CORS 头**（回显了 Origin）—— 一切看着都对。
+ * 3. **但用户的浏览器仍然报**：
+ *      `Failed to fetch …/PP-OCRv6_small_det.ort after 3 attempt(s): TypeError: Failed to fetch`
  *
- * 而**国内网络访问不了 huggingface.co**。本机实测：
- *   huggingface.co:443        → 不通
- *   cdn-lfs.huggingface.co:443 → 不通
- *   hf-mirror.com:443         → 通（这三个文件都能下载，合计 29.9MB）
+ * 也就是说：外网通、CORS 也没问题，**浏览器就是取不到**。
+ * 这类差异（代理、扩展、DNS、公司网关……）无法从代码侧根治。
  *
- * 后果不是「慢」，而是**整条功能彻底不可用**：模型一个字节都取不到，
- * OCR 引擎永远停在初始化，扫描版 PDF 一页都识别不出来。
- * 用户看到的现象是「一直显示读取中／正在初始化，最后什么都没有」，
- * 而且因为超时长达 180 秒、最后才报错，很容易被误判成「页面卡住了」
- * 甚至「页面自己刷新了」。**文字版 PDF / Markdown / TXT / EPUB 完全不受影响** ——
- * 因为它们不需要 OCR，这也正是「问题集中在扫描版 PDF」的原因。
+ * 结论：**不要让浏览器去任何第三方取模型。** 由构建脚本
+ * （`scripts/fetch-ocr-models.mjs`）取一次、放进 `public/ocr-models/`、
+ * 与站点同源发布。同源请求不受上述任何一项影响，而且顺带满足
+ * 离线与隐私诉求（运行期不再有第三方外发）。
  *
  * ═══════════════════════════════════════════════════════════════
  * 怎么改来源
@@ -29,23 +29,23 @@
  *
  * 设 `VITE_OCR_MODEL_BASE` 即可，无需改代码：
  *
- *   VITE_OCR_MODEL_BASE=https://huggingface.co/snowfluke/ppu-paddle-ocr-models/resolve/main
- *     官方源（海外网络更合适）
+ *   （不设）        → 同源 `/ocr-models`，即构建时取好的那份【默认】
+ *   https://…       → 任意 CDN 或自建镜像
+ *   https://huggingface.co/snowfluke/ppu-paddle-ocr-models/resolve/main
+ *                   → 官方源（海外网络适用）
  *
- *   VITE_OCR_MODEL_BASE=/ocr-models
- *     自托管：把三个文件按下面的目录结构放进 `public/ocr-models/`，
- *     就彻底不依赖任何外部站点（也顺带满足离线与隐私诉求）
- *
- * 不设则默认走下面的国内镜像。文件名与目录结构三个来源完全一致，
- * 因此互相之间可以随时切换。
+ * 三个来源的文件名与目录结构完全一致，因此可以随时互换。
  */
 
-/** 官方源（国内不可达，保留作为显式选项与文档参照） */
+/** 官方源（国内不可达；保留作为显式选项与文档参照） */
 export const OFFICIAL_MODEL_BASE =
   'https://huggingface.co/snowfluke/ppu-paddle-ocr-models/resolve/main';
 
-/** 国内可用的镜像；与官方源是同一份文件 */
+/** 国内镜像（本机可用，但**用户的浏览器实测取不到**，故不再作为默认） */
 export const MIRROR_MODEL_BASE = 'https://hf-mirror.com/snowfluke/ppu-paddle-ocr-models/resolve/main';
+
+/** 同源路径：由 scripts/fetch-ocr-models.mjs 在构建前放入 public/ocr-models/ */
+export const SELF_HOSTED_MODEL_BASE = `${import.meta.env.BASE_URL}ocr-models`.replace(/\/{2,}/g, '/');
 
 /** 三个文件相对于 base 的路径（三个来源共用同一套结构） */
 export const OCR_MODEL_FILES = {
@@ -54,11 +54,11 @@ export const OCR_MODEL_FILES = {
   charactersDictionary: 'recognition/ppocrv6_dict.txt',
 } as const;
 
-/** 实际使用的 base：环境变量优先，否则国内镜像 */
+/** 实际使用的 base：环境变量优先，否则**同源**（构建时已取好） */
 export function resolveModelBase(): string {
   const configured = import.meta.env.VITE_OCR_MODEL_BASE;
   if (configured && configured.trim()) return configured.trim().replace(/\/+$/, '');
-  return MIRROR_MODEL_BASE;
+  return SELF_HOSTED_MODEL_BASE;
 }
 
 export const OCR_MODEL_BASE = resolveModelBase();

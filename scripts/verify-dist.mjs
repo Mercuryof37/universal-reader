@@ -63,6 +63,38 @@ if (check(existsSync(wasmDir), 'dist/pdfjs-wasm 缺失 —— prebuild 钩子可
   notes.push(`WASM 解码器 ${files.length} 个，合计 ${mb(sum(files.map((f) => statSync(join(wasmDir, f)).size)))}`);
 }
 
+// ── 2b. OCR 模型（自托管，与站点同源）────────────────────────
+// 同样由 prebuild 钩子取来放进 public/。**必须在这里硬校验**：
+// 缺了它的表现是「扫描版 PDF 的 OCR 一直初始化失败」，而不是构建报错 ——
+// 也就是说，没有这道检查就会部署出一个「能打开、但 OCR 用不了」的站点，
+// 而且没人会发现。这正是修复这次故障时要杜绝的失败模式。
+const ocrModelDir = join(dist, 'ocr-models');
+const REQUIRED_OCR_MODELS = [
+  'detection/ort/PP-OCRv6_small_det.ort',
+  'recognition/ort/PP-OCRv6_small_rec.ort',
+  'recognition/ppocrv6_dict.txt',
+];
+if (
+  check(
+    existsSync(ocrModelDir),
+    'dist/ocr-models 缺失 —— 请用 npm run build（prebuild 会执行 fetch-ocr-models.mjs）',
+  )
+) {
+  let modelBytes = 0;
+  for (const rel of REQUIRED_OCR_MODELS) {
+    const full = join(ocrModelDir, rel);
+    if (check(existsSync(full), `dist/ocr-models/${rel} 缺失 —— OCR 将无法初始化`)) {
+      const size = statSync(full).size;
+      modelBytes += size;
+      // 空文件或截断的下载也要拦住：那种情况浏览器会报 Failed to fetch 或解析失败
+      check(size > 1024, `dist/ocr-models/${rel} 只有 ${size} 字节，像是下载失败`);
+    }
+  }
+  if (modelBytes > 0) {
+    notes.push(`OCR 模型 ${REQUIRED_OCR_MODELS.length} 个，合计 ${mb(modelBytes)}（同源发布）`);
+  }
+}
+
 // ── 3. 不应存在 sourcemap ───────────────────────────────────
 const allFiles = walk(dist);
 const maps = allFiles.filter((f) => f.endsWith('.map'));
