@@ -21,7 +21,7 @@ import type { ContentBlock } from '@/types/content';
 import type { OcrWord } from '@/lib/ocrTypes';
 // 字符框不在 `OcrWord` 上 —— 由 `ocrCharBoxes` 用 WeakMap 旁挂，必须显式取。
 // 这条例外值得写出来：看上去像"少了一个字段"，其实是刻意的设计。
-import { getAttachedChars } from '@/lib/ocrCharBoxes';
+import { getAttachedChars, getCharBoxSkips } from '@/lib/ocrCharBoxes';
 
 /** 一个词在页面上的原始形态（字段名刻意取短，便于阅读与对比） */
 export interface OcrStructureWord {
@@ -115,6 +115,8 @@ export interface OcrStructure {
   wordsTotal: number;
   /** 拿到字符级框的词数；0 表示字符级定位这一步没跑成 */
   wordsWithChars: number;
+  /** 没拿到字符框的词及各自的原因（`ocrCharBoxes` 的三个失败出口之一） */
+  charBoxSkips: { text: string; reason: string }[];
   /** 成行结果 */
   lines: OcrStructureLine[];
   linesTotal: number;
@@ -355,6 +357,14 @@ export function buildOcrStructure(input: {
      * 有了它，下一次导出就能一眼分清"功能没生效"与"生效了但没判出上下标"。
      */
     wordsWithChars,
+    /**
+     * 取不到字符框的词**各自的原因**。
+     *
+     * 没有它时，导出只能说明「8/23 拿到了」，而这个事实**不足以定位问题** ——
+     * 实测为此连猜两轮（先猜词太宽超出模型上限，被 44px 短词也失败的数据否掉）。
+     * 原因本来是采集了的，只是写进了 `console.warn`，而用户看不到控制台。
+     */
+    charBoxSkips: getCharBoxSkips(),
     lines: keptLines,
     linesTotal: lineEntries.length,
     blocks,

@@ -1087,6 +1087,44 @@ export async function createWordCharBoxRecognizer(): Promise<
  */
 const charBoxRegistry = new WeakMap<OcrWord, AttachedChars>();
 
+/**
+ * 取不到字符框的**原因**记录。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么必须记下来（真实教训）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * `attachCharBoxes` 对每个失败的词都会报原因（尺寸不合适 / 未解出字符 /
+ * 字符序列与词文本不一致），但**只送进 `console.warn`**。
+ * 而用户看不到控制台 —— 于是导出的结构里只有
+ * 「`wordsWithChars: 8`、含指数的那一行不在其中」这一个事实，
+ * **完全不知道 15 个词各自停在哪一个出口**。
+ *
+ * 实测为此连猜两轮：先猜「词太宽、超出模型宽度上限」，
+ * 但数据立刻否掉了它 —— 44px 宽的短词也没拿到，825px 的反而拿到了。
+ * 猜测之所以发生，只是因为原因被写进了看不见的地方。
+ *
+ * 所以这里把原因留下来，由 `ocrStructure` 导出。
+ * 机制与 `charBoxRegistry` 一致：旁挂、按页清空、不污染 `OcrWord`。
+ */
+const skipLog: { text: string; reason: string }[] = [];
+
+/** 记录一个词为什么没取到字符框（由 `ocrEngine` 的 `onSkip` 调用） */
+export function recordCharBoxSkip(text: string, reason: string): void {
+  // 词汇级别的明细可能很长，截断到可读长度；条数不限（一页的词是有限的）
+  skipLog.push({ text: text.slice(0, 24), reason });
+}
+
+/** 取本页记录到的失败原因 */
+export function getCharBoxSkips(): { text: string; reason: string }[] {
+  return [...skipLog];
+}
+
+/** 每页开始前清空 —— 否则会跨页累积，读出来的就不是这一页的情况 */
+export function clearCharBoxSkips(): void {
+  skipLog.length = 0;
+}
+
 /** 挂在词上的字符框：像素框（画布坐标）+ 归一化墨迹（判据用） */
 export interface AttachedChars {
   chars: OcrChar[];

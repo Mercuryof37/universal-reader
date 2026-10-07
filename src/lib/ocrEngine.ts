@@ -20,7 +20,12 @@ import { useSettingsStore } from '@/store/settingsStore';
 import { OCR_MODEL_BASE, OCR_MODEL_FILES, buildOcrModel } from '@/lib/ocrModelSource';
 import { resolveExecutionProviders } from '@/lib/ocrExecutionProvider';
 import { noteOcrStage } from '@/lib/sessionDiagnostics';
-import { attachCharBoxes, createWordCharBoxRecognizer } from '@/lib/ocrCharBoxes';
+import {
+  attachCharBoxes,
+  clearCharBoxSkips,
+  createWordCharBoxRecognizer,
+  recordCharBoxSkip,
+} from '@/lib/ocrCharBoxes';
 import type { OcrCanvasLike } from '@/lib/ocrCharBoxes';
 import {
   detectMissedInkRegionsFromCanvas,
@@ -368,6 +373,8 @@ class OcrEngine {
     );
 
     const words: OcrWord[] = [];
+    // 每页开始前清空「取不到字符框」的原因记录，否则会跨页累积
+    clearCharBoxSkips();
     for (const item of result.results) {
       const text = item.text.trim();
       if (!text) continue;
@@ -407,6 +414,9 @@ class OcrEngine {
           canvas: recognizedCanvas as unknown as OcrCanvasLike,
           scale: factor < 0.999 ? factor : 1,
           onSkip: (word, reason) => {
+            // 记进可导出的诊断里 —— 只写 console 的话用户永远看不到，
+            // 而这正是「15 个词为什么没拿到字符框」唯一的线索（见 ocrCharBoxes）。
+            recordCharBoxSkip(word.text, reason);
             console.warn(
               `[ocrEngine] 第 ${pageNum} 页词「${word.text.slice(0, 20)}」未取到字符级坐标：${reason}`,
             );
