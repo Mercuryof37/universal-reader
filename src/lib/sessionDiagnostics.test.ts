@@ -5,12 +5,15 @@ import {
   clearOcrAttempt,
   clearOcrStage,
   clearPersistentOcrCrash,
+  dismissDiagnostics,
+  getDiagnosticsSignature,
   getInterruptedOcr,
   getLastOcrStage,
   getLastReloadReason,
   getOcrStageTrail,
   getPersistentOcrCrash,
   getReloadCount,
+  isDiagnosticsDismissed,
   noteOcrCrashIfInterrupted,
   noteOcrProgress,
   noteOcrStage,
@@ -248,6 +251,62 @@ describe('跨会话的崩溃记忆（localStorage）', () => {
 
     clearPersistentOcrCrash();
     expect(getPersistentOcrCrash()).toBeNull();
+  });
+});
+
+describe('诊断报告的关闭（× 按钮）', () => {
+  it('关闭之后，同一份报告不再显示', () => {
+    /**
+     * 用户报告：诊断横幅右上角的 × 点了没反应。
+     * 真因有两层：① 横幅当初没传 onClose（× 是画出来但没接线的）；
+     * ② 即使接了，`showDiagnostics` 每次渲染都从存储重算，
+     *    关掉之后换个视图再回来它又冒出来 —— 看起来仍像坏的。
+     * 所以关闭状态必须被记住。
+     */
+    const sig = getDiagnosticsSignature({
+      reloadCount: 3,
+      interrupted: { pageNum: 1, total: 1 },
+      crashCount: 0,
+      stageCount: 5,
+    });
+
+    expect(isDiagnosticsDismissed(sig)).toBe(false);
+    dismissDiagnostics(sig);
+    expect(isDiagnosticsDismissed(sig)).toBe(true);
+  });
+
+  it('出了**新的**问题时要重新显示 —— 那才是最该被看到的时刻', () => {
+    const oldSig = getDiagnosticsSignature({
+      reloadCount: 3,
+      interrupted: { pageNum: 1, total: 10 },
+      crashCount: 0,
+      stageCount: 5,
+    });
+    dismissDiagnostics(oldSig);
+
+    // 又一次中断，走到了不同的页数 / 崩溃次数增加
+    const newSig = getDiagnosticsSignature({
+      reloadCount: 5,
+      interrupted: { pageNum: 3, total: 10 },
+      crashCount: 1,
+      stageCount: 6,
+    });
+
+    expect(newSig).not.toBe(oldSig);
+    expect(isDiagnosticsDismissed(newSig)).toBe(false);
+  });
+
+  it('签名对每一项关键事实都敏感（漏掉任一项就会漏报新问题）', () => {
+    const base = { reloadCount: 2, interrupted: null, crashCount: 0, stageCount: 1 };
+    const sig = getDiagnosticsSignature(base);
+
+    // 任一项变化都应产生不同的签名
+    expect(getDiagnosticsSignature({ ...base, reloadCount: 3 })).not.toBe(sig);
+    expect(getDiagnosticsSignature({ ...base, crashCount: 1 })).not.toBe(sig);
+    expect(getDiagnosticsSignature({ ...base, stageCount: 2 })).not.toBe(sig);
+    expect(
+      getDiagnosticsSignature({ ...base, interrupted: { pageNum: 1, total: 1 } }),
+    ).not.toBe(sig);
   });
 });
 

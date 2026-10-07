@@ -290,3 +290,47 @@ export function clearPersistentOcrCrash(): void {
     /* 同上 */
   }
 }
+
+/**
+ * 「用户已经把这条诊断关掉了」的记忆。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么不能只用一个 boolean
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 诊断横幅的内容每次都从存储里重算，所以**光把它从界面上藏起来是不够的** ——
+ * 换一次文档、或者组件重新挂载，它就会立刻回来，× 看起来像是坏的。
+ *
+ * 但如果简单地记成「已关闭」，又会有另一个问题：
+ * **下次真的又崩了，用户就再也看不到提示了** —— 而那恰恰是最该看到的时刻。
+ *
+ * 所以记的是**报告内容的签名**：关掉的是「这一份报告」，
+ * 一旦关键事实变化（新的中断、崩溃次数增加、走到更远的步骤），
+ * 签名就不同，提示会重新出现。
+ */
+const DISMISS_KEY = 'universal-reader:diagnostics-dismissed';
+
+/** 当前诊断报告的内容签名（变了就说明是新的一次问题） */
+export function getDiagnosticsSignature(input: {
+  reloadCount: number;
+  interrupted: { pageNum: number; total: number } | null;
+  crashCount: number;
+  stageCount: number;
+}): string {
+  return [
+    input.reloadCount,
+    input.interrupted ? `${input.interrupted.pageNum}/${input.interrupted.total}` : '-',
+    input.crashCount,
+    input.stageCount,
+  ].join('|');
+}
+
+/** 记住「这一份诊断报告」已被关闭 */
+export function dismissDiagnostics(signature: string): void {
+  write(DISMISS_KEY, signature);
+}
+
+/** 这一份诊断报告是否已被用户关闭 */
+export function isDiagnosticsDismissed(signature: string): boolean {
+  return read(DISMISS_KEY) === signature;
+}

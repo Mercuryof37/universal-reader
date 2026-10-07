@@ -1,11 +1,16 @@
+import { useState } from 'react';
 import { FileText, Trash2, BookOpen, AlertTriangle, X } from 'lucide-react';
 import { useLibraryStore } from '@/store/libraryStore';
 import { FileUploadZone } from '@/components/FileUploadZone';
 import {
+  dismissDiagnostics,
+  getDiagnosticsSignature,
   getInterruptedOcr,
   getLastReloadReason,
   getOcrStageTrail,
+  getPersistentOcrCrash,
   getReloadCount,
+  isDiagnosticsDismissed,
 } from '@/lib/sessionDiagnostics';
 
 const FORMAT_LABEL: Record<string, string> = {
@@ -42,7 +47,29 @@ export function DocumentLibrary({ onOpen }: { onOpen?: () => void }) {
   const interrupted = getInterruptedOcr();
   const lastReload = getLastReloadReason();
   const stageTrail = getOcrStageTrail();
-  const showDiagnostics = reloadCount > 1 || interrupted !== null;
+  const crashCount = getPersistentOcrCrash()?.count ?? 0;
+
+  /**
+   * 报告的签名 + 「已关闭」状态。
+   *
+   * `showDiagnostics` 每次渲染都从存储重算，所以只把它从界面上藏起来是不够的：
+   * 组件重新挂载（切到阅读器再回来）它就回来了，× 会显得是坏的。
+   * 因此关闭动作记的是**这一份报告的签名**，并且用 state 触发重渲染。
+   *
+   * 记签名而不是一个 boolean，是为了**下次真的又出问题时提示还能回来** ——
+   * 那才是最该被看到的时刻。
+   */
+  const signature = getDiagnosticsSignature({
+    reloadCount,
+    interrupted,
+    crashCount,
+    stageCount: stageTrail.length,
+  });
+  const [dismissedSignature, setDismissedSignature] = useState<string | null>(() =>
+    isDiagnosticsDismissed(signature) ? signature : null,
+  );
+  const showDiagnostics =
+    (reloadCount > 1 || interrupted !== null) && dismissedSignature !== signature;
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 p-6">
@@ -64,7 +91,13 @@ export function DocumentLibrary({ onOpen }: { onOpen?: () => void }) {
       )}
 
       {showDiagnostics && (
-        <Banner tone="warn">
+        <Banner
+          tone="warn"
+          onClose={() => {
+            dismissDiagnostics(signature);
+            setDismissedSignature(signature);
+          }}
+        >
           <p className="font-medium">检测到上次会话异常中断</p>
           <ul className="mt-1 list-inside list-disc space-y-0.5">
             {reloadCount > 1 && (
@@ -234,9 +267,22 @@ function Banner({
       {/* 用 whitespace-pre-line 保留解析器错误里的换行与空行：
           扫描件、加密、损坏这几类错误的处置办法是分段的，挤成一行很难读 */}
       <div className="min-w-0 flex-1 whitespace-pre-line leading-relaxed">{children}</div>
-      <button type="button" onClick={onClose} aria-label="关闭提示">
-        <X className="h-4 w-4" aria-hidden />
-      </button>
+      {/*
+        只在实际给了关闭处理时才画这个 ×。
+        原先它无条件渲染，而诊断横幅当初没传 onClose ——
+        于是「× 画出来了、点下去没反应」。没有处理函数的关闭按钮
+        比没有按钮更糟：用户会以为界面坏了。
+      */}
+      {onClose && (
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="关闭提示"
+          className="shrink-0 rounded p-0.5 opacity-70 transition-opacity hover:opacity-100"
+        >
+          <X className="h-4 w-4" aria-hidden />
+        </button>
+      )}
     </div>
   );
 }
