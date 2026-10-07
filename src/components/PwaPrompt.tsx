@@ -33,6 +33,7 @@ import { useLibraryStore } from '@/store/libraryStore';
 export function PwaPrompt() {
   const { offlineReady, updatePending, dismiss, reloadNow } = usePwa();
   const importing = useLibraryStore((s) => s.importing);
+  const scannedPdfPending = useLibraryStore((s) => s.scannedPdfPending);
   const [online, setOnline] = useState(() =>
     typeof navigator === 'undefined' ? true : navigator.onLine,
   );
@@ -40,21 +41,30 @@ export function PwaPrompt() {
   useEffect(() => subscribeOnline(setOnline), []);
 
   /**
-   * 新版本已就绪、但刷新被推迟时：等导入/OCR 一结束就自动刷新。
+   * 新版本已就绪、但刷新被推迟时：等手头的活儿一结束就自动刷新。
    *
-   * 放在这里而不是在 `onNeedReload` 里轮询，是因为 `importing` 是 store 状态，
-   * 组件天然会在它变化时重渲染。之所以要「结束就刷新」而不是一直等用户点：
+   * 「手头的活儿」有两种，与 `lib/pwa.ts` 里推迟刷新时判断的完全一致：
+   * 正在导入/识别（`importing`），或者有一份待识别的扫描件等着用户点开始
+   * （`scannedPdfPending`）。后者只在内存里，刷新就会丢，所以也必须等。
+   *
+   * 放在这里而不是在 `onNeedReload` 里轮询，是因为这些是 store 状态，
+   * 组件天然会在它们变化时重渲染。之所以要「结束就刷新」而不是一直等用户点：
    * 用户选的就是 autoUpdate，推迟只是为了**不毁掉正在进行的工作**，
    * 工作一结束就该回到原本的自动更新语义。
-   * 此时结果已经落盘（中途检查点 + 最终保存），刷新不会丢东西。
+   * 此时结果已经落盘（第一页起就落 + 每 5 页 + 末页），刷新不会丢东西。
    *
    * ⚠️ **必须同时判断 `online`**：离线时刷新毫无意义，而且此刻界面显示的是
    * 「已离线」那条（优先级更高，见上方表格），用户根本看不到「新版本已就绪」，
    * 突然重载只会莫名其妙。等恢复在线后这个 effect 会再次运行。
    */
+  const busy = importing || scannedPdfPending !== null;
+
   useEffect(() => {
-    if (updatePending && !importing && online) reloadNow();
-  }, [updatePending, importing, online, reloadNow]);
+    if (updatePending && !busy && online) {
+      console.info('[pwa] 手头的活儿已结束，现在应用新版本并刷新。');
+      reloadNow();
+    }
+  }, [updatePending, busy, online, reloadNow]);
 
   // 离线状态优先于其他提示：它描述的是此刻能不能用
   if (!online) {

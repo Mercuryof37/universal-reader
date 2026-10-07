@@ -90,10 +90,27 @@ export function usePwa(): PwaState {
      * 其余情况保持 autoUpdate 原有的立即刷新语义。
      */
     onNeedReload() {
-      if (useLibraryStore.getState().importing) {
+      const state = useLibraryStore.getState();
+
+      /**
+       * 两种「有活儿在内存里」的状态都必须拦住刷新：
+       *
+       * 1. `importing` —— 正在导入或正在 OCR，结果还没（或只落了一部分）到 IndexedDB；
+       * 2. `scannedPdfPending` —— **已导入的扫描件正等着用户点「开始识别」**。
+       *    这份 PDF 的 buffer 只在内存里，刷新即丢失，用户得重新导入一次。
+       *    之前只判断了第 1 种，于是「识别对话框开着的时候来了一次部署」
+       *    依然会把页面刷掉 —— 用户看到的就是「仍然会自动刷新」。
+       */
+      const busy = state.importing || state.scannedPdfPending !== null;
+
+      if (busy) {
+        const why = state.importing ? '正在导入/识别' : '有一份待识别的扫描件';
+        console.info(`[pwa] 新版本已接管，但${why}，已推迟刷新（完成后自动刷新）。`);
         setUpdatePending(true);
         return;
       }
+
+      console.info('[pwa] 新版本已接管，当前空闲，立即刷新。');
       window.location.reload();
     },
   });

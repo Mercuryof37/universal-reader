@@ -145,9 +145,22 @@ export const OCR_CHECKPOINT_EVERY_PAGES = 5;
  *
  * 纯函数，便于单测 —— 落盘时机的边界（第一页、末页、不足一个间隔的小任务）
  * 是最容易写错又最不容易发现的地方。
+ *
+ * @param firstSuccessfulPage 本页是否是**第一页成功产出内容**的页。
+ *   这一条是后来补上的，而且很关键：原来只在「第 5、10、15…页」落盘，
+ *   于是**少于 5 页就中断的任务一个字都没保存**。
+ *   用户报的正是这个 —— 「扫描完看不到文档，书库里也没有新条目」。
+ *   现在只要第一页识别成功就立刻落盘，几秒内书库里就会出现条目，
+ *   之后无论发生什么中断，至少有东西留下来。
  */
-export function shouldCheckpoint(pageNum: number, totalPages: number): boolean {
+export function shouldCheckpoint(
+  pageNum: number,
+  totalPages: number,
+  firstSuccessfulPage = false,
+): boolean {
   if (!Number.isFinite(pageNum) || pageNum <= 0) return false;
+  // 第一页成功 → 立刻落盘，把「书库里什么都没有」这个窗口压到最短
+  if (firstSuccessfulPage) return true;
   // 末页一定落盘：否则不足一个间隔的任务（比如试跑 3 页）永远等不到检查点
   if (pageNum >= totalPages) return true;
   return pageNum % OCR_CHECKPOINT_EVERY_PAGES === 0;

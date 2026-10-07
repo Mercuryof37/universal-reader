@@ -575,9 +575,21 @@ export async function ocrParsePdf(
 
       // 中途落盘：丢失窗口从"整次扫描"缩小到"最多 OCR_CHECKPOINT_EVERY_PAGES 页"。
       // 只在这一页确实产出了内容时才写，空白页/失败页没必要触发一次写入。
-      if (onCheckpoint && blocksThisPage && shouldCheckpoint(pageNum, totalPages)) {
+      //
+      // `pagesProcessed === 1` 表示"这是第一页成功产出内容的页" —— 必须立刻落盘。
+      // 否则「试跑 10 页」这种最常见用法要等到第 5 页才有第一条记录，
+      // 中途一旦被外部刷新打断，书库里就是空的（这正是用户报的现象）。
+      if (
+        onCheckpoint &&
+        blocksThisPage &&
+        shouldCheckpoint(pageNum, totalPages, pagesProcessed === 1)
+      ) {
         try {
           await onCheckpoint(snapshot());
+          console.info(
+            `[ocrParsePdf] 已落盘：第 ${pageNum} 页后，累计 ${allDrafts.length} 个内容块` +
+              `（共 ${totalPages} 页）—— 此刻起书库里已有该文档，中断也不会全丢`,
+          );
         } catch (err) {
           // 落盘失败不能反过来毁掉整次扫描 —— 告警后继续
           console.warn(`[ocrParsePdf] 第 ${pageNum} 页后落盘失败（继续识别）：`, err);

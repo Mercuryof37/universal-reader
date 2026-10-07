@@ -54,8 +54,9 @@ describe('落盘节奏 mustCheckpoint', () => {
     const total = 237;
     let last = 0;
     let maxGap = 0;
+    // 模拟真实调用：第一页成功时传 firstSuccessfulPage = true
     for (let p = 1; p <= total; p++) {
-      if (shouldCheckpoint(p, total)) {
+      if (shouldCheckpoint(p, total, p === 1)) {
         maxGap = Math.max(maxGap, p - last);
         last = p;
       }
@@ -65,10 +66,26 @@ describe('落盘节奏 mustCheckpoint', () => {
     expect(maxGap).toBeLessThanOrEqual(OCR_CHECKPOINT_EVERY_PAGES);
   });
 
+  it('第一页成功产出内容时立刻落盘 —— 否则短任务一个字都存不下来', () => {
+    /**
+     * 这是用户报的第二个现象的根因之一：「扫描完看不到文档，书库里也没有新条目」。
+     * 原先只在第 5、10、15…页落盘，于是**不足 5 页就中断的任务完全没有记录**；
+     * 即使是「试跑 10 页」，也要等到第 5 页才有第一条。
+     * 现在第一页成功就立刻写一次，几秒内书库里就有条目。
+     */
+    expect(shouldCheckpoint(1, 100, true)).toBe(true);
+    // 只有「第一页成功」才走这条捷径，普通页面不受影响
+    expect(shouldCheckpoint(1, 100, false)).toBe(false);
+    expect(shouldCheckpoint(2, 100, true)).toBe(true);
+  });
+
   it('非法输入不触发落盘（而不是意外地在第 0 页写库）', () => {
     expect(shouldCheckpoint(0, 10)).toBe(false);
     expect(shouldCheckpoint(-1, 10)).toBe(false);
     expect(shouldCheckpoint(Number.NaN, 10)).toBe(false);
+    // 「第一页成功」也不能让非法页码蒙混过关
+    expect(shouldCheckpoint(0, 10, true)).toBe(false);
+    expect(shouldCheckpoint(Number.NaN, 10, true)).toBe(false);
   });
 });
 

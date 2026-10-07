@@ -44,27 +44,38 @@ describe('刷新前必须先检查「是否有工作在进行」', () => {
     expect(PWA_SRC).toMatch(/onNeedReload\s*\(/);
   });
 
-  it('onNeedReload 里读的是 libraryStore 的 importing', () => {
-    expect(PWA_SRC).toMatch(/useLibraryStore\.getState\(\)\.importing/);
+  it('onNeedReload 里读的是 libraryStore 的状态', () => {
+    expect(PWA_CODE).toMatch(/useLibraryStore\.getState\(\)/);
+    expect(PWA_CODE).toMatch(/state\.importing/);
   });
 
-  it('importing 的检查出现在 window.location.reload() **之前**', () => {
+  it('两种「有活儿在内存里」的状态都要拦住刷新', () => {
+    /**
+     * 只判断 `importing` 是不够的 —— 用户看到的「仍然会自动刷新」正出在这里：
+     * 扫描件导入后、还没点「开始识别」时，`importing` 是 **false**，
+     * 但那份 PDF 的 buffer 只在内存里，刷新即丢失，用户得重新导入。
+     * 所以 `scannedPdfPending` 也必须算作「忙」。
+     */
+    expect(PWA_CODE).toMatch(/state\.scannedPdfPending/);
+    expect(PWA_CODE).toMatch(/const busy\s*=\s*state\.importing\s*\|\|\s*state\.scannedPdfPending/);
+  });
+
+  it('busy 的判断出现在 window.location.reload() **之前**', () => {
     const hook = PWA_CODE.indexOf('onNeedReload');
     expect(hook, 'pwa.ts 里找不到 onNeedReload').toBeGreaterThan(-1);
 
-    // 只看 onNeedReload 之后的那一段
     const body = PWA_CODE.slice(hook);
-    const guard = body.indexOf('importing');
+    const guard = body.indexOf('const busy');
     const reload = body.indexOf('window.location.reload()');
 
-    expect(guard, 'onNeedReload 里没有检查 importing').toBeGreaterThan(-1);
+    expect(guard, 'onNeedReload 里没有计算 busy').toBeGreaterThan(-1);
     expect(reload, 'onNeedReload 里没有兜底的 reload').toBeGreaterThan(-1);
-    expect(guard, 'importing 检查必须在 reload 之前，否则修复失效').toBeLessThan(reload);
+    expect(guard, 'busy 判断必须在 reload 之前，否则修复失效').toBeLessThan(reload);
   });
 
   it('被推迟时置 updatePending，而不是静默什么都不做', () => {
     const body = PWA_CODE.slice(PWA_CODE.indexOf('onNeedReload'));
-    const guard = body.indexOf('importing');
+    const guard = body.indexOf('const busy');
     const setPending = body.indexOf('setUpdatePending(true)');
     const reload = body.indexOf('window.location.reload()');
 
@@ -81,8 +92,10 @@ describe('刷新前必须先检查「是否有工作在进行」', () => {
 });
 
 describe('工作结束后自动刷新（否则新版本可能永远不生效）', () => {
-  it('PwaPrompt 在 updatePending 且不再 importing 时调用 reloadNow', () => {
-    expect(PROMPT_SRC).toMatch(/updatePending\s*&&\s*!importing/);
+  it('PwaPrompt 在手头活儿结束且在线时调用 reloadNow', () => {
+    // busy = importing || scannedPdfPending（与 pwa.ts 的判据保持一致）
+    expect(PROMPT_SRC).toMatch(/const busy\s*=\s*importing\s*\|\|\s*scannedPdfPending/);
+    expect(PROMPT_SRC).toMatch(/updatePending\s*&&\s*!busy\s*&&\s*online/);
     expect(PROMPT_SRC).toMatch(/reloadNow\(\)/);
   });
 
@@ -94,7 +107,7 @@ describe('工作结束后自动刷新（否则新版本可能永远不生效）'
      * 而且用户此刻看到的是优先级更高的「已离线」提示条，
      * 根本不知道有更新在等着。
      */
-    expect(PROMPT_SRC).toMatch(/updatePending\s*&&\s*!importing\s*&&\s*online/);
+    expect(PROMPT_SRC).toMatch(/updatePending\s*&&\s*!busy\s*&&\s*online/);
     // online 必须在依赖数组里，否则状态变化不会重新触发
     expect(PROMPT_SRC).toMatch(/\},\s*\[[^\]]*\bonline\b[^\]]*\]\)/);
   });
