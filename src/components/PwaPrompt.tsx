@@ -119,7 +119,9 @@ function Banner({
 }) {
   const color =
     tone === 'offline'
-      ? 'border-amber-500/40 bg-amber-500/10 text-amber-900 dark:text-amber-100'
+      ? // 与其它提示框统一：底色保留琥珀色以示「提醒」，文字用高对比中性色。
+        // 原来的 amber-900 / dark:amber-100 在暖色底上读不清（用户实测反馈）。
+        'border-amber-500/40 bg-amber-500/10 text-neutral-900 dark:text-neutral-100'
       : 'border-[var(--reader-accent)]/40 bg-[var(--reader-panel)] text-[var(--reader-fg)]';
 
   return (

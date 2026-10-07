@@ -149,12 +149,17 @@ export function FileUploadZone({ compact = false }: { compact?: boolean }) {
                 把整个页面弄没，不留任何报错，用户与应用都无从判断。
               */}
               {ocrSupport.level !== 'ok' && (
+                /*
+                  文字统一用高对比中性色：原有的 amber-900 / dark:amber-100
+                  在暖色底上对比不足（用户实际反馈读不清），底色保留琥珀色
+                  以维持「这是提醒」的语义即可。
+                */
                 <div
                   className={
                     'max-w-md rounded-md border p-3 text-xs leading-relaxed ' +
                     (ocrSupport.level === 'unsupported'
                       ? 'border-red-500/40 bg-red-500/10 text-red-900 dark:text-red-100'
-                      : 'border-amber-500/40 bg-amber-500/10 text-amber-900 dark:text-amber-100')
+                      : 'border-amber-500/40 bg-amber-500/10 text-neutral-900 dark:text-neutral-100')
                   }
                 >
                   <p className="font-medium">

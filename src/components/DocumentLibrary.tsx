@@ -340,7 +340,12 @@ function Banner({
   const color =
     tone === 'error'
       ? 'border-red-400/60 bg-red-500/10 text-red-700 dark:text-red-300'
-      : 'border-amber-400/60 bg-amber-500/10 text-amber-800 dark:text-amber-200';
+      : // 警示框的文字用**高对比中性色**，不要用琥珀色系列。
+        // 用户实测反馈：`text-amber-800 / dark:text-amber-200` 与本站
+        // 暖色调（米色/浅琥珀）背景过近，**读不清**；深色模式下
+        // `text-amber-200` 更是亮黄，与背景几乎融在一起。
+        // 底色保留琥珀色以维持「这是提醒」的语义，文字则用近黑/近白。
+        'border-amber-400/60 bg-amber-500/10 text-neutral-900 dark:text-neutral-100';
 
   return (
     <div
