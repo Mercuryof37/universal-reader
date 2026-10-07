@@ -147,8 +147,24 @@ describe('三档判定', () => {
 
     expect(s.level).toBe('unsupported');
     expect(s.reason).toContain('2 次');
-    expect(s.reason).toMatch(/建议直接换用/);
+    // 关键：**必须**告诉用户那些记录可能来自旧版本，并给出重试出口 ——
+    // 用户实测正是被这条规则挡在门外过
+    expect(s.reason).toMatch(/旧版本/);
+    expect(s.reason).toMatch(/仍要尝试/);
     expect(s.recommendation).toMatch(/Chrome/);
+    expect(s.canOverride, '基于历史记录的拦截必须允许覆盖').toBe(true);
+  });
+
+  it('能力缺失时不给覆盖入口（点了也一定失败）', () => {
+    vi.spyOn(WebAssembly, 'validate').mockReturnValue(false);
+    const s = detectOcrSupport({ userAgent: CHROME_UA });
+    expect(s.level).toBe('unsupported');
+    expect(s.canOverride, '能力确实缺失时不该给「仍要尝试」').toBe(false);
+  });
+
+  it('基于外壳浏览器的提醒同样允许覆盖（启发式不该剥夺重试机会）', () => {
+    const s = detectOcrSupport({ userAgent: 'Mozilla/5.0 QQBrowser/11.0' });
+    expect(s.canOverride).toBe(true);
   });
 
   it('问题浏览器 + 崩过 → 仍然是 risky，且优先说明「崩过」这个更硬的事实', () => {

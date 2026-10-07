@@ -50,7 +50,7 @@ export function FileUploadZone({ compact = false }: { compact?: boolean }) {
   const formulaOcrEnabled = useSettingsStore((s) => s.formulaOcrEnabled);
   const setFormulaOcrEnabled = useSettingsStore((s) => s.setFormulaOcrEnabled);
 
-  // 环境能力与「这台机器上崩过几次」只判定一次，结果不会在会话中变化
+  // 环境能力与「这台机器上崩过几次」只判定一次，结果不会在会话中变化。
   const [ocrSupport] = useState(() => {
     const interrupted = getInterruptedOcr();
     const lastReload = getLastReloadReason();
@@ -63,6 +63,13 @@ export function FileUploadZone({ compact = false }: { compact?: boolean }) {
       persistentCrashCount: getPersistentOcrCrash()?.count ?? 0,
     });
   });
+
+  // 用户是否点了「仍要尝试」，覆盖掉基于历史记录的拦截。
+  // 必须和上面那些 hook 放在一起 —— 组件后面有提前 return，
+  // 在那里声明 hook 会违反 Hooks 规则（渲染间顺序不一致）。
+  const [supportOverridden, setSupportOverridden] = useState(false);
+  /** 是否禁止开始识别：能力确实缺失时禁止；仅历史记录拦截时允许用户覆盖 */
+  const ocrBlocked = ocrSupport.level === 'unsupported' && !supportOverridden;
 
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -167,6 +174,22 @@ export function FileUploadZone({ compact = false }: { compact?: boolean }) {
                     只有扫描版 PDF 的文字识别需要用到这些能力；
                     文字版 PDF 与 Markdown / TXT / EPUB 不受影响，可以正常导入阅读。
                   </p>
+
+                  {/*
+                    覆盖入口：**只有基于历史记录**（崩溃次数）的拦截才给这个出口。
+                    能力确实缺失时（缺 WASM/SIMD）点了也一定失败，不给。
+                    理由：历史不等于未来，代码一直在改；用户实测就被这一点挡过 ——
+                    他的 3 次崩溃都发生在已经修好的旧版本上。
+                  */}
+                  {ocrSupport.canOverride && (
+                    <button
+                      type="button"
+                      onClick={() => setSupportOverridden(true)}
+                      className="mt-2 rounded-md border border-current px-2 py-1 text-xs font-medium transition-opacity hover:opacity-80"
+                    >
+                      仍要尝试
+                    </button>
+                  )}
                 </div>
               )}
 
@@ -201,7 +224,7 @@ export function FileUploadZone({ compact = false }: { compact?: boolean }) {
               <div className="flex gap-2">
                 <button
                   type="button"
-                  disabled={ocrSupport.level === 'unsupported'}
+                  disabled={ocrBlocked}
                   /**
                    * 内核确实不支持时**直接挡住**，而不是让用户点下去撞崩溃。
                    * 上面那块提示已经说明了原因与替代浏览器，
@@ -212,7 +235,7 @@ export function FileUploadZone({ compact = false }: { compact?: boolean }) {
                    * 那两条是启发式与历史记录，不该剥夺用户再试一次的机会。
                    */
                   title={
-                    ocrSupport.level === 'unsupported'
+                    ocrBlocked
                       ? '当前浏览器内核不支持文字识别，请改用推荐浏览器'
                       : undefined
                   }

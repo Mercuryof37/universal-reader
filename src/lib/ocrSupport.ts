@@ -50,6 +50,15 @@ export interface OcrSupport {
   reason: string;
   /** 推荐使用的浏览器（任何非 ok 情况都给） */
   recommendation: string;
+  /**
+   * 用户是否可以「仍要尝试」。
+   *
+   * `false` 只用于**能力确实缺失**的情况 —— 那种情况点了也一定失败。
+   * 凡是基于**历史记录**（崩溃次数）挡住用户的，都必须是 `true`：
+   * 历史不等于未来，代码一直在改，不该因为过去崩过就永久剥夺用户重试的机会
+   * （用户实测正是被这一点挡住的：3 次崩溃都发生在已修复的旧版本上）。
+   */
+  canOverride: boolean;
   details: OcrSupportDetails;
 }
 
@@ -142,6 +151,8 @@ export function detectOcrSupport(input: OcrSupportInput = {}): OcrSupport {
         '这个浏览器不支持 WebAssembly，无法在本机运行文字识别。' +
         (problemBrowser ? `（检测到你在使用${problemBrowser}，它的内核通常过旧。）` : ''),
       recommendation: BROWSER_RECOMMENDATION,
+      // 能力确实缺失：点了也一定失败，不给覆盖
+      canOverride: false,
       details: { wasm: false, simd: false, crossOriginIsolated: false },
     };
   }
@@ -161,6 +172,7 @@ export function detectOcrSupport(input: OcrSupportInput = {}): OcrSupport {
         '国产外壳浏览器常把内核停在很旧的版本上，即使用「极速模式」也可能不支持；' +
         '「兼容模式」实际是 IE 内核，一定不支持。',
       recommendation: BROWSER_RECOMMENDATION,
+      canOverride: false,
       details,
     };
   }
@@ -172,11 +184,14 @@ export function detectOcrSupport(input: OcrSupportInput = {}): OcrSupport {
 
   if (crashedBefore) {
     /**
-     * 崩过两次以上就直接挡住。
+     * 崩过两次以上就挡住，但**仍然允许用户「仍要尝试」**。
      *
-     * 一次可能是偶然（内存紧张、同时开着的标签页太多），所以只提醒、仍允许重试；
-     * 两次独立崩溃基本可以确定这个环境跑不了 —— 再让用户点下去，
-     * 只是让他白等一场，而且可能连带丢掉刚导入的文件。
+     * 一次可能是偶然（内存紧张、同时开着的标签页太多），所以只提醒；
+     * 两次以上则给出更强的结论。但注意：**这只是历史记录，不是能力缺失** ——
+     * 代码一直在改，很可能那个问题早就修掉了。
+     * 用户实测正是被这一点挡住的：他的 3 次崩溃都发生在
+     * WebGPU / PNG 编码 / 线程池尚未修复的旧版本上。
+     * 所以这里只挡默认路径，同时给出显式的覆盖入口。
      */
     const twice = crashCount >= 2;
     return {
@@ -184,13 +199,15 @@ export function detectOcrSupport(input: OcrSupportInput = {}): OcrSupport {
       problemBrowser,
       reason:
         `上一次识别没有跑完，页面是被浏览器自己中断的（不是本应用发起的刷新）` +
-        (crashCount > 0 ? `，这类中断在这台机器上已累计 ${crashCount} 次` : '') +
+        (crashCount > 0 ? `，这类中断在**当前版本**上已累计 ${crashCount} 次` : '') +
         '。这通常意味着当前浏览器无法稳定运行本功能' +
         (problemBrowser ? `，检测到你正在使用${problemBrowser}。` : '。') +
         (twice
-          ? '连续多次中断，建议直接换用下面的浏览器。'
+          ? '如果刚才更新过版本，那些记录来自旧版本、可能已经修好，可以点「仍要尝试」再试一次。'
           : '你可以再试一次；如果再次中断，请换用下面的浏览器。'),
       recommendation: BROWSER_RECOMMENDATION,
+      // 基于历史记录：必须允许用户仍要尝试
+      canOverride: true,
       details,
     };
   }
@@ -206,6 +223,7 @@ export function detectOcrSupport(input: OcrSupportInput = {}): OcrSupport {
         '识别过程中可能被浏览器中断，且不会给出任何错误提示。' +
         '如果识别失败或中途中断，请换用下面的浏览器重试。',
       recommendation: BROWSER_RECOMMENDATION,
+      canOverride: true,
       details,
     };
   }
@@ -215,6 +233,8 @@ export function detectOcrSupport(input: OcrSupportInput = {}): OcrSupport {
     problemBrowser: null,
     reason: '',
     recommendation: '',
+    // 不适用（本来就没挡）
+    canOverride: false,
     details,
   };
 }

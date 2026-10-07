@@ -232,10 +232,21 @@ const CRASH_KEY = 'universal-reader:ocr-crash';
 const CRASH_STALE_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface OcrCrashRecord {
-  /** 累计崩溃次数 */
+  /** 累计崩溃次数（**仅统计当前构建**） */
   count: number;
   /** 最近一次的时间戳 */
   at: number;
+  /** 记录时的构建标识；与当前不同则整条记录作废 */
+  buildId: string;
+}
+
+/** 当前构建标识；拿不到时退回空串（此时不做版本隔离，功能仍然可用） */
+function currentBuildId(): string {
+  try {
+    return typeof __BUILD_ID__ === 'string' ? __BUILD_ID__ : '';
+  } catch {
+    return '';
+  }
 }
 
 function readPersistent<T>(key: string): T | null {
@@ -271,14 +282,31 @@ export function noteOcrCrashIfInterrupted(): void {
   writePersistent(CRASH_KEY, {
     count: (prev?.count ?? 0) + 1,
     at: Date.now(),
+    buildId: currentBuildId(),
   });
 }
 
-/** 读取持久化的崩溃记录；没有或已过期则返回 null */
+/**
+ * 读取崩溃记录。
+ *
+ * **按构建版本隔离**：记录里的 `buildId` 与当前构建不同就直接作废。
+ *
+ * 理由是实测出来的：用户在某浏览器上累计了 3 次崩溃，而那 3 次都发生在
+ * WebGPU / PNG 编码 / 线程池尚未修复的旧版本上。修复上线之后，
+ * 那 3 次记录依然算数，于是他**被一个早已修掉的问题挡在门外**，
+ * 连再试一次、把新的错误信息拿到的机会都没有。
+ *
+ * 「这一版崩过几次」才是我们真正想知道的事，所以换了版本就重新开始计。
+ */
 export function getPersistentOcrCrash(): OcrCrashRecord | null {
   const record = readPersistent<OcrCrashRecord>(CRASH_KEY);
   if (!record || typeof record.count !== 'number') return null;
   if (Date.now() - (record.at ?? 0) > CRASH_STALE_MS) return null;
+
+  const build = currentBuildId();
+  // build 为空说明没拿到构建标识（例如测试环境），此时不做版本隔离
+  if (build && record.buildId && record.buildId !== build) return null;
+
   return record;
 }
 

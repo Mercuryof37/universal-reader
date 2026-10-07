@@ -28,3 +28,12 @@ interface ImportMetaEnv {
 interface ImportMeta {
   readonly env: ImportMetaEnv;
 }
+
+/**
+ * 构建标识，由 `vite.config.ts` 的 `define` 注入。
+ *
+ * 用于把「崩溃记忆」按构建版本隔离：旧版本记录下来的崩溃
+ * 不该在新版本上继续算数 —— 那会拿一个早已修掉的问题把用户挡在门外
+ * （用户实测就撞上了这一点）。
+ */
+declare const __BUILD_ID__: string;

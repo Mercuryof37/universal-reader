@@ -2,6 +2,18 @@ import { defineConfig } from 'vitest/config';
 import { fileURLToPath } from 'node:url';
 
 export default defineConfig({
+  /**
+   * 与 `vite.config.ts` 保持一致：注入构建标识。
+   *
+   * 少了它，`__BUILD_ID__` 在测试里就是 undefined，而
+   * `sessionDiagnostics` 的「按版本隔离崩溃记忆」逻辑会因此整段失效 ——
+   * 表现是相关断言莫名其妙地不成立（写这条时正是如此）。
+   * 测试里用固定值即可：我们验的是「版本不同就作废」这个逻辑，
+   * 不需要它是真实时间戳。
+   */
+  define: {
+    __BUILD_ID__: JSON.stringify('test-build'),
+  },
   resolve: {
     alias: [
       // pdf.js 默认构建依赖浏览器专有 API（DOMMatrix 等），在 Node 里会直接抛

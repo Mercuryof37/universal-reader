@@ -310,6 +310,42 @@ describe('诊断报告的关闭（× 按钮）', () => {
   });
 });
 
+describe('崩溃记忆按构建版本隔离', () => {
+  it('旧版本记录下来的崩溃，在新版本上不再算数', () => {
+    /**
+     * 用户实测撞上的正是这一点：他在 360 上累计了 3 次崩溃，
+     * 而那 3 次都发生在 WebGPU / PNG 编码 / 线程池尚未修复的旧版本上。
+     * 修复上线后那些记录依然算数，于是他**被一个早已修掉的问题挡在门外**，
+     * 连再试一次、拿到新的错误信息的机会都没有。
+     *
+     * 解决办法是按构建版本计：换了版本就重新开始计。
+     */
+    // 伪造一条属于「别的构建」的记录
+    localStorage.setItem(
+      'universal-reader:ocr-crash',
+      JSON.stringify({ count: 3, at: Date.now(), buildId: 'some-old-build' }),
+    );
+
+    // 当前构建与它不同 ⇒ 整条记录作废
+    expect(getPersistentOcrCrash()).toBeNull();
+
+    // 在**当前**构建上重新累计，才应该生效
+    noteOcrProgress(1, 1);
+    noteOcrCrashIfInterrupted();
+    expect(getPersistentOcrCrash()?.count).toBe(1);
+  });
+
+  it('新记录会带上当前构建标识', () => {
+    noteOcrProgress(1, 1);
+    noteOcrCrashIfInterrupted();
+
+    const raw = localStorage.getItem('universal-reader:ocr-crash');
+    expect(raw).toBeTruthy();
+    const parsed = JSON.parse(raw as string) as { buildId?: string };
+    expect(typeof parsed.buildId).toBe('string');
+  });
+});
+
 describe('存储不可用时必须安全降级', () => {
   it('sessionStorage 抛异常时所有接口都不炸', () => {
     /**
