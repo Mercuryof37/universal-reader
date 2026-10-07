@@ -30,7 +30,11 @@ export function DocumentLibrary({ onOpen }: { onOpen?: () => void }) {
   const removeDocument = useLibraryStore((s) => s.removeDocument);
   const clearError = useLibraryStore((s) => s.clearError);
   const ocrSummary = useLibraryStore((s) => s.ocrSummary);
+  const ocrStructure = useLibraryStore((s) => s.ocrStructure);
   const cancelOcr = useLibraryStore((s) => s.cancelOcr);
+
+  /** 「复制识别结构」按钮的反馈状态：用户必须知道到底复制成功了没有 */
+  const [copyState, setCopyState] = useState<'idle' | 'done' | 'failed'>('idle');
 
   /**
    * 会话诊断：把「页面被刷新过几次」「上次识别断在第几页」**显示在界面上**。
@@ -152,6 +156,41 @@ export function DocumentLibrary({ onOpen }: { onOpen?: () => void }) {
           <p className="mt-1 text-[11px] opacity-80">
             失败的页面不会中断整个任务。如需补齐，可对原文件重新执行 OCR。
           </p>
+
+          {/*
+            「复制识别结构」出口。
+            存在的理由见 `lib/ocrStructure.ts` 顶部：上下标（指数、下标）的判定
+            完全是几何的，而它此前只在**手工合成的坐标**上验证过 ——
+            真实扫描件上是否成立，只能靠用户把真实数据发出来才能判断。
+
+            文案刻意说清「这是什么、有什么用」：用户不是开发者，
+            只写「识别结构」四个字，他不知道该不该点、点了会发生什么。
+          */}
+          {ocrStructure && (
+            <div className="mt-2 border-t border-amber-400/40 pt-2">
+              <button
+                type="button"
+                onClick={() => {
+                  void (async () => {
+                    const ok = await copyTextToClipboard(ocrStructure.json);
+                    setCopyState(ok ? 'done' : 'failed');
+                  })();
+                }}
+                className="rounded-lg border border-amber-500/50 px-2.5 py-1 text-xs font-medium transition-colors hover:bg-amber-500/15"
+              >
+                复制识别结构（第 {ocrStructure.pageNum} 页，{ocrStructure.linesTotal} 行 /{' '}
+                {ocrStructure.wordsTotal} 个词）
+              </button>
+              <p className="mt-1 text-[11px] opacity-80">
+                {copyState === 'done'
+                  ? '已复制到剪贴板。把它粘贴给开发者，就能按真实数据校准公式识别。'
+                  : copyState === 'failed'
+                    ? '复制失败：浏览器拒绝了剪贴板操作。请改用 https 打开本页，或按 F12 在控制台里手动取出内容。'
+                    : '这是一页的原始识别数据（每个字的位置与大小，以及分行分段的中间结果），' +
+                      '不含图片，也不会联网。公式（例如指数）识别不对时，把它发给开发者最有用。'}
+              </p>
+            </div>
+          )}
         </Banner>
       )}
 
@@ -241,6 +280,51 @@ export function DocumentLibrary({ onOpen }: { onOpen?: () => void }) {
       </footer>
     </div>
   );
+}
+
+/**
+ * 把文本写进剪贴板，返回是否成功。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么必须有 execCommand 这条退路
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * `navigator.clipboard` **只在安全上下文里存在**（https 或 localhost）。
+ * 本应用会被部署到普通 http 地址上，也会被装成 PWA 从别的来源打开 ——
+ * 那些情况下 `navigator.clipboard` 是 `undefined`，
+ * 只写异步 API 就会得到「点下去什么都没发生」，而用户根本不知道原因。
+ *
+ * 退路用 `document.execCommand('copy')`（已废弃但浏览器仍普遍支持），
+ * 它需要一个真实被选中的节点，所以这里临时插一个 textarea 再移除。
+ *
+ * 两条路都失败时**如实返回 false**，由调用方把原因显示给用户 ——
+ * 「按钮点了没反应」是最难排查的一类反馈。
+ */
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // 落到下面的退路（例如权限被拒）
+  }
+
+  try {
+    const area = document.createElement('textarea');
+    area.value = text;
+    // 固定定位 + 透明：避免插入瞬间页面跳动
+    area.style.position = 'fixed';
+    area.style.top = '0';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(area);
+    return ok;
+  } catch {
+    return false;
+  }
 }
 
 function Banner({

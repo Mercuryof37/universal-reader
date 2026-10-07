@@ -14,6 +14,7 @@ import {
 } from '@/lib/ocrTypes';
 import type { OcrLang, OcrProgress } from '@/lib/ocrTypes';
 import { ocrResultToBlocks } from '@/lib/ocrPostProcess';
+import type { OcrStructure } from '@/lib/ocrStructure';
 
 /**
  * 从 pdf.js 的文本项里我们只取用这几个字段。
@@ -403,6 +404,19 @@ export interface OcrParseOptions {
    * 回调抛错不会中断扫描（只告警）—— 落盘是尽力而为的保障，不该反过来毁掉任务。
    */
   onCheckpoint?: (snapshot: DocDocument) => void | Promise<void>;
+  /**
+   * 每页识别完成后回调一次，交出**这一页的原始识别结构**
+   * （词框、字号、成行结果、最终块 —— 见 `lib/ocrStructure.ts`）。
+   *
+   * 为什么要暴露它：上下标（指数、下标）的判据是纯几何的，
+   * 而它此前只在**手工合成的坐标**上验证过，真实扫描件上是否成立
+   * 一直无从判断。有了这个出口，就能把真实结构复制出来，
+   * 从而**用数据定阈值**，而不是继续猜。
+   *
+   * ⚠️ 调用方应当**只留一份**（例如只留第一页）：词级数据很大，
+   * 而它不会写进 IndexedDB（见 `libraryStore` 里的取舍说明）。
+   */
+  onPageStructure?: (structure: OcrStructure) => void;
 }
 
 /** 单页 OCR 失败时的记录 */
@@ -448,7 +462,7 @@ export async function ocrParsePdf(
   metaTitle: string,
   metaAuthor: string,
 ): Promise<OcrParseResult> {
-  const { lang, maxPages, onProgress, onCheckpoint } = options;
+  const { lang, maxPages, onProgress, onCheckpoint, onPageStructure } = options;
 
   // 打开文档：这一步失败的原因与解析路径相同（加密 / 损坏 / 缺 API）
   let doc: Awaited<ReturnType<typeof pdfjsLib.getDocument>['promise']>;
@@ -574,7 +588,12 @@ export async function ocrParsePdf(
           onProgress,
         );
         noteOcrStage('recognize-done', `第 ${pageNum} 页：识别完成，${ocrResult.words.length} 个词`);
-        const blocks = ocrResultToBlocks(ocrResult, pageCanvas.height);
+        const blocks = ocrResultToBlocks(
+          ocrResult,
+          pageCanvas.height,
+          // 只在有人要的时候才构造结构对象（见 `ocrResultToBlocks` 的说明）
+          onPageStructure,
+        );
         if (blocks.length) {
           allDrafts.push(...blocks);
           pagesProcessed++;

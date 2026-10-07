@@ -41,6 +41,30 @@ interface LibraryState {
   ocrProgress: OcrProgress | null;
   /** 上次 OCR 的结果摘要：成功的页数与被跳过的页数 */
   ocrSummary: { pagesProcessed: number; pagesSkipped: number; failures: number[] } | null;
+  /**
+   * 上一页的**原始识别结构**（词框、字号、成行结果、最终块），已序列化成
+   * JSON 字符串，供「复制识别结构」按钮使用。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * 三处刻意的取舍
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 1. **只留一页**。词级数据很大（一页上千个词），而这一页已经足够回答
+   *    「真实文档里的指数到底长什么样」—— 那正是它存在的唯一理由。
+   *    每次识别都覆盖它，不会随页数累积。
+   *
+   * 2. **不写 IndexedDB**。文档库只管正文与批注；把诊断用的词级数据
+   *    塞进长期存储，会让每一次识别都多写几 MB，还得为此设计淘汰策略。
+   *    存成 store 里的字符串，刷新页面自然消失，代价最小。
+   *
+   * 3. **在解析层就序列化**（`pdfParser` 里做），而不是把对象留在内存里
+   *    等到点按钮时才 `stringify`。后者意味着整份词表对象常驻内存，
+   *    而且会随 GC 压力反复被扫；字符串是只读的，内存占用与它的大小
+   *    一样可预测 —— 本项目已经因为内存峰值吃过多次亏。
+   *
+   * 单页体积上限见 `lib/ocrStructure.ts` 的 `OCR_STRUCTURE_CHAR_BUDGET`。
+   */
+  ocrStructure: { pageNum: number; json: string; linesTotal: number; wordsTotal: number } | null;
 
   init: () => Promise<void>;
   importFiles: (files: File[]) => Promise<void>;
@@ -72,6 +96,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
   scannedPdfPending: null,
   ocrProgress: null,
   ocrSummary: null,
+  ocrStructure: null,
 
   init: async () => {
     set({ loading: true });
@@ -184,6 +209,8 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       importing: true,
       error: null,
       ocrSummary: null,
+      // 新一次识别从零开始：旧的结构属于上一本书，留着只会误导
+      ocrStructure: null,
       ocrProgress: { pageNum: 0, total, status: 'initializing' },
     });
 
@@ -218,6 +245,29 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
           onCheckpoint: async (snapshot) => {
             await saveDocument(snapshot);
             set({ documents: await listDocuments() });
+          },
+          /**
+           * 导出识别结构：**只保留第一页**。
+           *
+           * 为什么是第一页而不是最后一页：用户报的故障（题目挤成一段、
+           * 指数没生效）就在开头的题目页上，第一页最可能被看到；
+           * 而且早期页面的识别条件（模型冷启动之后的第一页）也更接近
+           * 他实际遇到的情况。后面的页面覆盖它没有意义 ——
+           * 同一份 PDF 的版式是一致的，一页足够定量。
+           *
+           * 已在别处序列化成字符串（见 `ocrStructure` 字段的说明），
+           * 这里不再持有词级对象。
+           */
+          onPageStructure: (structure) => {
+            if (get().ocrStructure) return;
+            set({
+              ocrStructure: {
+                pageNum: structure.pageNum,
+                json: JSON.stringify(structure, null, 2),
+                linesTotal: structure.linesTotal,
+                wordsTotal: structure.wordsTotal,
+              },
+            });
           },
         },
         pending.metaTitle,
@@ -276,5 +326,5 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     }
   },
 
-  cancelOcr: () => set({ scannedPdfPending: null, ocrProgress: null, ocrSummary: null }),
+  cancelOcr: () => set({ scannedPdfPending: null, ocrProgress: null, ocrSummary: null, ocrStructure: null }),
 }));

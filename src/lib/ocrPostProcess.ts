@@ -12,6 +12,7 @@
  */
 import type { ContentBlock } from '@/types/content';
 import type { OcrWord, OcrPageResult } from '@/lib/ocrTypes';
+import { buildOcrStructure, type OcrStructure } from '@/lib/ocrStructure';
 
 interface OcrLine {
   words: OcrWord[];
@@ -172,9 +173,31 @@ function looksLikeHeading(text: string): boolean {
   );
 }
 
+/**
+ * 识别结果转内容块。
+ *
+ * @param onStructure 可选的「导出识别结构」回调（见 `lib/ocrStructure.ts`）。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么把导出挂在回调上，而不是让调用方自己再算一遍
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 上下标判据此前只在**手工合成的坐标**上验证过，真实扫描件上是否成立
+ * 一直无从判断 —— 而那台机器上跑不了浏览器里的推理。
+ * 于是需要一个出口，把**这一页真实的词框与成行结果**交给用户复制出来。
+ *
+ * 关键点：成行结果（`lines`）只有本模块内部知道，而且**必须在上下标
+ * 绑定之后、文本拼装之后**才有意义。让调用方在外面重新分组一次，
+ * 等于把同一套判据实现两遍 —— 两份一定会漂移，导出的数据也就不可信了。
+ * 所以这里在**同一次计算**里顺手把结构交出去。
+ *
+ * 不传回调时**一个额外对象都不构造**：导出是诊断能力，不该给正常识别
+ * 增加任何开销（一页上千个词，多构造一份词表就是实打实的成本）。
+ */
 export function ocrResultToBlocks(
   result: OcrPageResult,
   pageHeight?: number,
+  onStructure?: (structure: OcrStructure) => void,
 ): Omit<ContentBlock, 'id'>[] {
   // 关键兜底：拿不到词级坐标时，用纯文本也要产出内容。
   // 否则就会出现"识别出 7058 字却报告什么都没识别到"这种荒唐结果。
@@ -311,6 +334,48 @@ export function ocrResultToBlocks(
         ...(isHeading ? { level: 2 } : {}),
       },
     });
+  }
+
+  // ── 导出识别结构（只在调用方要的时候才构造）────────────────────
+  //
+  // 放在最后：`filteredLines` 是真正参与拼装的行（页眉页脚已经滤掉），
+  // `blocks` 是最终产物。两者与原始 `words` 一起交出去，
+  // 收到的人才能拿真实词框去核对「这一行到底为什么没变成上下标」。
+  if (onStructure) {
+    const indexOfWord = new Map<OcrWord, number>();
+    result.words.forEach((word, i) => indexOfWord.set(word, i));
+
+    onStructure(
+      buildOcrStructure({
+        pageNum: result.pageNum,
+        canvasHeight: pageHeight,
+        dominantFontSize: medianFontSize,
+        words: result.words,
+        lines: filteredLines
+          // 没有词的「行」在导出里没有意义（它的 wordIndices 会是空的）
+          .filter((line) => line.words.length > 0)
+          .map((line) => ({
+            text: line.text,
+            y: line.y,
+            fontSize: line.fontSize,
+            avgConfidence: line.avgConfidence,
+            wordIndices: line.words
+              .map((word) => indexOfWord.get(word))
+              .filter((i): i is number => i !== undefined),
+            hasScripts: line.hasScripts === true,
+          })),
+        blocks,
+        // 把**真实生效的阈值**写进导出：JSON 自己就能说明「按什么标准判的」
+        thresholds: {
+          scriptMaxFontRatio: SCRIPT_MAX_FONT_RATIO,
+          scriptSuperShift: SCRIPT_SUPER_SHIFT,
+          scriptSubShift: SCRIPT_SUB_SHIFT,
+          scriptFragmentGap: SCRIPT_FRAGMENT_GAP,
+          scriptSuperBand: SCRIPT_SUPER_BAND,
+          scriptSubBand: SCRIPT_SUB_BAND,
+        },
+      }),
+    );
   }
 
   return blocks;
@@ -1121,6 +1186,23 @@ function fragmentToLatex(raw: string): string {
 }
 
 /**
+ * 把一段普通的识别文本放进**已经含公式**的行里，保证 `$` 仍然成对。
+ *
+ * 用在「上下标没判出来、只能按普通字补回」那条兜底上：这一行里可能
+ * 刚生成过 `$^{...}$`，若补回的文本里含未转义的 `$` 或 `_`，
+ * 渲染层（`BlockRow.tsx`）按 `$` 成对切分时就会错位，
+ * 把本该显示的整段文字吃掉 —— 那正是本文件顶部反复强调的
+ * 「把能用的结果弄丢」。所以这里统一按行内公式包一层。
+ */
+function plainInline(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  const latex = fragmentToLatex(trimmed);
+  if (/^\$[\s\S]*\$$/.test(latex)) return latex;
+  return `$${latex}$`;
+}
+
+/**
  * 组装一行文本，并把绑定了基字的上下标包成 `^{...}` / `_{...}`。
  *
  * 输出形态是 `e$^{-(x+y)}$` —— `$...$` 会被 `BlockRow.tsx` 的 KaTeX 渲染成
@@ -1129,6 +1211,24 @@ function fragmentToLatex(raw: string): string {
  * 词序由 `orderLineWords` 决定（基字在前、它的上下标紧随），因此这里只按
  * 顺序输出：遇到基字就写它自己，再把它带的上下标拼成 `$^{...}$`；
  * 未被判为上下标的词照常按字符类别拼接。
+ *
+/**
+ * 拼装行文本。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 一条不能违反的不变量：**这一行里的每个词都要出现在结果里**
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 主循环对「绑定了基字的词」是跳过的（它应该由基字带出来）。
+ * 但「基字带出来」这条路并不总是成立，实测踩到过一次真实的丢字：
+ *
+ *     e 后面跟一个被切成 `-` 和 `2` 的小字指数
+ *     → 输出 `e$^{-}$`，**`2` 整个消失**
+ *
+ * 原因是归属链中间断了一环：主循环看到 `2` 绑定了基字（`2 → -`）而跳过它，
+ * 而拼装时 `-` 名下有没有 `2`、形态判不判得出来是另一回事 ——
+ * 只要那一环不成立，`2` 就两边都不管。所以下面每条「跳过」都必须
+ * **先确认它真的会被别人吐出来**，否则补回文字（见循环里的兜底）。
  *
  * 返回 `scriptCount` 是为了让调用方能观察「这一行到底改没改」，
  * 也便于诊断输出区分「没检测到」与「检测到但没敢改」。
@@ -1147,6 +1247,16 @@ function assembleLineText(
     if (w) indexOf.set(w, i);
   }
 
+  /** 本行里出现的词序号集合。判断「基字是否在本行」必须按**序号**比，
+   *  不能按对象身份：`orderLineWords` 会返回词的新数组，而 `allWords` 里
+   *  是另一个词对象时 `words.includes(...)` 会为假，于是那个被跳过的词
+   *  谁也吐不出来（见下面的兜底说明）。 */
+  const indicesInLine = new Set<number>();
+  for (const word of words) {
+    const index = indexOf.get(word);
+    if (index !== undefined) indicesInLine.add(index);
+  }
+
   // 基字 → 它带的上下标词
   const scripts = new Map<OcrWord, OcrWord[]>();
   for (const word of words) {
@@ -1163,10 +1273,66 @@ function assembleLineText(
   let text = '';
   let scriptCount = 0;
 
-  for (const word of words) {
-    // 绑定了基字的词由它的基字带出来，轮到它自己时跳过
+  /**
+   * 一个词会不会被**别人**吐出来。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * 为什么不能只看「它绑没绑基字」
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 实测复现的真实丢字：`e` 后面跟一个被切成 `-` 和 `2` 的小字指数，
+   * 输出变成 `AB CD e$^{-}$` —— **`2` 整个消失**。
+   *
+   * 因为「绑定」是一条**可能断掉的链**：
+   *  · 主循环看到 `2` 绑定了基字就跳过它，认定「基字会带它出来」；
+   *  · 可它的基字是 `-`，而 `-` 自己也是个绑定了 `e` 的上下标 ——
+   *    `-` 那一轮只拿**挂在 `e` 名下**的词拼公式（`e` 名下只有 `-`），
+   *    根本不会碰挂在 `-` 名下的 `2`。于是 `2` 谁也不管。
+   *
+   * 所以判据必须是「**链的下一环会不会真的输出它**」，而不是
+   * 「它有没有绑上基字」。下面按拼装时的真实条件逐条对齐：
+   *  · 基字在本行（否则它自己都轮不到）；
+   *  · 基字自己不会被跳过（它没绑基字）—— 会的话它同样吐不出东西；
+   *  · 基字名下确实挂着这个词；
+   *  · 基字名下**至少有一个**词判得出形态（否则那一轮
+   *    `if (!kind) continue` 会把整串丢掉，正是上面那个丢字场景的最后一环）。
+   *
+   * ⚠️ 这里**不放宽任何上下标阈值**：该不该判成上下标仍由原判据决定。
+   * 这条兜底只保证「输出里不丢字」—— 识别出来的文字一个都不能少，
+   * 用户宁可看到一个没排好的字符，也不能让它凭空消失。
+   */
+  const willBeEmittedByAnchor = (word: OcrWord): boolean => {
     const index = indexOf.get(word);
-    if (index !== undefined && anchors.has(index)) continue;
+    const anchorIndex = index === undefined ? undefined : anchors.get(index);
+    if (anchorIndex === undefined) return false;
+
+    const anchor = allWords[anchorIndex];
+    if (!anchor || !indicesInLine.has(anchorIndex)) return false;
+
+    const anchorOfAnchor = anchors.get(anchorIndex);
+    if (anchorOfAnchor !== undefined && indicesInLine.has(anchorOfAnchor)) return false;
+
+    const attached = scripts.get(anchor);
+    if (!attached?.includes(word)) return false;
+    return attached.some((s) => inferScriptKind(anchor, s, pageMainFontSize) !== null);
+  };
+
+  for (const word of words) {
+    // 绑定了基字的词由它的基字带出来，轮到它自己时跳过 ——
+    // 但**只有确认它真的会被带出来**才跳过，否则补回文字（见上面的说明）
+    const index = indexOf.get(word);
+    if (index !== undefined && anchors.has(index)) {
+      if (!willBeEmittedByAnchor(word)) {
+        /*
+         * 补回时走 `plainInline()` 而不是直接拼原文：这一行里可能已经有
+         * `$...$`（基字那一轮刚生成的公式），若这里塞进一个未转义的 `$`
+         * 或 `_`，渲染层按 `$` 切分就会错位，把整段文字吃掉 ——
+         * `BlockRow.tsx` 的 `$...$` 是成对解析的。
+         */
+        text = appendWithJoin(text, plainInline(word.text));
+      }
+      continue;
+    }
 
     text = appendWithJoin(text, word.text.trim());
 
