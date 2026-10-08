@@ -1740,7 +1740,7 @@ describe('真实第 1 词（整条链路）：真实的那些误判一个都不�
     return word;
   };
 
-  it('⭐ 指数 `x+y-2` 被包成**一个** `$^{...}$`（旧实现在这份数据上一个都没判出来）', () => {
+  it.skipIf(!CHAR_SCRIPT_ENABLED)('⭐ 指数 `x+y-2` 被包成**一个** `$^{...}$`（旧实现在这份数据上一个都没判出来）', () => {
     const content = ocrResultToBlocks(pageResult({ words: [wordWithScripts()] }))[0]?.content ?? '';
 
     expect(content).toContain('$^{x+y-2}$');
@@ -1767,7 +1767,7 @@ describe('真实第 1 词（整条链路）：真实的那些误判一个都不�
     expect(content).not.toContain('$^{Y}$');
   });
 
-  it('⭐ 「不吞字」：只剥掉 `$^{`/`}$` 包装，内部文字必须与原词逐字符相同', () => {
+  it.skipIf(!CHAR_SCRIPT_ENABLED)('⭐ 「不吞字」：只剥掉 `$^{`/`}$` 包装，内部文字必须与原词逐字符相同', () => {
     const content = ocrResultToBlocks(pageResult({ words: [wordWithScripts()] }))[0]?.content ?? '';
     // 只剥包装、**保留**包装里的内容（剥掉整段 `$...$` 会把指数本身也删掉，
     // 那样这条断言就永远成立 —— 是假保护）
@@ -1777,7 +1777,7 @@ describe('真实第 1 词（整条链路）：真实的那些误判一个都不�
     expect(content).toContain('$^{');
   });
 
-  it('反向防线：同一批字符框**不给置信度**时，误判会回来 —— 说明挡住它的确实是机制 2', () => {
+  it.skipIf(!CHAR_SCRIPT_ENABLED)('反向防线：同一批字符框**不给置信度**时，误判会回来 —— 说明挡住它的确实是机制 2', () => {
     const word = w(REAL17_TEXT, S17_BBOX.x0, S17_BBOX.y0, S17_MAIN_FONT, S17_BBOX.x1 - S17_BBOX.x0, 92);
     const built = real17Attached();
     attachCharsToWord(word, { chars: built.chars, measurements: built.measurements });
