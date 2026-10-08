@@ -1290,7 +1290,7 @@ function centerY(word: OcrWord): number {
  * （可用同页同类字符的实测高度作替代），并用**真实逐字符置信度分布**
  * 校准系数 —— 现在导出里还看不到逐字符置信度，那是下一个诊断缺口。
  */
-export const CHAR_SCRIPT_ENABLED = false;
+export const CHAR_SCRIPT_ENABLED = true;
 
 function resolveCharScripts(
   word: OcrWord,
