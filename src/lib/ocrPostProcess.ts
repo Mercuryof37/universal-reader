@@ -1216,6 +1216,41 @@ function centerY(word: OcrWord): number {
  * 也绝不能让字符下标错位：错位会把 `x` 的上标判到 `y` 头上，
  * 输出的公式是**错的**，比不处理更糟。
  */
+/**
+ * ═══════════════════════════════════════════════════════════════
+ * 字符级上下标判定的**总开关**（当前：关闭）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 关掉的原因不是"做不到"，而是**现在这套判据在中英混排上会误判**。
+ *
+ * 用户真实导出（第 1 词）：
+ *
+ *   $^{17}$. 设 随机 变量 … 分 布律 $^{P}$ {X = x ,Y = y} …
+ *   (1$^{)问}$ X 和 Y 是否相互独立？
+ *   验证随机变量 Z = $^{√}$X2 + $^{Y}$ 的概率密度为
+ *
+ * 而真正该判出来的指数 `x+y−2` **反而没判出来**。
+ *
+ * 根因（已定位到具体的量）：这份文档混着**三种字体度量** —— 汉字 / 拉丁 / 数学符号。
+ * 拉丁数字天生比汉字矮，而汉字字形会探到基线以下，于是
+ * 「底边更高 + 更矮」对每个数字**恒成立**，与是否被抬高无关。
+ *
+ * 参照实现已找到：Tesseract 的 `ccmain/superscript.cpp`
+ * （https://tesseract-ocr.github.io/tessapi/3.05.02/a00149_source.html#l00253 ，
+ * Apache-2.0）。它有四个机制，而本实现**一个都没有**：
+ *   1. 阈值锚在「基线 + x 高度」上，不是「最高字」；
+ *   2. **同时要求两个独立信号**：位置异常 **且** 识别置信度明显偏低
+ *      （`unlikely_threshold = superscript_worse_certainty × avg_certainty`）；
+ *   3. 拒绝标点与斜体；
+ *   4. 候选只取词**两端**的连续异常段。
+ * 第 2 条是关键：`17`、`P`、`√` 都是被高置信度认出的普通字符，
+ * 而真正的指数是小而模糊的块 —— **只看几何必然误判**。
+ *
+ * 关闭期间：拿不到包装的词全部走原路径，**输出与功能引入前逐字符一致**。
+ * 已通过的测试（`$^{x+y-2}$` 必须被包出来）**保留**，作为重写后的验收标准。
+ */
+export const CHAR_SCRIPT_ENABLED = false;
+
 function resolveCharScripts(
   word: OcrWord,
 ): { chars: OcrChar[]; scripts: CharScript[] } | null {
@@ -2104,7 +2139,7 @@ function assembleLineText(
      * 而且底边高出基线」，于是这里优先按字符切分。
      * **拿不到字符框的词走下面的原路径，输出与改动前逐字符一致。**
      */
-    const charScripts = resolveCharScripts(word);
+    const charScripts = CHAR_SCRIPT_ENABLED ? resolveCharScripts(word) : null;
     if (charScripts) {
       const emitted = emitWordWithCharScripts(word.text, charScripts, charScripts.scripts);
       text = appendWithJoin(text, emitted.text);

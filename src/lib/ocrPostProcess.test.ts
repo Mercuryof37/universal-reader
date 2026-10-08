@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ocrResultToBlocks, ocrTextToBlocks } from '@/lib/ocrPostProcess';
+import { ocrResultToBlocks, ocrTextToBlocks, CHAR_SCRIPT_ENABLED } from '@/lib/ocrPostProcess';
 
 /**
  * OCR 结果转内容块的测试。
@@ -1504,7 +1504,10 @@ describe('字符级上下标：指数与整行同框时，词级几何永远判�
     expect(blocks[0]?.content).not.toContain('^{');
   });
 
-  it('拿到字符框后，指数 `x+y-2` 被包成一个 `$^{...}$`', () => {
+  // ⚠️ 这两条是**重写后的验收标准**，当前被总开关跳过（见 `CHAR_SCRIPT_ENABLED`）。
+  // 保留而不是删除：它们精确描述了「什么才算做对了」——
+  // 指数必须被包成**一个** `$^{...}$`，且不能吞掉结尾的空格。
+  it.skipIf(!CHAR_SCRIPT_ENABLED)('拿到字符框后，指数 `x+y-2` 被包成一个 `$^{...}$`', () => {
     const word = s17Word();
     attachCharsToWord(word, s17Chars(S17_EXP_FROM, S17_EXP_TO));
 
@@ -1563,7 +1566,7 @@ describe('字符级上下标：指数与整行同框时，词级几何永远判�
     expect(content).not.toContain('^{');
   });
 
-  it('指数**结尾紧跟空格**时不能把空格也吞进 `^{}`', () => {
+  it.skipIf(!CHAR_SCRIPT_ENABLED)('指数**结尾紧跟空格**时不能把空格也吞进 `^{}`', () => {
     /**
      * ═══════════════════════════════════════════════════════════
      * 这条是从真实数据的实际输出里发现的边界
