@@ -22,10 +22,12 @@ import {
   type LayoutRegion,
 } from '@/lib/layoutAnalysis';
 import {
+  buildCharSizeTable,
   classifyCharsByGeometry,
   getAttachedChars,
   groupScriptFragments,
   type CharScript,
+  type CharSizeTable,
 } from '@/lib/ocrCharBoxes';
 
 interface OcrLine {
@@ -816,6 +818,26 @@ function groupWordsIntoLines(words: OcrWord[], pageHeight?: number): OcrLine[] {
   // 众数稳定落在正文上，因为它就是页面上重复次数最多的那个字号。
   const pageMainFontSize = dominantFontSize(words);
 
+  /**
+   * ═══════════════════════════════════════════════════════════════
+   * 机制 5 的页级字符高度表：**在逐词判定之前**扫一遍所有词的字符框
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 表必须是**页级**的：判据要的是「这个字符在本页最大能有多大」，
+   * 而第 1 词那个指数 `2` 之所以判得出，靠的正是**别处**的 `2`
+   * （实测第 3/9/22 词 h=21 / 20.4 / 23）。只看当前词就退化成恒等式
+   * （`H = h ⟹ h/H = 1` → 把真上标一律拒掉）。
+   *
+   * 放在这里（而不是 `assembleLineText` 里）还有一个实际理由：
+   * `assembleLineText` 是**逐行**调用的，放那里会把整页扫一遍的动作
+   * 重复「行数」次；而每次的结果完全相同（表只依赖词，不依赖行）。
+   *
+   * ⚠️ 拿不到表（`buildCharSizeTable` 返回 `null`，例如整页只有一两个词）
+   * 时机制 5 **不启用**：`classifyCharsByGeometry` 收到 `undefined`，
+   * 行为与引入机制 5 之前**逐字节相同**（这条不变量有测试守着）。
+   */
+  const sizeTable = buildCharSizeTable(words) ?? undefined;
+
   // ── 第 0 层：先把上下标绑到它的基字上 ─────────────────────────
   //
   // 这一步必须在**分桶之前**，原因见 `findScriptAnchors` 的说明：
@@ -881,7 +903,7 @@ function groupWordsIntoLines(words: OcrWord[], pageHeight?: number): OcrLine[] {
 
   return merged
     .map((line) => {
-      const assembled = assembleLineText(line.words, anchors, words);
+      const assembled = assembleLineText(line.words, anchors, words, sizeTable);
       return { ...line, text: assembled.text, hasScripts: assembled.scriptCount > 0 };
     })
     .filter((l) => l.text.length > 0)
@@ -1294,6 +1316,7 @@ export const CHAR_SCRIPT_ENABLED = true;
 
 function resolveCharScripts(
   word: OcrWord,
+  sizeTable?: CharSizeTable,
 ): { chars: OcrChar[]; scripts: CharScript[] } | null {
   const attached = getAttachedChars(word);
   if (!attached) return null;
@@ -1349,8 +1372,12 @@ function resolveCharScripts(
    * `confidences` 可能是 undefined（这条路径上没拿到逐字符置信度）：
    * 那时判据**不启用**置信度门，退回纯几何（见 `classifyCharsByGeometry`）。
    * 这是显式的两条路径，不是「用 0 补齐」。
+   *
+   * `sizeTable` 是**页级**的字符高度表（机制 5）：由 `groupWordsIntoLines`
+   * 在建行之前扫一遍所有词算出来，逐层传到这里。为 `undefined` 时
+   * 机制 5 不启用 —— 与「没有字符框」一样，是一条显式的降级路径。
    */
-  const scripts = classifyCharsByGeometry(measurements, chars, confidences);
+  const scripts = classifyCharsByGeometry(measurements, chars, confidences, sizeTable);
   return scripts.length ? { chars, scripts } : null;
 }
 
@@ -2079,6 +2106,7 @@ function assembleLineText(
   words: OcrWord[],
   anchors: Map<number, number>,
   allWords: OcrWord[],
+  sizeTable?: CharSizeTable,
 ): { text: string; scriptCount: number } {
   if (!words.length) return { text: '', scriptCount: 0 };
 
@@ -2189,7 +2217,7 @@ function assembleLineText(
      * 而且底边高出基线」，于是这里优先按字符切分。
      * **拿不到字符框的词走下面的原路径，输出与改动前逐字符一致。**
      */
-    const charScripts = CHAR_SCRIPT_ENABLED ? resolveCharScripts(word) : null;
+    const charScripts = CHAR_SCRIPT_ENABLED ? resolveCharScripts(word, sizeTable) : null;
     if (charScripts) {
       const emitted = emitWordWithCharScripts(word.text, charScripts, charScripts.scripts);
       text = appendWithJoin(text, emitted.text);
