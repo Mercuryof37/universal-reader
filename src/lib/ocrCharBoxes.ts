@@ -1114,19 +1114,16 @@ export function classifyCharsByGeometry(
    * Step one：正常字符的平均置信度（机制 2）
    * ═══════════════════════════════════════════════════════════════
    *
-   * **置信度必须齐**才算得出来：`allHaveCertainty` 要求每个进入了判定的字符
+   * **缺值不再是全局开关**：门槛只用**已知**置信度算（原来要求齐全，见下）
    * 都有一个有限的置信度。缺一个就整体不启用这道门（理由见函数文档）。
    */
   let worstNormal = Infinity;
   let normalTotal = 0;
   let normalCount = 0;
-  let allHaveCertainty = true;
   for (let k = 0; k < kept.length; k++) {
     const c = confidences?.[kept[k] as number];
-    if (typeof c !== 'number' || !Number.isFinite(c)) {
-      allHaveCertainty = false;
-      continue;
-    }
+    // ⚠️ 有洞照算，**只用已知值**（原因见函数文档「缺值不再是全局开关」）
+    if (typeof c !== 'number' || !Number.isFinite(c)) continue;
     if (pos[k] !== 'normal') continue;
     normalTotal += c;
     normalCount++;
@@ -1134,7 +1131,7 @@ export function classifyCharsByGeometry(
   }
 
   let unlikelyThreshold: number | null = null;
-  if (allHaveCertainty && normalCount >= 3) {
+  if (normalCount >= 3) {
     // 丢掉最差的那一个：它是**唯一**一个可能在数据上「又正常又低置信」的字符
     // （真实的低置信字符几乎都会被位置判据归到候选段里；落在 normal 这边的那一个
     //  多半是识别抖动），留着会把门槛整体拉低。与 Tesseract 逐字一致。
@@ -1184,8 +1181,15 @@ export function classifyCharsByGeometry(
     // 机制 2：置信度正常 → 不是上下标
     if (unlikelyThreshold !== null) {
       const c = confidences?.[i];
-      if (typeof c !== 'number' || !Number.isFinite(c)) continue;
-      if (!(c <= unlikelyThreshold)) continue;
+      /**
+       * ⚠️ 缺值 → **不拒绝**，退回几何判据。
+       *
+       * 原来这里是 `if (缺值) continue;`，等于把缺值当成 0 → 一律拒绝。
+       * 实测 17 个词里 11 个缺值，而**所有出误判的词都在那 11 个里** ——
+       * 也就是说这条门在该用它的地方**从未运行**。缺值本就无法证明「置信度正常」，
+       * 拿它当拒绝理由是错的。
+       */
+      if (typeof c === 'number' && Number.isFinite(c) && !(c <= unlikelyThreshold)) continue;
     }
 
     out.push({ index: i, kind });
@@ -1687,7 +1691,7 @@ function trimCharRange(
     chars: slicedChars,
     measurements: slicedMeasure,
     // 有一个缺值就整条不给：半份置信度会让机制 2 的门槛算错（见函数文档）
-    ...(keptConfidences && keptConfidences.every((c) => Number.isFinite(c))
+    ...(keptConfidences && keptConfidences.some((c) => Number.isFinite(c))
       ? { confidences: keptConfidences }
       : {}),
     text: slicedChars.map((c) => c.char).join(''),
@@ -1729,7 +1733,20 @@ export function reconcileWithWordText(
    * 而置信度缺一个会让机制 2 的门槛算错（缺值会被当成 0），所以要么全有、
    * 要么整条不给。`alignConfidences` 为 null 时下游退回纯几何判据。
    */
-  const alignConfidences = confidences?.length === chars.length ? confidences : null;
+  /**
+   * ⚠️ 长度不等**不再整条丢弃**，而是补齐到 `chars.length`，洞位记 `NaN`。
+   *
+   * 原来要求 `confidences.length === chars.length`，否则整条给 null。
+   * 用户真实导出（`buildId 2026-10-08T09:42:56.578Z`）显示后果是灾难性的：
+   * 17 个有字符框的词里 **11 个** `charConfidencesComplete: false`、逐字符置信度
+   * 全是 `null` —— 而**所有出误判的词（1/15/16/20）都在那 11 个里**。
+   * 补一个洞最多让那一个字符退回几何判据，丢掉整条却会让整页退回几何。
+   */
+  const alignConfidences = confidences?.some((c) => Number.isFinite(c))
+    ? chars.map((_, i) =>
+        Number.isFinite(confidences[i]) ? (confidences[i] as number) : Number.NaN,
+      )
+    : null;
 
   const trimmed = trimCharRange(chars, measurements, alignConfidences);
 
@@ -1895,10 +1912,10 @@ export function reconcileWithWordText(
    * 被跳过的那一位自然没有置信度 —— 若把它当成 0 混进去，
    * 机制 2 的门槛会被整体拉低，反而放行本该拒掉的候选。
    */
-  const everyConfidenceKnown = keptConfidence.every((c) => Number.isFinite(c));
+  const anyConfidenceKnown = keptConfidence.some((c) => Number.isFinite(c));
   return {
     chars: keptChars,
     measurements: keptMeasure,
-    ...(everyConfidenceKnown ? { confidences: keptConfidence } : {}),
+    ...(anyConfidenceKnown ? { confidences: keptConfidence } : {}),
   };
 }
