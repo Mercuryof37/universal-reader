@@ -767,8 +767,19 @@ describe('对账与挂载：拿不到字符框时行为必须与改动前一致'
     expect(padded?.chars.map((c) => c.char).join('')).toBe('ABC');
   });
 
-  it('字符数不一致 → null（错位的字符框比没有更糟）', () => {
-    expect(reconcileWithWordText(charsOf('ABCD'), measOf(4), 'ABCD', 'ABC')).toBeNull();
+  it('识别**多出**字符 → 放行（跳过多余的，目标每个字符仍然都有框）', () => {
+    // ⚠️ 这条此前是「字符数不一致 → null」。规则已按实测改成**不对称**的：
+    // 多识别只影响被跳过的那一个字符，漏识别才会让它后面全部错位。
+    // 实测依据：含指数的第 1 词被识别成 `…=p²(1−p)x+y−2…`，
+    // 比期望多一个 `²`、其余逐个吻合；旧规则因此丢掉了整行。
+    const r = reconcileWithWordText(charsOf('ABCD'), measOf(4), 'ABCD', 'ABC');
+    expect(r?.chars.map((c) => c.char).join('')).toBe('ABC');
+  });
+
+  it('识别**漏掉**目标字符 → null（从那一点起对应关系已不可靠）', () => {
+    // 反向防线：实测 `μ>0` 被读成 `μ0`（漏了 `>`），必须继续拒绝。
+    // 放行会让字符框对到别的字上 —— 错位的框比没有框更糟。
+    expect(reconcileWithWordText(charsOf('ABD'), measOf(3), 'ABD', 'ABCD')).toBeNull();
   });
 
   it('逐字符内容不一致 → null（不能用错的坐标去判上下标）', () => {
@@ -1035,5 +1046,67 @@ describe('真实回归：对账必须容忍格式差异', () => {
 
   it('归一化不能把完全不相干的文本放过', () => {
     expect(reconcile('完全不同的内容', '这一行文字明显长得多')).toBeNull();
+  });
+});
+
+describe('真实回归：序列对齐必须救回含指数的第 1 词', () => {
+  const reconcileReal = (recognized: string, expected: string) =>
+    reconcileWithWordText(mkChars(recognized), mkMeas(recognized.length), recognized, expected);
+
+  it('第 1 词：识别多出一个 `²`，其余吻合 → 放行，且 `x+y−2` 五个字符都拿到框', () => {
+    /**
+     * 真实数据（用户导出）：
+     *   识别 `17. 设随机变量(X,Y) 具有分布律 P{ X = x ,Y = y} = p² (1− p )x+y−2 ,0 < p < 1,x ,y 均为正`
+     *   期望 `17. 设 随机 变量 (X ,Y) 具有 分 布律 P {X = x ,Y = y} = p (1 − p )x+y−2 ,0 < p < 1,x ,y 均为 正`
+     *
+     * 差别只有 `p²` 与 `p` —— 识别**多**一个 `²`。旧规则要求逐字符相同，
+     * 于是整行被丢弃，而这一行正是唯一需要判上标的地方。
+     */
+    const recognized =
+      '17. 设随机变量(X,Y) 具有分布律 P{ X = x ,Y = y} = p² (1− p )x+y−2 ,0 < p < 1,x ,y 均为正';
+    const expected =
+      '17. 设 随机 变量 (X ,Y) 具有 分 布律 P {X = x ,Y = y} = p (1 − p )x+y−2 ,0 < p < 1,x ,y 均为 正';
+
+    const r = reconcileReal(recognized, expected);
+    expect(r, '必须能对齐').not.toBeNull();
+
+    // 对齐后的字符序列必须**恰好等于期望文本**（不含空白），逐字符一一对应
+    const got = r!.chars.map((c) => c.char).join('');
+    expect(got.replace(/\s+/g, '')).toBe(expected.replace(/\s+/g, ''));
+
+    // 与 `word.text` 逐位对齐；**每个非空白字符都必须有测量值**
+    // （空白位是 null —— 没有墨迹就没有几何，这是契约的一部分）
+    expect(r!.measurements).toHaveLength(r!.chars.length);
+    const blank = r!.chars.filter((c) => !c.char.trim()).length;
+    expect(r!.measurements.filter((m) => m !== null)).toHaveLength(r!.chars.length - blank);
+
+    // 指数 `x+y−2` 那五个字符必须都在，且横向位置递增（说明框没串位）
+    const xs = r!.chars.filter((c) => c.char.trim()).map((c) => c.x0);
+    for (let i = 1; i < xs.length; i++) {
+      expect(xs[i], `第 ${i} 个字符的横坐标必须递增`).toBeGreaterThan(xs[i - 1]!);
+    }
+  });
+
+  it('第 20 词：Unicode 下标 `n₂` 与普通 `n2` 必须视为同一字符', () => {
+    const recognized =
+      '35. 设 X,Y是相互独立的随机变量,X ∼ b(n1,p),Y ∼b(n2,p),证明Z = X +Y∼b(n1 +n2，';
+    const expected =
+      '35. 设 X,Y是相互独立的随机变量,X ∼ b(n1,p),Y∼ b(n2,p),证明Z = X +Y∼b(n1+n₂,';
+
+    const r = reconcileReal(recognized, expected);
+    expect(r, '`n₂`(U+2082) 与 `n2` 是同一张图的两次识别结果，不该因此丢弃').not.toBeNull();
+  });
+
+  it('⚠️ 反向：实测那些**真的漏字/认错字**的必须继续拒绝', () => {
+    // 漏掉 `>`（实测第 4 词）
+    expect(reconcileReal('其中λ>0，μ0是常数.引入随机变量', '其中λ>0，μ>0是常数.引入随机变量')).toBeNull();
+    // 漏掉开头的 `=`（实测第 6 词）
+    expect(reconcileReal('10, 当X>Y', '=10, 当X>Y')).toBeNull();
+    // `）` 被认成 `1`（实测第 10 词）
+    expect(reconcileReal('1', '）')).toBeNull();
+    // `0` 被认成 `O`（实测第 11 词）
+    expect(reconcileReal('O，', '0，')).toBeNull();
+    // 整段认错（实测第 5 词）
+    expect(reconcileReal('2-, Mx', 'Z= 当X>Y')).toBeNull();
   });
 });

@@ -1225,8 +1225,45 @@ function resolveCharScripts(
   const target = word.text.trim();
   if (!target) return null;
   const { chars, measurements } = attached;
+
+  /**
+   * ═══════════════════════════════════════════════════════════════
+   * 这里必须与 `ocrCharBoxes.reconcileWithWordText` 的**同一套口径**
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 对账产出的 `chars` 与 `word.text`（trim 后）**逐位对齐**，空位与
+   * 「识别漏掉」的位置测量值为 `null` —— 这是 `emitWordWithCharScripts`
+   * 按下标切片所依赖的契约。
+   *
+   * 所以这里必须比**同一套归一化**（全角转半角、大小写、Unicode 上下标），
+   * 而不是逐字符完全相同：识别与正文在标点宽度上不一致是常态、不是错误。
+   *
+   * 原先这里要求完全相同，实测后果是 23 个词里只有**恰好走精确匹配**的
+   * 第 14 词能通过（它的字符带着空格、长度刚好对上），其余全被挡在门外 ——
+   * 上下标判定此前**根本没机会运行**，唯一跑成的一次还是错的
+   * （等号被包成 `$^{=}$`）。
+   *
+   * ⚠️ 输出仍用 `word.text` 的原文切片，所以字符身份上的全角/半角差异
+   * **不会**进入渲染结果 —— 它只决定「哪些位置有框」，而那正是需要的。
+   */
+  const strip = (s: string): string =>
+    s
+      .replace(/\s+/g, '')
+      .replace(/[\uFF01-\uFF5E]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+      .replace(/[\u2070-\u2079\u2080-\u2089\u207A-\u207E\u208A-\u208E]/g, (ch) => {
+        const code = ch.charCodeAt(0);
+        if (code >= 0x2070 && code <= 0x2079) return String.fromCharCode(code - 0x2070 + 0x30);
+        if (code >= 0x2080 && code <= 0x2089) return String.fromCharCode(code - 0x2080 + 0x30);
+        const tail: Record<number, string> = {
+          0x207a: '+', 0x207b: '-', 0x207c: '=', 0x207d: '(', 0x207e: ')',
+          0x208a: '+', 0x208b: '-', 0x208c: '=', 0x208d: '(', 0x208e: ')',
+        };
+        return tail[code] ?? ch;
+      })
+      .toLowerCase();
+
   if (chars.length !== target.length) return null;
-  if (chars.map((c) => c.char).join('') !== target) return null;
+  if (strip(chars.map((c) => c.char).join('')) !== strip(target)) return null;
 
   const scripts = classifyCharsByGeometry(measurements);
   return scripts.length ? { chars, scripts } : null;

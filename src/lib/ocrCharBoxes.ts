@@ -1394,20 +1394,115 @@ export function reconcileWithWordText(
     s
       .replace(/\s+/g, '')
       .replace(/[\uFF01-\uFF5E]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+      // Unicode 上下标字符归到基字符：实测第 20 词里 `n₂`(U+2082) 与 `n2`
+      // 是同一张图的两次识别结果 —— 一次给真下标字符、一次给普通数字。
+      // 语义相同，不该因此丢掉整行的字符框。
+      .replace(/[\u2070-\u2079\u2080-\u2089\u207A-\u207E\u208A-\u208E]/g, (ch) => {
+        const code = ch.charCodeAt(0);
+        if (code >= 0x2070 && code <= 0x2079) return String.fromCharCode(code - 0x2070 + 0x30);
+        if (code >= 0x2080 && code <= 0x2089) return String.fromCharCode(code - 0x2080 + 0x30);
+        const tail: Record<number, string> = {
+          0x207a: '+', 0x207b: '-', 0x207c: '=', 0x207d: '(', 0x207e: ')',
+          0x208a: '+', 0x208b: '-', 0x208c: '=', 0x208d: '(', 0x208e: ')',
+        };
+        return tail[code] ?? ch;
+      })
       .toLowerCase();
 
-  if (canonical(trimmed.text) !== canonical(target)) return null;
-  if (canonical(recognizedText) !== canonical(target)) return null;
+  /**
+   * ═══════════════════════════════════════════════════════════════
+   * 序列对齐：允许识别结果**多出**字符，不允许它**漏掉**字符
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 此前要求两边（归一化后）**完全相同**，于是含指数的第 1 词被丢掉：
+   *
+   *   识别 `…=p²(1−p)x+y−2…`   期望 `…=p(1−p)x+y−2…`
+   *                              ↑ 识别多出一个 `²`
+   *
+   * 其余逐个吻合 —— 多出来的那个跳过即可，**期望里每个字符仍然都有框**。
+   *
+   * 反过来不行：期望里有、识别里没有（实测 `μ>0` 被读成 `μ0`，漏了 `>`），
+   * 说明从漏掉那一点起对应关系已经不可靠，必须整条拒绝 ——
+   * 这正是原来那道闸要防的事（错位的框比没有框更糟）。
+   *
+   * 所以规则是**不对称**的，而这个不对称有依据：
+   * **多识别**只影响被跳过的那一个字符，**漏识别**会让它后面全部错位。
+   */
+  const targetChars = [...target].filter((ch) => ch.trim());
+  if (!targetChars.length) return null;
+
+  /**
+   * 整串识别结果也要能容下 target（与逐字符对齐互为印证）。
+   *
+   * 两者本该一致，但它们的来源不同：`recognizedText` 是识别器给的整串，
+   * `trimmed.chars` 是逐字符框拼出来的。若只有一边对得上，说明中间某处
+   * 出了问题，此时拒绝比给出坐标安全。
+   */
+  const recCanon = canonical(recognizedText);
+  const tgtCanon = canonical(target);
+  let matched = 0;
+  for (const ch of recCanon) {
+    if (matched < tgtCanon.length && ch === tgtCanon[matched]) matched++;
+  }
+  if (matched !== tgtCanon.length) return null;
 
   const keptChars: OcrChar[] = [];
   const keptMeasure: Array<InkMeasurement | null> = [];
-  for (let i = 0; i < trimmed.chars.length; i++) {
-    const c = trimmed.chars[i];
-    // 空白没有墨迹，去掉它才与 `target` 的非空白字符逐字符对齐
-    if (!c || !c.char.trim()) continue;
-    keptChars.push(c);
-    keptMeasure.push(trimmed.measurements[i] ?? null);
+  let cursor = 0;
+  let skipped = 0;
+
+  /**
+   * ⚠️ 输出必须与 **`target` 逐位对齐**，包括空白位置。
+   *
+   * 这一点是契约，不是实现细节：`emitWordWithCharScripts` 是按**下标**在
+   * `word.text` 上切片的，字符数组一旦与原文错位，切出来的就是别的字。
+   *
+   * 所以空白位与「识别漏掉」的位置都要占一个位置，只是**测量值为 null**
+   * （`classifyCharsByGeometry` 本来就会跳过 null —— 没有墨迹就没有几何可言）。
+   * 两条路径（精确匹配 / 序列对齐）由此得到**同一个**契约。
+   */
+  let prevX = 0;
+  let prevY = 0;
+  for (const want of [...target]) {
+    if (!want.trim()) {
+      // 空白：占位，无墨迹
+      keptChars.push({ char: want, x0: prevX, y0: prevY, x1: prevX, y1: prevY });
+      keptMeasure.push(null);
+      continue;
+    }
+
+    const wantC = canonical(want);
+    let found = -1;
+    for (let j = cursor; j < trimmed.chars.length; j++) {
+      const c = trimmed.chars[j];
+      if (!c || !c.char.trim()) continue;
+      if (canonical(c.char) === wantC) {
+        found = j;
+        break;
+      }
+      skipped++;
+    }
+    if (found < 0) return null;
+
+    const hit = trimmed.chars[found] as OcrChar;
+    // 字符身份取**原文**的 `want`（输出以 `word.text` 为准），几何取识别到的
+    keptChars.push({ char: want, x0: hit.x0, y0: hit.y0, x1: hit.x1, y1: hit.y1 });
+    keptMeasure.push(trimmed.measurements[found] ?? null);
+    prevX = hit.x1;
+    prevY = hit.y0;
+    cursor = found + 1;
   }
-  if (canonical(keptChars.map((c) => c.char).join('')) !== canonical(target)) return null;
+
+  /**
+   * 跳过的字符不能太多。
+   *
+   * 不设上限时，一段胡乱识别的文本也可能「碰巧」把 target 当子序列匹配上，
+   * 那种对齐给出的坐标是错的。上限取「目标长度的四分之一，且至少允许 2 个」：
+   * 实测词 1 只多出 **1** 个字符，离上限很远；胡乱匹配通常要跳过一大半。
+   */
+  const maxSkip = Math.max(2, Math.ceil(targetChars.length * 0.25));
+  if (skipped > maxSkip) return null;
+
+  if (keptChars.length !== [...target].length) return null;
   return { chars: keptChars, measurements: keptMeasure };
 }
