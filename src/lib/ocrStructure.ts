@@ -41,7 +41,19 @@ export interface OcrStructureWord {
    * 字符级框。**只有真的拿到时才存在**（见下面 `wordEntries` 里的长注释）。
    * 缺这个字段 = 字符级定位这一步没跑成，而不是"字符框为空"。
    */
-  chars?: { char: string; bbox: [number, number, number, number] }[];
+  chars?: {
+    char: string;
+    bbox: [number, number, number, number];
+    /**
+     * 该字符的识别置信度；`null` = 这一位没有墨迹（空白）或识别多出被跳过。
+     *
+     * 它是判据里「位置异常 **且** 置信度偏低」那道门的输入，
+     * 也是判断那道门到底有没有用的**唯一依据** —— 见下面写出处的注释。
+     */
+    confidence?: number | null;
+  }[];
+  /** 整串逐字符置信度是否齐备；缺一个则为 `false`（`AttachedChars` 同一规则） */
+  charConfidencesComplete?: boolean;
 }
 
 /** 一个词相对**本行基线**的实测几何：定阈值要看的正是这几个数 */
@@ -211,7 +223,7 @@ export function buildOcrStructure(input: {
        */
       ...(getAttachedChars(word)?.chars?.length
         ? {
-            chars: getAttachedChars(word)!.chars.map((c) => ({
+            chars: getAttachedChars(word)!.chars.map((c, i) => ({
               char: c.char,
               bbox: [round(c.x0), round(c.y0), round(c.x1), round(c.y1)] as [
                 number,
@@ -219,7 +231,25 @@ export function buildOcrStructure(input: {
                 number,
                 number,
               ],
+              /**
+               * ⚠️ 每字符置信度必须能看见，否则关于它的每一次讨论都是猜测。
+               *
+               * 这是被一个真实失败逼出来的字段：上下标判据里那道「位置异常
+               * **且** 识别置信度偏低」的门，在用户文档上没挡住 `=`、`+`、`∼`
+               * —— 而这些字符**天生**就是识别器没把握的字形。当时要判断是
+               * 「系数不对」还是「这个维度根本没用」，**手里一个真实数值都没有**，
+               * 只能拿构造数据论证，结果用假设验证了假设。
+               *
+               * 口径（见 `CtcDecoded.confidences`）：该字符全部触发时间步上
+               * argmax 概率的平均值，与 `measurements` 逐位对齐。
+               * 空白位与「识别多出被跳过」的位是 `null`。
+               */
+              confidence: Number.isFinite(getAttachedChars(word)!.confidences?.[i])
+                ? Math.round((getAttachedChars(word)!.confidences![i] as number) * 1e4) / 1e4
+                : null,
             })),
+            // 整串置信度是否齐备，一眼可见：缺一个就不写（与 `AttachedChars` 同一规则）
+            charConfidencesComplete: Boolean(getAttachedChars(word)!.confidences),
           }
         : {}),
     };
