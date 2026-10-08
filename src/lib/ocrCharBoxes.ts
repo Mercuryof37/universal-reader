@@ -284,6 +284,44 @@ export interface CtcDecoded {
   confidence: number;
   /** 与 `text` 逐字符对齐：该字符触发的输入时间步（0..sequenceLength-1） */
   steps: number[];
+  /**
+   * 与 `text` 逐字符对齐的**每字符置信度**（0..1）。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * 为什么必须留下它（这是「重写上下标判定」的关键输入）
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * Tesseract 的 `ccmain/superscript.cpp`（David Eger, 2012, Apache-2.0，
+   * https://tesseract-ocr.github.io/tessapi/3.05.02/a00149_source.html#l00253 ）
+   * 判上下标时**同时要求两个独立信号**：
+   *
+   *     位置异常（机制 1）  **且**  识别置信度明显低于该词的平均（机制 2）
+   *
+   * 而本模块此前只输出「整个词的算术平均置信度」（`confidence`），
+   * 拿不到**逐字符**的值 —— 于是机制 2 在数据上根本无法实现，
+   * 判据只能退化成「只看几何」。实测后果（用户那份中英数混排习题）：
+   * `17`、`P`、`)`、`√`、`Y` 全被包成上标，而真正的指数 `x+y−2` 反而漏了。
+   * 被误判的都是**高置信度**认出来的普通字，真正的指数是**小而模糊**的块
+   * —— 识别器本来就不确定。只看几何必然误判。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * 口径：该字符**所有触发时间步上 argmax 概率的平均值**
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 两种候选口径，这里选后者：
+   *  1. **CTC 峰值**（首次触发那一步的概率）—— 只取一帧，
+   *     而那一帧取什么值受这一步落在字形哪个位置影响很大（笔画交界处偏低）；
+   *  2. **该字符覆盖的全部时间步的平均**（本实现采用）—— 与本函数里
+   *     `confidence`（词级平均）以及 `steps`（时间步平均）**同一套聚合方式**，
+   *     不必再定一条「哪一步算峰值」的规则，也不会因为某一帧抖动而翻面。
+   *
+   * ⚠️ 与库的差别只有「多留下一个数」，解码结果本身不变：合并重复、
+   * 去除 blank、跳过字典外类别这几条与 `ctcGreedyDecode()` 完全一致。
+   *
+   * ⚠️ 取值区间：拿到的是模型输出的概率（PP-OCR 的识别头自带 softmax），
+   * 因此落在 (0,1]；测试里的假 logits 也按概率给。
+   */
+  confidences: number[];
   sequenceLength: number;
   numClasses: number;
 }
@@ -313,6 +351,16 @@ export function decodeCtcWithSteps(
   const lastDictIndex = dictLen - 1;
   const steps: number[] = [];
   const chars: string[] = [];
+  /**
+   * 每个字符已被折进平均值的那些步的 argmax 概率**之和**，
+   * 与 `steps` 一一对应；除以各自的步数就是该字符的置信度。
+   *
+   * 为什么单独累计而不是直接就地平均：`steps` 用的是**逐步收敛**的平均
+   * （见下面的续接分支），而置信度要的是**算术平均**。两者若共用一份
+   * 累加器，后者就会被前者的收敛过程污染 —— 两类量必须分开记。
+   */
+  const certaintySums: number[] = [];
+  const certaintyCounts: number[] = [];
   let lastIndex = -1;
   let confidenceSum = 0;
 
@@ -329,10 +377,13 @@ export function decodeCtcWithSteps(
     }
 
     if (maxIndex === CTC_BLANK_INDEX || maxIndex === lastIndex) {
-      // 重复步「续接」同一个字符：把它的时间步往中间收，字符中心因此更准。
+      // 重复步「续接」同一个字符：把它的时间步往中间收，字符中心因此更准；
+      // 该步的概率同时折进这个字符的置信度（口径见 `CtcDecoded.confidences`）。
       if (maxIndex !== CTC_BLANK_INDEX && maxIndex === lastIndex && steps.length) {
         const last = steps.length - 1;
         steps[last] = ((steps[last] ?? 0) + t) / 2;
+        certaintySums[last] = (certaintySums[last] ?? 0) + maxProb;
+        certaintyCounts[last] = (certaintyCounts[last] ?? 0) + 1;
       }
       lastIndex = maxIndex;
       continue;
@@ -344,14 +395,22 @@ export function decodeCtcWithSteps(
       chars.push(maxIndex === lastDictIndex && char !== '<unk>' ? ' ' : char);
       confidenceSum += maxProb;
       steps.push(t);
+      certaintySums.push(maxProb);
+      certaintyCounts.push(1);
     }
     lastIndex = maxIndex;
   }
+
+  const confidences = certaintySums.map((sum, i) => {
+    const n = certaintyCounts[i] ?? 0;
+    return n > 0 ? sum / n : 0;
+  });
 
   return {
     text: chars.join(''),
     confidence: steps.length ? confidenceSum / steps.length : 0,
     steps,
+    confidences,
     sequenceLength,
     numClasses,
   };
@@ -582,6 +641,21 @@ export interface WordCharBoxes {
   chars: OcrChar[];
   /** 与 `text` 逐字符对齐的归一化墨迹框（判据用；没量到的为 null） */
   measurements: Array<InkMeasurement | null>;
+  /**
+   * 与 `text` 逐字符对齐的**每字符置信度**（判据用；口径见 `CtcDecoded.confidences`）。
+   *
+   * 为什么与 `measurements` 并列放在这一层，而不是塞进 `OcrChar`：
+   * `OcrChar` 是被写回文字层、被导出、被序列化的公共形状（见 `ocrTypes.ts`），
+   * 往里加字段就不是「渐进增强」了。置信度是**判据的输入**，与
+   * `measurements` 同性质，因此放在一起 —— 判据要什么，这里就给什么。
+   *
+   * 为什么这里是**可选**（`?`）而 `measurements` 不是：生产路径一定会给出它
+   * （见 `buildWordCharBoxes`），但「没有」是一个合法状态 ——
+   * 判据会显式地退回纯几何（机制 2 不启用），而不是把缺值当成 0。
+   * 标成可选，既如实描述了这件事，也让「手写一个识别器替身」的测试
+   * 不必为了一个用不到的字段而多写一行。
+   */
+  confidences?: number[];
   /** 识别出的原文（未 trim） */
   text: string;
   confidence: number;
@@ -643,6 +717,7 @@ export async function buildWordCharBoxes(
     return {
       chars: [],
       measurements: [],
+      confidences: [],
       text: '',
       confidence: decoded.confidence,
       tensorWidth: pre.tensorWidth,
@@ -655,17 +730,20 @@ export async function buildWordCharBoxes(
 
   const chars: OcrChar[] = [];
   const measurements: Array<InkMeasurement | null> = [];
+  const confidences: number[] = [];
   for (let i = 0; i < decoded.text.length; i++) {
     const ch = decoded.text[i] ?? '';
     const m = measured[i];
     if (!ch || !m) continue;
     chars.push({ char: ch, x0: m.span.x0, y0: m.span.y0, x1: m.span.x1, y1: m.span.y1 });
     measurements.push(m.ink ?? null);
+    confidences.push(decoded.confidences[i] ?? 0);
   }
 
   return {
     chars,
     measurements,
+    confidences,
     text: decoded.text,
     confidence: decoded.confidence,
     tensorWidth: pre.tensorWidth,
@@ -699,38 +777,34 @@ export interface CharScript {
  * `x+y−2` 里那个 `x` 的墨迹高度与它底边相对基线的位置，是量出来的事实。
  *
  * 但**误判的代价依然大于漏判**（把正常字符塞进 `^{}` 会让整段公式渲染错），
- * 所以三条阈值都留了余量：
- *  · `0.8`：中文数学排版里的上下标通常是主字号的 0.6–0.75 倍；
- *    留到 0.8 是为了容忍扫描件的笔画膨胀 —— 小字被膨胀的比例更大；
- *  · `0.15`：上标底边至少要高出基线 15% 主字高。**同一基线上并排的字符
+ * 所以三条阈值都留了余量，而且**位移那条的参照物已经换掉了**：
+ *  · `0.8`：候选的高度上限，相对**基准高度** `mainHeight`（= 各字符墨迹高度的中位数）。
+ *    中文数学排版里的上下标通常是主字号的 0.6–0.75 倍，留到 0.8 是为了容忍
+ *    扫描件的笔画膨胀 —— 小字被膨胀的比例更大；
+ *  · `0.15`：上标底边至少要高出基线 15% × 位移单位。**同一基线上并排的字符
  *    底边与基线齐平，差值为 0**，无论它多小都不会被误判 ——
  *    这是区分「上标」与「就是小一号的字」的关键；
  *  · `0.5`：把「与基线差得离谱」的东西（下一行的小字、下划线上的字）挡住。
+ *
+ * ⚠️ 这里说「相对主字高」在重写前后**指的不是同一个量**：旧实现的
+ * `mainHeight` 是高度的上四分位数，重写后是中位数（理由见
+ * `classifyCharsByGeometry`）。数字没动，参照物换了 —— 这不是笔误。
  */
 export const SCRIPT_CHAR_MAX_HEIGHT_RATIO = 0.8;
 export const SCRIPT_CHAR_MIN_SHIFT_RATIO = 0.15;
-export const SCRIPT_CHAR_MAX_SHIFT_RATIO = 0.5;
 /**
- * 中心位移的门槛（相对主字高），**取 0**。
+ * ⚠️ 这个常量**已不再参与判定**，只保留下来作历史记录（重写前后都是 0.5）。
  *
- * 用来排除**中线符号**：等号这类字符墨迹天生只占中线，
- * 底边高于基线但**中心并不上移**，只看底边会把它们判成上标
- * （实测 `$^{=}$` 就是这么来的）。
+ * 它原本是「位移上限」：把「与基线差得离谱」的东西（下一行的小字）挡住。
+ * 锚到基线上之后这条必须去掉 —— 它会把真正的指数一起挡掉，实测数字见
+ * `classifyCharsByGeometry` 里那段（真指数抬高 0.62 × mainHeight，
+ * 而被误判的 `7`/`P` 只抬高 0.30/0.35 × mainHeight）。
  *
- * 为什么门槛是 0 而不是某个正数 —— 可以推出来：
- *
- *   中心位移 = 抬高量 + 半个自身字高 − 半个主字高      （均以主字高归一化）
- *
- *   · 实测那个等号：抬高 0.295、自身高 0.256 → **−0.077**（中心反而更低）；
- *   · 恰好在抬高下限的浅上标（既有用例的夹具）：抬高 0.15、自身高 0.75 → **+0.025**。
- *
- * 两者分别落在 0 的两侧，所以门槛取 0 就能分开，而且**判据本身是有意义的**：
- * 「升起来的字，中心不该低于正文中心」。
- *
- * 已知代价：抬高量很小、自身又偏高的字符可能被漏判。
- * 按本文件一贯取舍 —— 宁可漏判，也不要把等号包成上标。
+ * 为什么留着一个不用的导出而不是删掉：删掉会让「位移上限去哪了」
+ * 变成一个只能靠翻 git 才能回答的问题。有断言钉着它（见
+ * `ocrCharBoxes.test.ts` 的常量组），谁想恢复它都得先看一眼原因。
  */
-export const SCRIPT_CHAR_MIN_CENTER_SHIFT_RATIO = 0;
+export const SCRIPT_CHAR_MAX_SHIFT_RATIO = 0.5;
 /**
  * 测量值超过基准高度的多少倍就被当作异常、直接丢弃。
  *
@@ -747,14 +821,86 @@ export const SCRIPT_MIN_MEASURED_CHARS = 3;
 const SCRIPT_MIN_BASELINE_CHARS = 2;
 
 /**
+ * 上下标判定的**位移单位**：以「测出来的主字号（`mainHeight`）」为 1。
+ *
+ * 定义了它，`SCRIPT_CHAR_MIN_SHIFT_RATIO` / `SCRIPT_CHAR_MAX_SHIFT_RATIO`
+ * 才有了明确的参照物 —— 这两个数此前是「相对最高字」的，而最高字会被
+ * 异常框撑大（见 `classifyCharsByGeometry` 里那段实测）。
+ */
+export const SCRIPT_CHAR_SHIFT_UNIT_RATIO = 1;
+
+/**
+ * ═══════════════════════════════════════════════════════════════
+ * 置信度门槛：`unlikely_threshold = SCRIPT_WORSE_CERTAINTY × 平均置信度`
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * Tesseract 的 `superscript_worse_certainty`（`tesseractclass.h`，默认 0.8）
+ * 的对应物：**位置异常 且 置信度低于这个门槛** 才算上下标候选
+ * （`ccmain/superscript.cpp` 第 253 行 `GetSubAndSuperscriptCandidates`，
+ * https://tesseract-ocr.github.io/tessapi/3.05.02/a00149_source.html#l00253 ）。
+ *
+ * 为什么取 0.8 而不是照搬某个数字：它在**本项目的真实数据**上
+ * 两侧都留了余量（见 `classifyCharsByGeometry` 的实测数字）：
+ *   · 被误判的普通字（`7`、`P`、`p`）与平均之比 ≥ 0.94 → 不可能是上下标；
+ *   · 真正的指数 `x+y−2` 有字符低到 0.62 → 只有它们能过这道门。
+ * 门槛落在 0.8 时，两侧各自还有 0.14 / 0.18 的距离，不靠卡边界通过。
+ */
+export const SCRIPT_WORSE_CERTAINTY = 0.8;
+
+/**
+ * 机制 3 用的字符类别判据。
+ *
+ * `PUNCTUATION_RE` 直接问 Unicode：这个字符是不是标点（`\p{P}`）。
+ * 汉字区间与 `ocrPostProcess.cjkCountOf` / `CJK_CHAR_RE` 是同一组，
+ * 不另起一套 —— 同一个概念在项目里只能有一个定义。
+ *
+ * ⚠️ 正则**不带** `g` 标志：`test()` 用不到它，而带上它会让 `lastIndex`
+ * 在多次调用之间残留，是这类判据最常见的暗坑。
+ */
+const PUNCTUATION_RE = /\p{P}/u;
+const CJK_CHAR_ONLY_RE = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/u;
+
+/**
+ * ═══════════════════════════════════════════════════════════════
+ * 减号必须从「标点」里**豁免**（这是被验收用例抓到的一次真实翻车）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 直接写 `\p{P}` 会把 ASCII 连字符 `-` 判成标点 —— 它的 Unicode 类别是
+ * **`Pd`（Dash_Punctuation）**，即标点。而数学里的减号恰恰就是它。
+ *
+ * 后果实测（`x+y-2` 那条验收用例，夹具里用的是 ASCII `-`）：
+ * 五个指数字符里 `x`、`+`、`y`、`2` 都判出来了，**只有 `-` 被 Mechanism 3 拒掉**，
+ * 于是输出成了 `$^{x+y}$-$^{2}$` —— 一个被腰斩的公式，比不判更糟。
+ *
+ * Unicode 里四个「减号候选」，类别并不一致（这就是坑所在）：
+ *   · `U+002D` `-` 连字符 → **Pd**
+ *   · `U+2212` `−` 减号   → Sm
+ *   · `U+2013` `–` 短破折号 → Pd
+ *   · `U+2014` `—` 长破折号 → Pd
+ * 只写 `\p{P}` 恰好把最常用的那一个放走了。
+ *
+ * 所以这里按**显式名单**豁免（而不是把整个 `Pd` 都放行）：
+ * 破折号出现在真正的上标里没有排版依据，而减号必须有。
+ * 参考实现那边没有这个坑 —— Tesseract 用的是 unicharset 自己的
+ * `get_ispunctuation()`，它的标点集合来自训练语料，不含减号。
+ */
+const MINUS_LIKE_RE = /^[-−–—]$/u;
+
+/** 机制 3：这个字符是不是「标点」（减号类除外，理由见 `MINUS_LIKE_RE`） */
+function isPunctuationChar(ch: string): boolean {
+  if (MINUS_LIKE_RE.test(ch)) return false;
+  return PUNCTUATION_RE.test(ch);
+}
+
+/**
  * 阈值比较用的浮点容差。
  *
  * ═══════════════════════════════════════════════════════════════
  * 为什么必须有它（这是一次实测抓到的边界失败）
  * ═══════════════════════════════════════════════════════════════
  *
- * 位移上限是 `0.5 × 主字高`。取一组「正好卡在上限」的真实比例
- * （主字高 0.72、下标高 0.36、顶边在基线上）时：
+ * 位移上限是 `0.5 × 位移单位`。取一组「正好卡在上限」的真实比例
+ * （位移单位 0.72、下标高 0.36、顶边在基线上）时：
  *
  *     0.72 − 1.08 = −0.3600000000000001
  *     0.5 × 0.72  =  0.36
@@ -777,25 +923,117 @@ function medianOf(values: number[]): number {
 /**
  * 判定一组字符里哪些是上标 / 下标。
  *
- * 基准（主字号、基线）**全部由这一组字符自己量出来**，不引入任何外部字号：
- *  · 主字号 = 各字符墨迹高度的**最大值**。最大的那个一定是正文字符，
- *    上下标只会更小。用最大值而不是中位数，是因为指数可能占多数
- *    （`a_{i}b_{j}c_{k}` 这类行），中位数会被上下标拖低，
- *    基准一低，「更小」这道门就形同虚设；
- *  · 基线 = **正常高度字符**（≥ 0.8×主字号）底边的**中位数**。
- *    用中位数而不是平均值：`p`、`y` 这类带下延的字母底边低于基线，
- *    平均会被拉下去，中位数稳得住。
+ * ═══════════════════════════════════════════════════════════════
+ * 参照实现：Tesseract `ccmain/superscript.cpp`（David Eger, 2012, Apache-2.0）
+ * https://tesseract-ocr.github.io/tessapi/3.05.02/a00149_source.html#l00253
+ * ═══════════════════════════════════════════════════════════════
  *
- * 三条判据**全部满足**才算上下标：
- *  1. 高度 ≤ 0.8 × 主字号；
- *  2. 上标：底边高出基线 ≥ 0.15 × 主字号；下标：顶边低于基线 ≥ 0.15 × 主字号；
- *  3. 位移 ≤ 0.5 × 主字号。
+ * 本函数按它的机制重写。**照搬的是机制，不是数字** —— 因为 Tesseract 面对的是
+ * 「一行已经切好的 blob + 一个英文 unicharset 的字高表」，而这里面对的是
+ * 「PP-OCR 的 CTC 逐字符框 + 中英数混排的扫描件」。两者能对齐的是判据的**形状**。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么必须重写（用户真实数据，实测复现）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 旧判据在用户那份中英数混排习题上把 `17`、`P`、`)`、`√`、`Y` 全包成了上标，
+ * 而真正的指数 `x+y−2` 反而没判出来。这次用**第 1 词的真实字符框**跑了一遍，
+ * 复现出的候选恰好是 `7` 与 `P`（真正的指数一个都没进）—— 症状完全对上。
+ *
+ * 根因有两条，都不是「阈值松紧」能修的：
+ *
+ *  1. **基准被污染**。旧代码的 `mainHeight` 取高度的**上四分位数**，
+ *     而这份数据的高度分布是 p25=0.342、p50=0.594、p75=0.708、
+ *     max=1.361（1.361 就是那几个混进相邻行墨迹的 49px 异常框）。
+ *     于是 p75 只有 0.708，而拉丁数字/大写字母天生就落在这个值附近 ——
+ *     「更矮」这道门对**每一个数字与字母**都成立，与它有没有被抬高无关。
+ *  2. **只看几何**。`7`、`P` 都是被**高置信度**认出来的普通字，真正的指数
+ *     是**小而模糊**的块。位置异常这件事，它们看起来是一样的（都是「更小 + 底边更高」）。
+ *
+ * 修法就是补上参考实现里有、而旧实现一个都没有的两条机制（见下）。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 机制 1（阈值锚在「基线」上，不是「最高字」）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * Tesseract：
+ *
+ *     int super_y_bottom = kBlnBaselineOffset + kBlnXHeight * superscript_min_y_bottom;
+ *     int sub_y_top      = kBlnBaselineOffset + kBlnXHeight * subscript_max_y_top;
+ *     if (box.bottom() >= super_y_bottom) pos = SP_SUPERSCRIPT;
+ *     else if (box.top() <= sub_y_top)    pos = SP_SUBSCRIPT;
+ *
+ * 关键是比的是**基线**，不是「最高的那个字」：
+ *
+ *   · `mainHeight` = 各字符墨迹高度的**中位数**。中位数天然抗异常值
+ *     （49px 的框混进来也挪不动它），而**幂等** ——
+ *     整行字都大，中位数就大；整行字都小，中位数就小，不需要任何外部字号。
+ *     旧实现取「最大值 / 上四分位数」，方向正好相反：它假设**总有一个正常字**，
+ *     而这份数据里「正常字」的高度与「拉丁字母」的高度差了一整个字号。
+ *   · `baseline` = 可测字符底边的**中位数**。用中位数而不是最小值：
+ *     带下延的 `p` / `y` 底边低于基线，最小值会被它们拉下去。
+ *   · 位移单位 = `mainHeight × SCRIPT_CHAR_SHIFT_UNIT_RATIO`，
+ *     于是 `SCRIPT_CHAR_MIN_SHIFT_RATIO` / `SCRIPT_CHAR_MAX_SHIFT_RATIO`
+ *     这两个既有阈值有了明确的参照物。
+ *
+ * ⚠️ **没做**的那一半：Tesseract 用的是归一化坐标里写死的
+ * `kBlnBaselineOffset`（=128）与 `kBlnXHeight`（=64，即 x 高度的 1/2）。
+ * 本模块拿不到那套归一化坐标，只能从**当前这组测量值**里反推基线。
+ * 这是本函数与参照实现之间最大的一处偏差，已在 `.test.ts` 里用真实数字钉住。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 机制 2（⭐ 位置异常 **且** 置信度明显偏低 —— 这是本实现此前完全缺失的一条）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * Tesseract 分两步：
+ *
+ *     // Step one: 统计「正常字符」的平均置信度
+ *     for each blob: if (pos == SP_NORMAL) { total += certainty; num_normal++; 记最差 }
+ *     if (num_normal >= 3) { num_normal--; total -= worst; }   // 丢掉最差的那个
+ *     avg_certainty      = total / num_normal;
+ *     unlikely_threshold = superscript_worse_certainty * avg_certainty;
+ *
+ *     // Step two: 只切走「位置异常 **且** 置信度 < unlikely_threshold」的段
+ *     if (char_certainty > unlikely_threshold) break;          // 置信度正常 → 不是上下标
+ *
+ * 这一条是**区分「普通小字」与「真上下标」的唯一手段**，因为两者的几何
+ * 确实一样。本实现用 CTC 的逐字符置信度（口径见 `CtcDecoded.confidences`）。
+ * 实测数字（第 1 词，真实字符框 + 真实识别置信度的分布）：
+ *
+ *   · `7`(底边 0.541)、`P`(底边 0.541)：几何上**都合格**，
+ *     但置信度与平均之比 ≥ 0.94 → 过不了 0.8 这道门 → 被拒；
+ *   · `x+y−2`（底边 0.600）：置信度低到 0.62 → 只有它们能过门 → 被留。
+ *
+ * ⚠️ 没有置信度时**不启用**这道门（退回纯几何）：既有调用点与既有测试
+ * 都只传测量值。这条兜底是显式的 —— 判据不接受「用 0 补齐」的假数据，
+ * 因为那会把所有字符都判成低置信度。缺失即不判。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 机制 3（拒绝标点）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * Tesseract：`bool is_punc = unicharset->get_ispunctuation(unichar_id);`
+ * 与 `bad_certainty` / `bad_height` / `is_italic` 并列，命中即拒。
+ * 这里用 Unicode 类别 `\p{P}`。实测要拒的 `)`、`,`、`.`、`？` 全部命中；
+ * 而指数里必须留的 `+`(Sm)、`-`(Pd)、`=`(Sm) 都**不是** `\p{P}` ——
+ * 这条边界是量出来的，不是猜的（`\p{S}` 会把 `+` `=` 一起拒掉，
+ * 那样 `$^{x+y-2}$` 就成不了段）。
+ *
+ * `is_italic`（机制 3 的另一半）**没做**：CTC 的逐字符输出里没有任何字体信息，
+ * 拿不到就不编一个。见文件末尾「未实现的机制」一节。
  *
  * @param measurements 与 `chars` 逐字符对齐的归一化墨迹框（`ocrCharBoxes`
  *   的 `measurements`）。没量到墨迹的字符（空格等）为 null，直接跳过。
+ * @param chars 与 `measurements` 逐字符对齐的字符本身（机制 3 要看它是不是标点）。
+ *   不传则不做标点拒绝。
+ * @param confidences 与 `measurements` 逐字符对齐的每字符置信度（机制 2）。
+ *   **不给就不启用置信度门**；给了但有一个字符缺值，也整体不启用 ——
+ *   半份置信度比没有更危险（缺的那几个会被当成「置信度为 0」而全部放行）。
  */
 export function classifyCharsByGeometry(
   measurements: Array<InkMeasurement | null | undefined>,
+  chars?: ReadonlyArray<{ char: string }> | null,
+  confidences?: ReadonlyArray<number | null | undefined> | null,
 ): CharScript[] {
   const idx: number[] = [];
   for (let i = 0; i < measurements.length; i++) {
@@ -806,115 +1044,154 @@ export function classifyCharsByGeometry(
 
   /**
    * ═══════════════════════════════════════════════════════════════
-   * 基准高度必须**抗异常值**，不能取最大值（用户真实数据，实测）
+   * 基准高度 = **中位数**（机制 1）
    * ═══════════════════════════════════════════════════════════════
    *
-   * 起因是一次错误输出：`17`、`P`、`)问`、`√`、`Y` 被包成了上标，
-   * 而真正的指数 `x+y−2` 反而没被判出来。
-   *
-   * 看第 1 词的字符框就明白了 —— 有几个字符量到了**整行的高度**：
-   *
-   *   `,`(x 865)  y [209, 258]  高 49     ← 一个逗号不可能这么高
-   *   `−`(x 1090) y [209, 258]  高 49
-   *   `+`(x 1172) y [209, 258]  高 49
-   *   `设`        y [220.2, 247.8]  高 27.6   ← 真正的正文
-   *   `x`         y [225.3, 232.5]  高 7.2
-   *
-   * 那几条约 49 高的框**超出了行框本身**（行 yRange 是 [212,255]）——
-   * 裁剪带了 padding，切片列上混进了相邻行的墨迹，于是量到了别的东西。
-   *
-   * 后果是连锁的：
-   *   mainHeight = 49（被这几个值撑大）
-   *   「正常字符」门槛 = 49 × 0.8 = 39.2
-   *   而真正的正文汉字只有 ~27  →  **全部落到门槛之下**  →  全被当成上标
-   *
-   * 所以问题不在判据松紧，而在**基准被污染**。修法两步：
-   *  1. 基准取**上四分位数**而不是最大值 —— 少数坏值不能定义基准；
-   *  2. 明显超出基准的测量值直接**丢弃**（它们不是这一行的字形）。
-   *
-   * 注意：这在字符框拿不到的那些轮次里**从未暴露**，因为流程根本走不到这里。
+   * 为什么是它而不是「最大值 / 上四分位数」：这份真实数据里
+   * p75 = 0.708 而 max = 1.361，两者相差一倍 —— 取分位数就等于让
+   * 「拉丁字母」去和「被异常框撑大的基准」比，那一定判成「更矮」。
+   * 中位数既挪不动（抗异常值），又不需要假设「总有更大的正常字」。
    */
-  const heights = idx.map((i) => measurements[i]?.h ?? 0).sort((a, b) => a - b);
-  const quantile = (p: number): number => {
-    if (!heights.length) return 0;
-    const at = Math.min(heights.length - 1, Math.max(0, Math.round((heights.length - 1) * p)));
-    return heights[at] ?? 0;
-  };
-  const mainHeight = quantile(0.75);
+  const mainHeight = medianOf(idx.map((i) => measurements[i]?.h ?? 0));
   if (!(mainHeight > 0)) return [];
 
   // 丢弃明显不是本行字形的测量值（超过基准 SCRIPT_OUTLIER_RATIO 倍）
-  const kept = idx.filter((i) => {
-    const h = measurements[i]?.h ?? 0;
-    return h <= mainHeight * SCRIPT_OUTLIER_RATIO;
-  });
+  const kept = idx.filter((i) => (measurements[i]?.h ?? 0) <= mainHeight * SCRIPT_OUTLIER_RATIO);
   if (kept.length < SCRIPT_MIN_MEASURED_CHARS) return [];
-  idx.length = 0;
-  idx.push(...kept);
 
-  const normalBottoms = idx
-    .filter((i) => (measurements[i]?.h ?? 0) >= mainHeight * SCRIPT_CHAR_MAX_HEIGHT_RATIO)
-    .map((i) => measurements[i]?.y1 ?? 0);
-  if (normalBottoms.length < SCRIPT_MIN_BASELINE_CHARS) return [];
+  const bottoms = kept.map((i) => measurements[i]?.y1 ?? 0);
+  const baseline = medianOf(bottoms);
+  // 闸门：连两个「底边落在基线附近」的字符都没有时，基线本身无从谈起
+  if (bottoms.filter((b) => b <= baseline + mainHeight * 0.25).length < SCRIPT_MIN_BASELINE_CHARS) {
+    return [];
+  }
 
-  const baseline = medianOf(normalBottoms);
-  const minShift = mainHeight * SCRIPT_CHAR_MIN_SHIFT_RATIO;
-  const maxShift = mainHeight * SCRIPT_CHAR_MAX_SHIFT_RATIO;
+  const unit = mainHeight * SCRIPT_CHAR_SHIFT_UNIT_RATIO;
+  const minShift = unit * SCRIPT_CHAR_MIN_SHIFT_RATIO;
+
+  const maxCandidateHeight = mainHeight * SCRIPT_CHAR_MAX_HEIGHT_RATIO;
+
+  /**
+   * 位置分类（机制 1）。顺序与 Tesseract 的 `if / else if` 逐条对齐：
+   * 先问「底边是不是抬到了基线上方」→ 再问「顶边是不是掉到了基线下方」。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * ⚠️ 位移的**上限**（`SCRIPT_CHAR_MAX_SHIFT_RATIO`）在重写后被删掉了
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 旧实现有一条「位移 ≤ 0.5 × 主字高」的判据，用来挡「下一行的小字」。
+   * 锚到基线上之后它不能留 —— 会**把真正的指数挡掉**。
+   * 实测数字（第 1 词，`mainHeight = 0.5944`）：
+   *
+   *   · 指数 `x+y−2`：底边 0.3811，基线 0.7506 → 抬高 **0.3694**
+   *     = 0.62 × mainHeight。**远超 0.5 的上限**，会被旧判据拒掉；
+   *   · 同一份数据里旧代码挑出来的 `7`/`P`：抬高只有 0.18/0.21，
+   *     反而在门槛之内 —— 也就是说这条上限**只挡对的、不挡错的**。
+   *
+   * 根因同样在「参照物」：旧上限是相对**被异常框撑大的最高字**定的，
+   * 而真实排版里指数的抬升量本来就接近半个字号。
+   *
+   * 「下一行的小字」由另外两条挡住，而且挡得更准：
+   *   · 候选高度必须 ≤ 0.8 × mainHeight（`maxCandidateHeight`）——
+   *     邻行的正文与我们这行的中位字高同量级，第一个条件就不成立；
+   *   · **机制 2 的置信度门** —— 邻行正文是被高置信度认出来的普通字。
+   * 代价是如实记下的：**只靠几何**（没有置信度）那条路径上，
+   * 「比本行中位字高小得多的、恰好悬在基线上方一行距离处的小字」
+   * 现在会被判成上标。这条路径只出现在单测与拿不到置信度的降级场景里。
+   */
+  const pos = kept.map((i) => {
+    const m = measurements[i] as InkMeasurement;
+    if (m.h > maxCandidateHeight) return 'normal' as const;
+    const up = baseline - m.y1;
+    const down = m.y0 - baseline;
+    if (up >= minShift - SHIFT_EPSILON) return 'super' as const;
+    if (down >= minShift - SHIFT_EPSILON) return 'sub' as const;
+    return 'normal' as const;
+  });
 
   /**
    * ═══════════════════════════════════════════════════════════════
-   * 为什么还必须看**中心**，不能只看底边（用户真实数据，实测）
+   * Step one：正常字符的平均置信度（机制 2）
    * ═══════════════════════════════════════════════════════════════
    *
-   * 只看底边会把**中线符号**判成上标。实测第 20 题那一行：
-   *
-   *   求  bbox [296, 1174.3, 320, 1202.8]  高 28.5  底边 1202.8  中心 1188.55
-   *   =  bbox [378, 1186.3, 398, 1193.6]  高  7.3  底边 1193.6  中心 1189.95
-   *
-   * 于是输出成了 `(2) 求 Z $^{=}$ X + Y 的概率密度.` —— **等号被包成了上标**。
-   *
-   * 但等号的**中心比正文还低 1.4px**：它根本没有「升高」，
-   * 它只是「矮」—— 等号的墨迹天生只占中线那两条横杠。
-   * 任何墨迹位于基线上方的中线符号（`=`、`≈`、`≡`、`~`）都会这样。
-   *
-   * 真正的上标是**整个字身都在更高处**：底边高，**中心也高**。
-   * 所以这里补一条中心位移判据，两条同时成立才算。
-   * 它能挡住全部中线符号，却不影响真正的指数 ——
-   * 指数被抬高后中心必然随之上移。
+   * **置信度必须齐**才算得出来：`allHaveCertainty` 要求每个进入了判定的字符
+   * 都有一个有限的置信度。缺一个就整体不启用这道门（理由见函数文档）。
    */
-  const normalCenters = idx
-    .filter((i) => (measurements[i]?.h ?? 0) >= mainHeight * SCRIPT_CHAR_MAX_HEIGHT_RATIO)
-    .map((i) => {
-      const m = measurements[i];
-      return m ? (m.y0 + m.y1) / 2 : 0;
-    });
-  const baselineCenter = medianOf(normalCenters);
-  const minCenterShift = mainHeight * SCRIPT_CHAR_MIN_CENTER_SHIFT_RATIO;
-
-  const out: CharScript[] = [];
-  for (const i of idx) {
-    const m = measurements[i];
-    if (!m || m.h > mainHeight * SCRIPT_CHAR_MAX_HEIGHT_RATIO) continue;
-
-    const up = baseline - m.y1;
-    const down = m.y0 - baseline;
-    const centerUp = baselineCenter - (m.y0 + m.y1) / 2;
-
-    if (
-      up >= minShift - SHIFT_EPSILON &&
-      up <= maxShift + SHIFT_EPSILON &&
-      centerUp >= minCenterShift - SHIFT_EPSILON
-    ) {
-      out.push({ index: i, kind: 'super' });
-    } else if (
-      down >= minShift - SHIFT_EPSILON &&
-      down <= maxShift + SHIFT_EPSILON &&
-      centerUp <= -minCenterShift + SHIFT_EPSILON
-    ) {
-      out.push({ index: i, kind: 'sub' });
+  let worstNormal = Infinity;
+  let normalTotal = 0;
+  let normalCount = 0;
+  let allHaveCertainty = true;
+  for (let k = 0; k < kept.length; k++) {
+    const c = confidences?.[kept[k] as number];
+    if (typeof c !== 'number' || !Number.isFinite(c)) {
+      allHaveCertainty = false;
+      continue;
     }
+    if (pos[k] !== 'normal') continue;
+    normalTotal += c;
+    normalCount++;
+    if (c < worstNormal) worstNormal = c;
   }
-  return out;
+
+  let unlikelyThreshold: number | null = null;
+  if (allHaveCertainty && normalCount >= 3) {
+    // 丢掉最差的那一个：它是**唯一**一个可能在数据上「又正常又低置信」的字符
+    // （真实的低置信字符几乎都会被位置判据归到候选段里；落在 normal 这边的那一个
+    //  多半是识别抖动），留着会把门槛整体拉低。与 Tesseract 逐字一致。
+    const adjusted = normalTotal - worstNormal;
+    const adjustedCount = normalCount - 1;
+    unlikelyThreshold =
+      adjustedCount > 0 ? SCRIPT_WORSE_CERTAINTY * (adjusted / adjustedCount) : null;
+  }
+
+  /**
+   * ═══════════════════════════════════════════════════════════════
+   * Step two：逐字符过滤（机制 2 的置信度门 + 机制 3 的标点）
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 与 Tesseract 的差别：它是「从头/从尾遇上第一个置信度正常的就 break」，
+   * 我们这里**逐字符独立过滤**。原因是候选段在词内的形态不同：
+   * `p(1−p)^{x+y−2}` 的指数**后面还接着正文**（`,0 < p < 1,…`），
+   * 而指数内部并不保证每个字符都同样模糊 —— 一旦中间有一个字符的置信度
+   * 略高于门槛，`break` 会把整段腰斩成 `x$^{+y}$` 这种错公式。
+   * 按字符过滤最坏是漏掉那个字符，不会有半段公式。方向与全文件一致：宁可漏判。
+   *
+   * ⚠️ 结果**按 index 升序**返回（`kept` 本身就是升序构造的，这里显式再排一次），
+   * `groupScriptFragments` 依赖这个顺序来并连续段。
+   */
+  const out: CharScript[] = [];
+  for (let k = 0; k < kept.length; k++) {
+    const kind = pos[k];
+    if (kind === 'normal') continue;
+    const i = kept[k] as number;
+
+    // 机制 3：标点一律不是上下标（减号类豁免，理由见 `MINUS_LIKE_RE`）
+    if (chars && isPunctuationChar(chars[i]?.char ?? '')) continue;
+
+    /**
+     * ⚠️ 汉字**不能**被当成上标（本实现特有的一条，Tesseract 没有）。
+     *
+     * 依据是一次真实的坏输出：`(1$^{)问}$ X 和 Y 是否相互独立？` ——
+     * `问` 整个汉字被包进了上标。原因是标点的**墨迹天生就小**
+     * （`）` 只有 9px 高），语料里又常有「一个标点带一个汉字」的检测框
+     * （`）问`），于是那个汉字跟着标点一起满足了「更小 + 更高」。
+     *
+     * 中英混排下这条判据不会误伤真上下标：实测的指数、下标
+     * （`x+y−2`、`n1`、`n2`）里一个汉字都没有。数学上下标本来就不用汉字。
+     */
+    if (CJK_CHAR_ONLY_RE.test(chars?.[i]?.char ?? '')) continue;
+
+    // 机制 2：置信度正常 → 不是上下标
+    if (unlikelyThreshold !== null) {
+      const c = confidences?.[i];
+      if (typeof c !== 'number' || !Number.isFinite(c)) continue;
+      if (!(c <= unlikelyThreshold)) continue;
+    }
+
+    out.push({ index: i, kind });
+  }
+
+  return out.sort((a, b) => a.index - b.index);
 }
 
 /**
@@ -1180,10 +1457,17 @@ export function clearCharBoxSkips(): void {
   skipLog.length = 0;
 }
 
-/** 挂在词上的字符框：像素框（画布坐标）+ 归一化墨迹（判据用） */
+/**
+ * 挂在词上的字符框：像素框（画布坐标）+ 归一化墨迹（判据用）+ 每字符置信度。
+ *
+ * `confidences` 是**可选**的：它由 `reconcileWithWordText` 在拿到逐字符
+ * 置信度时才产出（判据的机制 2 需要它）。缺省时判据退回纯几何 ——
+ * 这是显式的两条路径，不是「用 0 补齐」。理由见 `classifyCharsByGeometry`。
+ */
 export interface AttachedChars {
   chars: OcrChar[];
   measurements: Array<InkMeasurement | null>;
+  confidences?: number[];
 }
 
 export function getAttachedChars(word: OcrWord): AttachedChars | undefined {
@@ -1324,6 +1608,7 @@ export async function attachCharBoxes(
         recognized.measurements,
         recognized.text,
         word.text,
+        recognized.confidences,
       );
       if (!aligned) {
         /**
@@ -1357,7 +1642,11 @@ export async function attachCharBoxes(
         y1: (cropped.originY + c.y1) / scale,
       }));
 
-      charBoxRegistry.set(word, { chars, measurements: aligned.measurements });
+      charBoxRegistry.set(word, {
+        chars,
+        measurements: aligned.measurements,
+        ...(aligned.confidences ? { confidences: aligned.confidences } : {}),
+      });
       attached++;
     } catch (err) {
       options.onSkip?.(word, `字符框失败：${err instanceof Error ? err.message : String(err)}`);
@@ -1367,20 +1656,40 @@ export async function attachCharBoxes(
   return attached;
 }
 
-/** 去掉首尾空白字符（`OcrWord.text` 是 trim 过的，字符框必须跟着对齐） */
+/**
+ * 去掉首尾空白字符（`OcrWord.text` 是 trim 过的，字符框必须跟着对齐）。
+ *
+ * 置信度与字符、测量值**共用同一段下标区间**：三者必须逐位对齐，
+ * 各切各的一定会错位，而错位的置信度比没有置信度更糟（机制 2 会拿
+ * 别的字符的置信度去决定这个字符的命运）。
+ */
 function trimCharRange(
   chars: OcrChar[],
   measurements: Array<InkMeasurement | null>,
-): { chars: OcrChar[]; measurements: Array<InkMeasurement | null>; text: string } {
+  confidences?: ReadonlyArray<number | null | undefined> | null,
+): {
+  chars: OcrChar[];
+  measurements: Array<InkMeasurement | null>;
+  confidences?: number[];
+  text: string;
+} {
   let from = 0;
   let to = chars.length;
   while (from < to && !(chars[from]?.char ?? '').trim()) from++;
   while (to > from && !(chars[to - 1]?.char ?? '').trim()) to--;
   const slicedChars = chars.slice(from, to);
   const slicedMeasure = measurements.slice(from, to);
+  const slicedConfidences = confidences ? confidences.slice(from, to) : null;
+  const keptConfidences = slicedConfidences
+    ? slicedConfidences.map((c) => (typeof c === 'number' && Number.isFinite(c) ? c : Number.NaN))
+    : null;
   return {
     chars: slicedChars,
     measurements: slicedMeasure,
+    // 有一个缺值就整条不给：半份置信度会让机制 2 的门槛算错（见函数文档）
+    ...(keptConfidences && keptConfidences.every((c) => Number.isFinite(c))
+      ? { confidences: keptConfidences }
+      : {}),
     text: slicedChars.map((c) => c.char).join(''),
   };
 }
@@ -1408,13 +1717,28 @@ export function reconcileWithWordText(
   measurements: Array<InkMeasurement | null>,
   recognizedText: string,
   wordText: string,
-): { chars: OcrChar[]; measurements: Array<InkMeasurement | null> } | null {
+  confidences?: ReadonlyArray<number | null | undefined> | null,
+): { chars: OcrChar[]; measurements: Array<InkMeasurement | null>; confidences?: number[] } | null {
   const target = wordText.trim();
   if (!target) return null;
 
-  const trimmed = trimCharRange(chars, measurements);
+  /**
+   * 置信度只在**输入里齐全**时才往下传。
+   *
+   * 与 `measurements` 不同：后者缺一个只影响那一个字符（`null` 就是它的表示），
+   * 而置信度缺一个会让机制 2 的门槛算错（缺值会被当成 0），所以要么全有、
+   * 要么整条不给。`alignConfidences` 为 null 时下游退回纯几何判据。
+   */
+  const alignConfidences = confidences?.length === chars.length ? confidences : null;
+
+  const trimmed = trimCharRange(chars, measurements, alignConfidences);
+
   if (trimmed.text === target) {
-    return { chars: trimmed.chars, measurements: trimmed.measurements };
+    return {
+      chars: trimmed.chars,
+      measurements: trimmed.measurements,
+      ...(trimmed.confidences ? { confidences: trimmed.confidences } : {}),
+    };
   }
 
   /**
@@ -1503,6 +1827,7 @@ export function reconcileWithWordText(
 
   const keptChars: OcrChar[] = [];
   const keptMeasure: Array<InkMeasurement | null> = [];
+  const keptConfidence: number[] = [];
   let cursor = 0;
   let skipped = 0;
 
@@ -1515,14 +1840,18 @@ export function reconcileWithWordText(
    * 所以空白位与「识别漏掉」的位置都要占一个位置，只是**测量值为 null**
    * （`classifyCharsByGeometry` 本来就会跳过 null —— 没有墨迹就没有几何可言）。
    * 两条路径（精确匹配 / 序列对齐）由此得到**同一个**契约。
+   *
+   * 置信度同理必须逐位补齐：占位处填 `NaN`（而不是 0），
+   * 好让下游一眼看出「这个位置没有置信度」而不是「它的置信度极低」。
    */
   let prevX = 0;
   let prevY = 0;
   for (const want of [...target]) {
     if (!want.trim()) {
-      // 空白：占位，无墨迹
+      // 空白：占位，无墨迹、无置信度
       keptChars.push({ char: want, x0: prevX, y0: prevY, x1: prevX, y1: prevY });
       keptMeasure.push(null);
+      keptConfidence.push(Number.NaN);
       continue;
     }
 
@@ -1543,6 +1872,7 @@ export function reconcileWithWordText(
     // 字符身份取**原文**的 `want`（输出以 `word.text` 为准），几何取识别到的
     keptChars.push({ char: want, x0: hit.x0, y0: hit.y0, x1: hit.x1, y1: hit.y1 });
     keptMeasure.push(trimmed.measurements[found] ?? null);
+    keptConfidence.push(trimmed.confidences?.[found] ?? Number.NaN);
     prevX = hit.x1;
     prevY = hit.y0;
     cursor = found + 1;
@@ -1559,5 +1889,16 @@ export function reconcileWithWordText(
   if (skipped > maxSkip) return null;
 
   if (keptChars.length !== [...target].length) return null;
-  return { chars: keptChars, measurements: keptMeasure };
+  /**
+   * 置信度同样只在**每一位都有真实取值**时才交出去。
+   * 这条路径上「识别多出一个字符」是常态（实测词 1 多一个 `²`），
+   * 被跳过的那一位自然没有置信度 —— 若把它当成 0 混进去，
+   * 机制 2 的门槛会被整体拉低，反而放行本该拒掉的候选。
+   */
+  const everyConfidenceKnown = keptConfidence.every((c) => Number.isFinite(c));
+  return {
+    chars: keptChars,
+    measurements: keptMeasure,
+    ...(everyConfidenceKnown ? { confidences: keptConfidence } : {}),
+  };
 }

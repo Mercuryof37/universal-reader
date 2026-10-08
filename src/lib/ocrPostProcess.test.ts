@@ -1593,3 +1593,198 @@ describe('字符级上下标：指数与整行同框时，词级几何永远判�
   });
 });
 
+// ═══════════════════════════════════════════════════════════════
+// 真实第 1 词（完整的 53 个字符 + 每字符置信度）走**整条链路**
+// ═══════════════════════════════════════════════════════════════
+//
+// 上面那两条验收用例用的是「按比例合成」的字符框（均匀铺开、指数一律抬高
+// 0.14）。这一组改用**用户导出的真实纵向范围**逐个字符给，并且带上
+// 每字符置信度 —— 也就是重写后判据在生产里真正会拿到的输入。
+//
+// ⚠️ 真实误判的原文（用户导出，就是要挡住的东西）：
+//
+//   $^{17}$. 设 随机 变量 … 分 布律 $^{P}$ {X = x ,Y = y} …
+//   (1$^{)问}$ X 和 Y 是否相互独立？
+//   验证随机变量 Z = $^{√}$X2 + $^{Y}$ 的概率密度为
+//
+// 这四条断言就是「不许再出现这些」：可见文字必须逐字保持原样，
+// 一个字都不能被包进 `$^{...}$`。
+
+/** 真实词文本（用户导出，一字不改；指数是 ASCII `-`） */
+const REAL17_TEXT =
+  '17. 设 随机 变量 (X ,Y) 具有 分 布律 P {X = x ,Y = y} = p (1 - p )x+y-2 ,0 < p < 1,x ,y 均为 正';
+
+/** 真实逐字符纵向范围 `[字符, y0, y1]`（画布像素；按出现顺序，与正文逐位对齐） */
+const REAL17_ROWS: Array<[string, number, number]> = [
+  ['1', 219.2, 239.6],
+  ['7', 219.2, 238.6],
+  ['.', 236.6, 240.6],
+  ['设', 220.2, 247.8],
+  ['随', 220.2, 247.8],
+  ['机', 221.3, 246.8],
+  ['变', 220.2, 246.8],
+  ['量', 220.2, 247.8],
+  ['(', 223.3, 245.8],
+  ['X', 223.3, 244.7],
+  [',', 237.6, 245.8],
+  ['Y', 223.3, 244.7],
+  [')', 224.3, 245.8],
+  ['具', 220.2, 247.8],
+  ['有', 220.2, 247.8],
+  ['分', 220.2, 247.8],
+  ['布', 220.2, 247.8],
+  ['律', 220.2, 248.8],
+  ['P', 223.3, 234.5],
+  ['{', 221.3, 246.8],
+  ['X', 226.4, 244.7],
+  ['=', 231.5, 237.6],
+  ['x', 231.5, 244.7],
+  [',', 209, 258], // ← 异常框（超出整行）
+  ['Y', 223.3, 244.7],
+  ['=', 231.5, 237.6],
+  ['y', 231.5, 248.8],
+  ['}', 222.3, 246.8],
+  ['=', 231.5, 237.6],
+  ['p', 227.4, 249.8],
+  ['(', 223.3, 245.8],
+  ['1', 223.3, 244.7],
+  ['-', 209, 258], // ← 异常框
+  ['p', 227.4, 249.8],
+  [')', 223.3, 245.8],
+  ['x', 225.3, 232.5], // ── 指数 x+y-2（墨迹高 7.2px、底边高出正文 12.2px）
+  ['+', 225.3, 232.5],
+  ['y', 225.3, 232.5],
+  ['-', 225.3, 232.5],
+  ['2', 220.2, 232.5],
+  [',', 237.6, 245.8],
+  ['0', 224.3, 244.7],
+  ['<', 225.3, 243.7],
+  ['p', 227.4, 243.7],
+  ['<', 225.3, 243.7],
+  ['1', 224.3, 244.7],
+  [',', 237.6, 245.8],
+  ['x', 223.3, 243.7],
+  [',', 237.6, 245.8],
+  ['y', 223.3, 243.7],
+  ['均', 220.2, 247.8],
+  ['为', 220.2, 247.8],
+  ['正', 221.3, 246.8],
+];
+
+const REAL17_MAIN = 36; // 内部真正生效的词高（不是被公式撑大的 43）
+const REAL17_BASELINE = 244.7;
+const REAL17_EXP_FROM = 35;
+const REAL17_EXP_TO = 39;
+
+/**
+ * 造真实第 1 词的旁挂数据（与生产同一套归一化口径）。
+ *
+ * 置信度按**两条已知事实**构造（详见 `ocrCharBoxes.test.ts` 同名字段的说明）：
+ * 高置信度的普通字（`7`/`P`/`=`/`p`）与低置信度的真指数（`x+y−2`）。
+ * 逐字符置信度当时没有出口，拿不到真值 —— 这一点如实写在这里。
+ */
+function real17Attached(): {
+  chars: OcrChar[];
+  measurements: AttachedChars['measurements'];
+  confidences: number[];
+} {
+  const chars = [...REAL17_TEXT].map((char) => ({ char }));
+  const charW = (S17_BBOX.x1 - S17_BBOX.x0) / chars.length;
+  const nonBlank = chars.filter((c) => c.char.trim());
+  expect(nonBlank.length, '字符表必须与正文逐位对齐').toBe(REAL17_ROWS.length);
+
+  let k = 0;
+  const out: OcrChar[] = [];
+  const measurements: AttachedChars['measurements'] = [];
+  const confidences: number[] = [];
+  const weak = [0.62, 0.65, 0.61, 0.58, 0.66];
+
+  for (let i = 0; i < chars.length; i++) {
+    const char = chars[i]!.char;
+    if (!char.trim()) {
+      // 空白位：占位、无墨迹、无置信度（与生产路径的契约一致）
+      out.push({ char, x0: 0, y0: 0, x1: 0, y1: 0 });
+      measurements.push(null);
+      confidences.push(Number.NaN);
+      continue;
+    }
+    const [ch, y0, y1] = REAL17_ROWS[k]!;
+    expect(ch, `第 ${k} 个非空白字符`).toBe(char);
+    const ky = k;
+    k++;
+    out.push({
+      char,
+      x0: S17_BBOX.x0 + i * charW,
+      y0,
+      x1: S17_BBOX.x0 + (i + 1) * charW,
+      y1,
+    });
+    measurements.push({
+      y0: (y0 - REAL17_BASELINE) / REAL17_MAIN + 0.72,
+      y1: (y1 - REAL17_BASELINE) / REAL17_MAIN + 0.72,
+      h: (y1 - y0) / REAL17_MAIN,
+    });
+    confidences.push(
+      ky >= REAL17_EXP_FROM && ky <= REAL17_EXP_TO
+        ? weak[ky - REAL17_EXP_FROM]!
+        : 0.97 + ((ky * 7) % 5) * 0.005,
+    );
+  }
+  return { chars: out, measurements, confidences };
+}
+
+describe('真实第 1 词（整条链路）：真实的那些误判一个都不许再出现', () => {
+  const wordWithScripts = () => {
+    const word = w(REAL17_TEXT, S17_BBOX.x0, S17_BBOX.y0, S17_MAIN_FONT, S17_BBOX.x1 - S17_BBOX.x0, 92);
+    attachCharsToWord(word, real17Attached());
+    return word;
+  };
+
+  it('⭐ 指数 `x+y-2` 被包成**一个** `$^{...}$`（旧实现在这份数据上一个都没判出来）', () => {
+    const content = ocrResultToBlocks(pageResult({ words: [wordWithScripts()] }))[0]?.content ?? '';
+
+    expect(content).toContain('$^{x+y-2}$');
+    // 不能拆成好几个公式
+    expect(content).not.toContain('$^{x}$$^{+}$');
+    // 前后原文必须都在（切片最容易丢首尾）
+    expect(content).toContain('= p (1 - p )');
+    expect(content).toContain(',0 < p < 1,x ,y 均为 正');
+  });
+
+  it('⭐ 旧实现的四个误判（`17`、`P`、`）问`、`√`/`Y`）**一个都不许再出现**', () => {
+    const content = ocrResultToBlocks(pageResult({ words: [wordWithScripts()] }))[0]?.content ?? '';
+
+    // `$^{17}$`（真实误判里最显眼的一个）
+    expect(content).not.toContain('$^{17}$');
+    expect(content).not.toContain('$^{1}$');
+    expect(content).not.toContain('$^{7}$');
+    // `$^{P}$`
+    expect(content).not.toContain('$^{P}$');
+    // `(1$^{)问}$`
+    expect(content).not.toContain(')问}$');
+    expect(content).not.toContain('$^{)');
+    // `$^{Y}$`
+    expect(content).not.toContain('$^{Y}$');
+  });
+
+  it('⭐ 「不吞字」：只剥掉 `$^{`/`}$` 包装，内部文字必须与原词逐字符相同', () => {
+    const content = ocrResultToBlocks(pageResult({ words: [wordWithScripts()] }))[0]?.content ?? '';
+    // 只剥包装、**保留**包装里的内容（剥掉整段 `$...$` 会把指数本身也删掉，
+    // 那样这条断言就永远成立 —— 是假保护）
+    const stripped = content.replace(/\$\^\{/g, '').replace(/\}_\$/g, '').replace(/\}\$/g, '');
+    expect(stripped.replace(/\s+/g, '')).toBe(REAL17_TEXT.replace(/\s+/g, ''));
+    // 前提：这次确实包了一层（否则上面那条对「没包装」也成立）
+    expect(content).toContain('$^{');
+  });
+
+  it('反向防线：同一批字符框**不给置信度**时，误判会回来 —— 说明挡住它的确实是机制 2', () => {
+    const word = w(REAL17_TEXT, S17_BBOX.x0, S17_BBOX.y0, S17_MAIN_FONT, S17_BBOX.x1 - S17_BBOX.x0, 92);
+    const built = real17Attached();
+    attachCharsToWord(word, { chars: built.chars, measurements: built.measurements });
+
+    const content = ocrResultToBlocks(pageResult({ words: [word] }))[0]?.content ?? '';
+    // 没有置信度 → 纯几何：`P`（以及三个中线等号）会被包进去
+    expect(content).toContain('$^{');
+  });
+});
+

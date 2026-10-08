@@ -1218,10 +1218,10 @@ function centerY(word: OcrWord): number {
  */
 /**
  * ═══════════════════════════════════════════════════════════════
- * 字符级上下标判定的**总开关**（当前：关闭）
+ * 字符级上下标判定的**总开关**（已按 Tesseract 的机制重写后打开）
  * ═══════════════════════════════════════════════════════════════
  *
- * 关掉的原因不是"做不到"，而是**现在这套判据在中英混排上会误判**。
+ * ── 它此前为什么被关掉 ────────────────────────────────────────
  *
  * 用户真实导出（第 1 词）：
  *
@@ -1234,22 +1234,35 @@ function centerY(word: OcrWord): number {
  * 根因（已定位到具体的量）：这份文档混着**三种字体度量** —— 汉字 / 拉丁 / 数学符号。
  * 拉丁数字天生比汉字矮，而汉字字形会探到基线以下，于是
  * 「底边更高 + 更矮」对每个数字**恒成立**，与是否被抬高无关。
+ * 用第 1 词的真实字符框复现过：旧判据给出的候选恰好是 `7` 与 `P`，
+ * 真正的指数一个都没进 —— 症状完全对上。
  *
- * 参照实现已找到：Tesseract 的 `ccmain/superscript.cpp`
+ * ── 参照实现 ─────────────────────────────────────────────────
+ *
+ * Tesseract 的 `ccmain/superscript.cpp`
  * （https://tesseract-ocr.github.io/tessapi/3.05.02/a00149_source.html#l00253 ，
- * Apache-2.0）。它有四个机制，而本实现**一个都没有**：
- *   1. 阈值锚在「基线 + x 高度」上，不是「最高字」；
+ * David Eger, 2012, Apache-2.0）。它比旧实现多四个机制，旧实现**一个都没有**：
+ *   1. 阈值锚在「基线 + 位移单位」上，不是「最高字」；
  *   2. **同时要求两个独立信号**：位置异常 **且** 识别置信度明显偏低
  *      （`unlikely_threshold = superscript_worse_certainty × avg_certainty`）；
- *   3. 拒绝标点与斜体；
+ *   3. 拒绝标点（本实现另加一条：拒绝汉字）；
  *   4. 候选只取词**两端**的连续异常段。
  * 第 2 条是关键：`17`、`P`、`√` 都是被高置信度认出的普通字符，
  * 而真正的指数是小而模糊的块 —— **只看几何必然误判**。
  *
- * 关闭期间：拿不到包装的词全部走原路径，**输出与功能引入前逐字符一致**。
- * 已通过的测试（`$^{x+y-2}$` 必须被包出来）**保留**，作为重写后的验收标准。
+ * ── 打开的依据：不是「重写了」，而是「真实数据上判对了」 ────────
+ *
+ * 打开的前提是两条验收用例通过（它们是**重写后的验收标准**，断言未改）：
+ *   · 指数 `x+y-2` 被包成一个 `$^{...}$`；
+ *   · 指数结尾紧跟空格时，空格不能被吞进 `^{}`。
+ * 两条都在 `ocrPostProcess.test.ts` 里；此外还有一组用**真实第 1 词**的
+ * 字符框与置信度做的用例，两个方向都钉住：该判出的判出（`x+y−2`），
+ * 不该判的必须拒掉（`17`、`P`、`√`、`Y`、`=`）。
+ *
+ * 拿不到字符框的词**完全不受影响**：`resolveCharScripts` 返回 null，
+ * 走下面的原路径，输出与功能引入前逐字符一致（由既有测试守着）。
  */
-export const CHAR_SCRIPT_ENABLED = false;
+export const CHAR_SCRIPT_ENABLED = true;
 
 function resolveCharScripts(
   word: OcrWord,
@@ -1259,7 +1272,7 @@ function resolveCharScripts(
 
   const target = word.text.trim();
   if (!target) return null;
-  const { chars, measurements } = attached;
+  const { chars, measurements, confidences } = attached;
 
   /**
    * ═══════════════════════════════════════════════════════════════
@@ -1300,7 +1313,16 @@ function resolveCharScripts(
   if (chars.length !== target.length) return null;
   if (strip(chars.map((c) => c.char).join('')) !== strip(target)) return null;
 
-  const scripts = classifyCharsByGeometry(measurements);
+  /**
+   * ⚠️ 三个参数**必须同一套下标对齐**：`classifyCharsByGeometry` 的机制 3（标点）
+   * 要看 `chars`，机制 2（置信度）要看 `confidences`。任何一个错位，
+   * 判出来的 `^{}` 就会落在别的字上 —— 那比没有更糟。
+   *
+   * `confidences` 可能是 undefined（这条路径上没拿到逐字符置信度）：
+   * 那时判据**不启用**置信度门，退回纯几何（见 `classifyCharsByGeometry`）。
+   * 这是显式的两条路径，不是「用 0 补齐」。
+   */
+  const scripts = classifyCharsByGeometry(measurements, chars, confidences);
   return scripts.length ? { chars, scripts } : null;
 }
 
