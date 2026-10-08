@@ -731,6 +731,16 @@ export const SCRIPT_CHAR_MAX_SHIFT_RATIO = 0.5;
  * 按本文件一贯取舍 —— 宁可漏判，也不要把等号包成上标。
  */
 export const SCRIPT_CHAR_MIN_CENTER_SHIFT_RATIO = 0;
+/**
+ * 测量值超过基准高度的多少倍就被当作异常、直接丢弃。
+ *
+ * 实测依据：混进相邻行墨迹的那几个框高 **49**，而真正的正文字形高 **27.6** ——
+ * 比值 1.78。取 1.5 落在两者之间，且远离两侧，不靠卡边界通过。
+ *
+ * 丢弃而不是「当作正文」：一个量错位置的框，它的**纵向位置同样不可信**，
+ * 留着它只会继续污染基准。
+ */
+export const SCRIPT_OUTLIER_RATIO = 1.5;
 /** 判定所需的最少可测字符数（与词级判据的 `SCRIPT_MIN_LINE_WORDS` 同口径） */
 export const SCRIPT_MIN_MEASURED_CHARS = 3;
 /** 算基线时，「正常字」至少要有这么多个，否则不出结论 */
@@ -794,8 +804,53 @@ export function classifyCharsByGeometry(
   }
   if (idx.length < SCRIPT_MIN_MEASURED_CHARS) return [];
 
-  const mainHeight = Math.max(...idx.map((i) => measurements[i]?.h ?? 0));
+  /**
+   * ═══════════════════════════════════════════════════════════════
+   * 基准高度必须**抗异常值**，不能取最大值（用户真实数据，实测）
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 起因是一次错误输出：`17`、`P`、`)问`、`√`、`Y` 被包成了上标，
+   * 而真正的指数 `x+y−2` 反而没被判出来。
+   *
+   * 看第 1 词的字符框就明白了 —— 有几个字符量到了**整行的高度**：
+   *
+   *   `,`(x 865)  y [209, 258]  高 49     ← 一个逗号不可能这么高
+   *   `−`(x 1090) y [209, 258]  高 49
+   *   `+`(x 1172) y [209, 258]  高 49
+   *   `设`        y [220.2, 247.8]  高 27.6   ← 真正的正文
+   *   `x`         y [225.3, 232.5]  高 7.2
+   *
+   * 那几条约 49 高的框**超出了行框本身**（行 yRange 是 [212,255]）——
+   * 裁剪带了 padding，切片列上混进了相邻行的墨迹，于是量到了别的东西。
+   *
+   * 后果是连锁的：
+   *   mainHeight = 49（被这几个值撑大）
+   *   「正常字符」门槛 = 49 × 0.8 = 39.2
+   *   而真正的正文汉字只有 ~27  →  **全部落到门槛之下**  →  全被当成上标
+   *
+   * 所以问题不在判据松紧，而在**基准被污染**。修法两步：
+   *  1. 基准取**上四分位数**而不是最大值 —— 少数坏值不能定义基准；
+   *  2. 明显超出基准的测量值直接**丢弃**（它们不是这一行的字形）。
+   *
+   * 注意：这在字符框拿不到的那些轮次里**从未暴露**，因为流程根本走不到这里。
+   */
+  const heights = idx.map((i) => measurements[i]?.h ?? 0).sort((a, b) => a - b);
+  const quantile = (p: number): number => {
+    if (!heights.length) return 0;
+    const at = Math.min(heights.length - 1, Math.max(0, Math.round((heights.length - 1) * p)));
+    return heights[at] ?? 0;
+  };
+  const mainHeight = quantile(0.75);
   if (!(mainHeight > 0)) return [];
+
+  // 丢弃明显不是本行字形的测量值（超过基准 SCRIPT_OUTLIER_RATIO 倍）
+  const kept = idx.filter((i) => {
+    const h = measurements[i]?.h ?? 0;
+    return h <= mainHeight * SCRIPT_OUTLIER_RATIO;
+  });
+  if (kept.length < SCRIPT_MIN_MEASURED_CHARS) return [];
+  idx.length = 0;
+  idx.push(...kept);
 
   const normalBottoms = idx
     .filter((i) => (measurements[i]?.h ?? 0) >= mainHeight * SCRIPT_CHAR_MAX_HEIGHT_RATIO)
