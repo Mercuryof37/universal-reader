@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
   Bookmark,
@@ -21,6 +21,7 @@ import { TranslationPanel } from '@/components/TranslationPanel';
 import { TtsVoiceSelector } from '@/components/TtsVoiceSelector';
 import { AnnotationSidebar } from '@/components/AnnotationSidebar';
 import { loadProgress, saveProgress } from '@/lib/db';
+import { buildHeadingAnchors, findHeadingIndex } from '@/lib/utils';
 
 type SidePanel = 'none' | 'toc' | 'annotations' | 'settings';
 
@@ -154,6 +155,16 @@ export function ReaderView() {
     [annotations],
   );
 
+  /** Markdown 文内链接（`[x](#标题)`）的可跳转目标 */
+  const headingAnchors = useMemo(() => buildHeadingAnchors(blocks), [blocks]);
+  const jumpToAnchor = useCallback(
+    (anchor: string) => {
+      const idx = findHeadingIndex(blocks, anchor);
+      if (idx >= 0) scrollToIndex(idx);
+    },
+    [blocks, scrollToIndex],
+  );
+
   const handleAddAnnotation = useCallback(
     async (type: Annotation['type'], withNote: boolean) => {
       if (!selection || !currentDoc) return;
@@ -284,6 +295,8 @@ export function ReaderView() {
                     block.type !== 'code' &&
                     block.type !== 'image'
                   }
+                  headingAnchors={headingAnchors}
+                  onJumpAnchor={jumpToAnchor}
                   reportHeight={reportHeight}
                   onToggleSpeak={tts.toggle}
                   onSelection={setSelection}
@@ -317,7 +330,9 @@ export function ReaderView() {
             </div>
 
             <div className="reader-scroll min-h-0 flex-1 overflow-y-auto">
-              {panel === 'toc' && <TocPanel onJump={scrollToIndex} />}
+              {panel === 'toc' && (
+                <TocPanel onJump={scrollToIndex} activeIndex={firstVisibleIndex} />
+              )}
 
               {panel === 'annotations' && (
                 <AnnotationSidebar
@@ -416,10 +431,37 @@ function toolbarBtn(active: boolean): string {
   ].join(' ');
 }
 
-/** 目录面板 */
-function TocPanel({ onJump }: { onJump: (index: number) => void }) {
+/**
+ * 目录面板。
+ *
+ * 除了点击跳转，还跟随正文滚动高亮"当前节"（最后一个起始位置不超过
+ * 当前视口顶部的条目），并把高亮项滚进可视区 —— 长文档里目录本身就是
+ * 一个迷你进度条。
+ */
+function TocPanel({ onJump, activeIndex }: { onJump: (index: number) => void; activeIndex: number }) {
   const currentDoc = useLibraryStore((s) => s.currentDoc);
   const toc = currentDoc?.toc ?? [];
+  const blocks = currentDoc?.blocks ?? [];
+  const activeRef = useRef<HTMLButtonElement | null>(null);
+
+  const entries = useMemo(
+    () => toc.map((entry) => ({ entry, index: blocks.findIndex((b) => b.id === entry.blockId) })),
+    [toc, blocks],
+  );
+
+  const activeBlockId = useMemo(() => {
+    let active: string | null = null;
+    for (const { entry, index } of entries) {
+      if (index < 0) continue;
+      if (index <= activeIndex) active = entry.blockId;
+      else break;
+    }
+    return active;
+  }, [entries, activeIndex]);
+
+  useEffect(() => {
+    activeRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [activeBlockId]);
 
   if (!toc.length) {
     return (
@@ -429,19 +471,21 @@ function TocPanel({ onJump }: { onJump: (index: number) => void }) {
     );
   }
 
-  const blocks = currentDoc?.blocks ?? [];
-
   return (
     <nav className="p-3">
       <ul className="flex flex-col gap-0.5">
-        {toc.map((entry) => {
-          const index = blocks.findIndex((b) => b.id === entry.blockId);
+        {entries.map(({ entry, index }) => {
+          const active = entry.blockId === activeBlockId;
           return (
             <li key={entry.blockId}>
               <button
                 type="button"
+                ref={active ? activeRef : undefined}
                 onClick={() => index >= 0 && onJump(index)}
-                className="w-full truncate rounded px-2 py-1 text-left text-xs hover:bg-[var(--reader-bg)] hover:text-[var(--reader-accent)]"
+                className={[
+                  'w-full truncate rounded px-2 py-1 text-left text-xs hover:bg-[var(--reader-bg)] hover:text-[var(--reader-accent)]',
+                  active ? 'toc-active' : '',
+                ].join(' ')}
                 style={{ paddingLeft: `${(entry.level - 1) * 12 + 8}px` }}
                 title={entry.title}
               >

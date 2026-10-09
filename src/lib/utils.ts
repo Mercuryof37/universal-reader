@@ -6,7 +6,6 @@ import type {
   DocFormat,
   TocEntry,
 } from '@/types/content';
-
 /** 生成稳定 id。优先用 crypto.randomUUID，降级到时间戳随机串。 */
 export function uid(prefix = ''): string {
   const raw =
@@ -61,6 +60,43 @@ export function buildToc(blocks: ContentBlock[]): TocEntry[] {
       title: b.content.trim(),
       level: Math.min(6, Math.max(1, b.metadata.level ?? 1)),
     }));
+}
+
+/**
+ * 归一化文内锚点 / 标题文本，用于跳转匹配。
+ *
+ * 两种写法都要认：Obsidian 的 `[[#标题]]`（直接写标题）、
+ * Markdown 的 `[x](#heading-slug)`（GitHub 风格 slug：小写、空格转连字符）。
+ * 去掉大小写、空白与 `-`/`_`/标点后，两者都会落到同一个键上。
+ */
+export function normalizeAnchor(text: string): string {
+  let s = text.trim();
+  if (s.startsWith('#')) s = s.slice(1);
+  try {
+    s = decodeURIComponent(s);
+  } catch {
+    // 不是合法的百分号编码就按原文处理
+  }
+  return s
+    .toLowerCase()
+    .replace(/[\s\u3000]+/g, '')
+    .replace(/[-_`*~"'“”‘’()（）[\]【】]/g, '');
+}
+
+/** 文档里全部标题的锚点集合，供渲染层判断链接是否可跳 */
+export function buildHeadingAnchors(blocks: ContentBlock[]): Set<string> {
+  const set = new Set<string>();
+  for (const b of blocks) {
+    if (b.type === 'heading' && b.content.trim()) set.add(normalizeAnchor(b.content));
+  }
+  return set;
+}
+
+/** 按锚点找标题块下标；找不到返回 -1 */
+export function findHeadingIndex(blocks: ContentBlock[], anchor: string): number {
+  const key = normalizeAnchor(anchor);
+  if (!key) return -1;
+  return blocks.findIndex((b) => b.type === 'heading' && normalizeAnchor(b.content) === key);
 }
 
 /** 组装一篇文档，统一补齐 id、字数、目录、时间戳 */
@@ -201,4 +237,7 @@ export const BLOCK_TYPE_LABEL: Record<BlockType, string> = {
   list: '列表',
   image: '图片',
   math: '公式',
+  table: '表格',
+  callout: '提示框',
+  divider: '分隔线',
 };

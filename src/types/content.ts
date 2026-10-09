@@ -18,7 +18,67 @@ export type BlockType =
   | 'code'
   | 'list'
   | 'image'
-  | 'math';
+  | 'math'
+  | 'table'
+  | 'callout'
+  | 'divider';
+
+/**
+ * 行内格式片段（Markdown 的 **粗体**、`代码`、==高亮==、链接、行内公式等）。
+ *
+ * 只记录 offsets，不破坏 content 纯文本：朗读、翻译、批注锚点全部继续
+ * 基于 content 工作，渲染层把 offsets 变成包裹元素。这也是"DOM 文本必须
+ * 等于 content 文本"这条不变量的来源（见 annotations.ts 的偏移收集器）——
+ * 包裹元素不允许增删任何字符。
+ */
+export type InlineKind =
+  | 'strong'
+  | 'emphasis'
+  | 'code'
+  | 'del'
+  | 'mark'
+  | 'link'
+  | 'wikilink'
+  | 'math'
+  | 'fnref';
+
+export interface InlineSpan {
+  /** 相对 block.content 的起止偏移（[start, end)） */
+  start: number;
+  end: number;
+  kind: InlineKind;
+  /** link/wikilink 的目标（# 开头为文内锚点）；fnref 为脚注标识 */
+  href?: string;
+}
+
+/** GFM 表格：rows 含表头行，cells 用单个空格连接作为 content 的一行 */
+export interface TableSpec {
+  align: Array<'left' | 'center' | 'right' | null>;
+  rows: string[][];
+}
+
+/** 列表项（嵌套列表被拍平，用 indent 记录层级） */
+export interface ListItemSpec {
+  text: string;
+  indent: number;
+  /** 悬挂在行首的项目符号（CSS ::before 绘制，不进入 content） */
+  marker: string;
+  /** 任务列表的勾选状态；null 表示普通列表项 */
+  checked: boolean | null;
+}
+
+export interface ListSpec {
+  ordered: boolean;
+  items: ListItemSpec[];
+}
+
+/** `> [!note] 标题` 提示框 */
+export interface CalloutSpec {
+  /** note / tip / warning / ... 未知类型按默认色渲染 */
+  type: string;
+  /** 标题行文本（content 的第 0 行） */
+  title: string;
+}
 
 /** 批注类型 */
 export type AnnotationType = 'highlight' | 'note' | 'tag' | 'question';
@@ -79,6 +139,19 @@ export interface BlockMetadata {
   ocrConfidence?: number;
   /** 段落内是否包含行内公式（$...$），渲染时需走 KaTeX */
   hasInlineMath?: boolean;
+  /**
+   * 行内格式片段。
+   *
+   * 只有 Markdown 解析器会写这个字段，而且**即使没有格式也会写空数组**：
+   * 渲染层用 `inline !== undefined` 判断"这是 Markdown 块"，
+   * 从而启用 Obsidian 排版、关闭 OCR 专用的 `x^2` / `snake_case` 猜测。
+   */
+  inline?: InlineSpan[];
+  table?: TableSpec;
+  list?: ListSpec;
+  callout?: CalloutSpec;
+  /** 脚注定义块的编号（内容以 `[n] ` 开头） */
+  footnote?: number;
 }
 
 /** 统一内容块 */

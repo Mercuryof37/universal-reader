@@ -78,8 +78,10 @@ export function useVirtualWindow(
     };
   }, []);
 
-  const virtualWindow = useMemo<VirtualWindow>(() => {
-    if (itemCount === 0) return { start: 0, end: 0, topPadding: 0, bottomPadding: 0 };
+  const { window: virtualWindow, firstVisible } = useMemo(() => {
+    if (itemCount === 0) {
+      return { window: { start: 0, end: 0, topPadding: 0, bottomPadding: 0 }, firstVisible: 0 };
+    }
 
     // 找到第一个"底部越过视口顶部"的项
     let start = 0;
@@ -98,7 +100,14 @@ export function useVirtualWindow(
     const lastHeight = heightsRef.current.get(lastIndex) ?? estimateHeight;
     const bottomPadding = Math.max(0, totalHeight - ((offsets[lastIndex] ?? 0) + lastHeight));
 
-    return { start: startWithBuffer, end: endWithBuffer, topPadding, bottomPadding };
+    return {
+      window: { start: startWithBuffer, end: endWithBuffer, topPadding, bottomPadding },
+      // 上报给外界的"第一可见项"必须是未加缓冲的 start：
+      // 缓冲只服务于渲染（提前挂好 6 块，快速拖动时不露白），
+      // 而进度、目录高亮、朗读起点要的是用户真正看到的那一段，
+      // 拿 window.start 会恒定提前 buffer 项（表现就是滚动时进度"走在后面"）
+      firstVisible: start,
+    };
   }, [itemCount, offsets, totalHeight, scrollTop, viewportHeight, buffer, estimateHeight]);
 
   /** 注册某个下标实测到的真实高度 */
@@ -116,8 +125,22 @@ export function useVirtualWindow(
     (index: number) => {
       const el = containerRef.current;
       if (!el || itemCount === 0) return;
-      const top = offsets[Math.max(0, Math.min(index, itemCount - 1))] ?? 0;
+      const target = Math.max(0, Math.min(index, itemCount - 1));
+      const top = offsets[target] ?? 0;
       el.scrollTo({ top: Math.max(0, top - 24), behavior: 'smooth' });
+
+      // 估算高度与实际高度会有偏差（表格、译文、列宽变化都会改变块高），
+      // 只按 offsets 滚会停在目标上方或下方几百像素。等平滑滚动结束后，
+      // 用真实 DOM 位置校正一次 —— 目录跳转必须落在标题上，而不是"附近"。
+      window.setTimeout(() => {
+        const node = el.querySelector(`[data-index="${target}"]`);
+        if (!node) return;
+        const delta =
+          node.getBoundingClientRect().top - el.getBoundingClientRect().top - 24;
+        if (Math.abs(delta) > 8) {
+          el.scrollTo({ top: Math.max(0, el.scrollTop + delta), behavior: 'auto' });
+        }
+      }, 520);
     },
     [offsets, itemCount],
   );
@@ -127,8 +150,8 @@ export function useVirtualWindow(
     window: virtualWindow,
     scrollToIndex,
     reportHeight,
-    /** 当前首个可见项，用于保存进度与懒翻译 */
-    firstVisibleIndex: virtualWindow.start,
+    /** 视口顶部那一段的真实下标（不含渲染缓冲），用于进度、目录高亮与朗读起点 */
+    firstVisibleIndex: firstVisible,
     scrollTop,
   };
 }
