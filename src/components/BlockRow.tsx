@@ -18,7 +18,6 @@ import {
   Zap,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
-import katex from 'katex';
 import type {
   Annotation,
   BilingualLayout,
@@ -35,6 +34,7 @@ import {
   type StyledLine,
   type TextSegment,
 } from '@/lib/annotations';
+import { renderMath } from '@/lib/mathRender';
 import { normalizeAnchor } from '@/lib/utils';
 import { useAnnotationsStore } from '@/store/annotationsStore';
 import { useMeasuredHeight } from '@/hooks/useVirtualWindow';
@@ -660,20 +660,6 @@ function WikiLink({
 function MathSpan({ tex, original }: { tex: string; original: string }) {
   const html = useMemo(() => renderMath(tex, false), [tex]);
   return <span className="md-math" data-math-src={original} dangerouslySetInnerHTML={{ __html: html }} />;
-}
-
-/** 用 KaTeX 渲染 LaTeX 公式为 HTML 字符串 */
-function renderMath(tex: string, displayMode: boolean): string {
-  try {
-    return katex.renderToString(tex, {
-      displayMode,
-      throwOnError: false,
-      strict: false,
-      trust: true,
-    });
-  } catch {
-    return `<code>${tex}</code>`;
-  }
 }
 
 // ═══════════════════════════════════════════════════════════════

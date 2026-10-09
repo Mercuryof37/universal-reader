@@ -9,7 +9,7 @@ import {
   Settings2,
   X,
 } from 'lucide-react';
-import type { Annotation } from '@/types/content';
+import type { Annotation, ContentBlock } from '@/types/content';
 import { useLibraryStore } from '@/store/libraryStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useAnnotationsStore } from '@/store/annotationsStore';
@@ -21,6 +21,8 @@ import { TranslationPanel } from '@/components/TranslationPanel';
 import { TtsVoiceSelector } from '@/components/TtsVoiceSelector';
 import { AnnotationSidebar } from '@/components/AnnotationSidebar';
 import { loadProgress, saveProgress } from '@/lib/db';
+import { buildStyledSegments, sliceSegments } from '@/lib/annotations';
+import { renderMath } from '@/lib/mathRender';
 import { buildHeadingAnchors, findHeadingIndex } from '@/lib/utils';
 
 type SidePanel = 'none' | 'toc' | 'annotations' | 'settings';
@@ -489,7 +491,7 @@ function TocPanel({ onJump, activeIndex }: { onJump: (index: number) => void; ac
                 style={{ paddingLeft: `${(entry.level - 1) * 12 + 8}px` }}
                 title={entry.title}
               >
-                {entry.title}
+                <TocTitle block={index >= 0 ? blocks[index] : undefined} title={entry.title} />
               </button>
             </li>
           );
@@ -497,6 +499,33 @@ function TocPanel({ onJump, activeIndex }: { onJump: (index: number) => void; ac
       </ul>
     </nav>
   );
+}
+
+/**
+ * 目录条目标题。
+ *
+ * 标题里的行内公式要按正文那样渲染成符号 —— 否则 `### 1. $\epsilon - N$ 语言`
+ * 会在目录里原样显示 LaTeX 源码。span 偏移由解析器给出、与 block.content 对齐，
+ * 直接复用正文那套切分逻辑取出公式片段。
+ */
+function TocTitle({ block, title }: { block: ContentBlock | undefined; title: string }) {
+  const nodes = useMemo(() => {
+    const inline = block?.metadata.inline;
+    if (!block || !inline?.some((s) => s.kind === 'math')) return null;
+
+    const content = block.content;
+    const lead = content.length - content.trimStart().length;
+    const segments = sliceSegments(buildStyledSegments(content, [], inline), lead, lead + title.length);
+    return segments.map((seg, i) => {
+      if (seg.inlines.some((s) => s.kind === 'math')) {
+        const html = renderMath(seg.text.slice(1, -1), false);
+        return <span key={i} className="md-math" dangerouslySetInnerHTML={{ __html: html }} />;
+      }
+      return seg.text;
+    });
+  }, [block, title]);
+
+  return <>{nodes ?? title}</>;
 }
 
 /** 排版设置 */

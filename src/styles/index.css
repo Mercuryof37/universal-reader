@@ -116,33 +116,41 @@ body {
   padding-left: 1.2rem;
 }
 
-/* 批注高亮：用 box-shadow 铺底色而不是 background，
-   这样跨行折行时高亮不会出现断裂的方块边角 */
+/* 批注高亮：只铺一层纯色。
+   <mark> 自带浏览器默认样式（黄底 + 黑字），必须显式覆盖，
+   否则默认黄底会和这里的颜色叠在一起，看上去就是两种颜色叠色 */
 .annotation-highlight {
+  background: rgb(var(--hl-rgb, 216 168 74) / 0.4);
+  color: inherit;
   border-radius: 2px;
   cursor: pointer;
-  box-shadow: inset 0 -0.5em 0 var(--hl-color, rgba(216, 168, 74, 0.35));
-  transition: box-shadow 120ms ease;
+  transition: background-color 120ms ease;
 }
 
+/* 选中态用同一种颜色加深，不加第二层绘制 */
 .annotation-highlight[data-active='true'] {
-  box-shadow: inset 0 -1em 0 var(--hl-color, rgba(216, 168, 74, 0.6));
+  background: rgb(var(--hl-rgb, 216 168 74) / 0.72);
 }
 
 [data-color='amber'] {
-  --hl-color: rgba(233, 186, 74, 0.42);
+  --hl-rgb: 233 186 74;
 }
 [data-color='rose'] {
-  --hl-color: rgba(226, 122, 122, 0.35);
+  --hl-rgb: 226 122 122;
 }
 [data-color='sky'] {
-  --hl-color: rgba(106, 168, 226, 0.35);
+  --hl-rgb: 106 168 226;
 }
 [data-color='emerald'] {
-  --hl-color: rgba(104, 190, 140, 0.35);
+  --hl-rgb: 104 190 140;
 }
 [data-color='violet'] {
-  --hl-color: rgba(160, 130, 220, 0.35);
+  --hl-rgb: 160 130 220;
+}
+
+/* 侧栏色点等装饰元素沿用同一组颜色 */
+[data-color] {
+  --hl-color: rgb(var(--hl-rgb) / 0.5);
 }
 
 /* 正在朗读的段落 */
