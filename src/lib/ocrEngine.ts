@@ -34,9 +34,12 @@ import {
   resetScriptSecondOpinion,
 } from '@/lib/ocrTesseractScripts';
 import {
+  admitRetryWords,
   detectMissedInkRegionsFromCanvas,
   overlapRatio,
+  planRetryCrop,
   type MissedInkRegion,
+  type RetryCropPlan,
 } from '@/lib/ocrInkRegions';
 
 /** 「裁剪 → 字符框」的识别器；建不起来时是 null（见 `ensureCharBoxRecognizer`） */
@@ -379,6 +382,33 @@ class OcrEngine {
     );
 
     const words: OcrWord[] = [];
+    /**
+     * 把词框从「识别画布坐标系」换算回「原图坐标系」。
+     *
+     * ═══════════════════════════════════════════════════════════════
+     * 为什么必须有这一步（降档识别时坐标会差一个 factor 倍）
+     * ═══════════════════════════════════════════════════════════════
+     *
+     * `result.results[].box` 是**在那张喂进识别的画布上**量的
+     * （读库的源码可确认：检测器把框按 input 画布的尺寸还原，
+     * 识别器最后又按 `1/cropRatio` 折算回去，两者都以传入画布为准）。
+     * 内存不足走降档（0.7 / 0.5 / 0.35，见 `recognizeWithFallback`）时，
+     * 那张画布比原图小，于是同一块内容的坐标会小一个 factor 倍。
+     *
+     * 而下游**全部**按原图坐标系解释词框：
+     *   · `attachCharBoxes` / `attachTesseractEvidence` 都用
+     *     `box.x0 * scale` 在降档画布上裁剪（契约写在 `cropWord` 注释里）；
+     *   · `detectMissedInkRegionsFromCanvas(imageData, words)` 要求词与
+     *     source 同一坐标系（写在它的函数注释里）；
+     *   · 公式增强与本地重试都从 `imageData` 裁剪；
+     *   · 页眉页脚按整页高度取边缘带。
+     *
+     * 不换算的后果不是报错，而是**静默降级**：字符框对账失败
+     * （错的坐标比没有更糟，于是整页一个都挂不上）、墨迹探测把
+     * 已识别区域也算成漏识别、公式裁剪裁到别处。所以在这里一次性
+     * 换算成原图坐标，让全链路只有**一个**坐标系。
+     */
+    const toPageFrame = factor < 0.999 ? 1 / factor : 1;
     // 每页开始前清空「取不到字符框」的原因记录，否则会跨页累积
     clearCharBoxSkips();
     /**
@@ -387,20 +417,40 @@ class OcrEngine {
      * 查不到，留着只会在诊断里制造「上一页的坐标」这种假象。
      */
     clearTesseractEvidence();
+    /**
+     * 「检测器给了框、识别结果却是空」的计数。
+     *
+     * 这正是跨行大括号公式整块消失的形态：`if (!text) continue` 把那个框
+     * 无声丢掉，`words` 里连痕迹都没有，下游（公式增强靠词聚类找候选）
+     * 也就永远发现不了它。至少要**把它数出来并说出来** ——
+     * 否则用户看到的只是一道少了主分支的题，不知道少了什么、为什么少。
+     * 这些框会在下面由「墨迹探测 + 本地重试」尝试救回。
+     */
+    let skippedBlank = 0;
     for (const item of result.results) {
       const text = item.text.trim();
-      if (!text) continue;
+      if (!text) {
+        skippedBlank++;
+        continue;
+      }
       words.push({
         text,
         confidence: Math.round(item.confidence * 100),
         bbox: {
-          x0: item.box.x,
-          y0: item.box.y,
-          x1: item.box.x + item.box.width,
-          y1: item.box.y + item.box.height,
+          x0: item.box.x * toPageFrame,
+          y0: item.box.y * toPageFrame,
+          x1: (item.box.x + item.box.width) * toPageFrame,
+          y1: (item.box.y + item.box.height) * toPageFrame,
         },
-        fontSize: item.box.height,
+        fontSize: item.box.height * toPageFrame,
       });
+    }
+    if (skippedBlank) {
+      console.warn(
+        `[ocrEngine] 第 ${pageNum} 页有 ${skippedBlank} 个检测框识别结果为空` +
+          `（共 ${result.results.length} 个）—— 这类内容不会出现在 words 里，` +
+          `接下来由墨迹探测 + 本地重试尝试救回`,
+      );
     }
 
     /**
@@ -496,17 +546,6 @@ class OcrEngine {
       }
     }
 
-    if (!words.length) {
-      console.warn(
-        `[ocrEngine] 第 ${pageNum} 页未提取到词。` +
-          `识别结果数=${result.results.length}，纯文本长度=${result.text.length}`,
-      );
-    }
-
-    const avgConfidence = words.length
-      ? words.reduce((sum, w) => sum + w.confidence, 0) / words.length
-      : 0;
-
     /**
      * 找出「有墨迹但没有词覆盖」的区域。
      *
@@ -536,8 +575,97 @@ class OcrEngine {
       );
     }
 
+    /**
+     * ═══════════════════════════════════════════════════════════════
+     * 漏识别区域的**本地重试**：放大后再识别一次（不联网）
+     * ═══════════════════════════════════════════════════════════════
+     *
+     * 上面那批区域在**默认配置下**没有任何补救路径：SimpleTex 公式增强
+     * 在隐私开关后面（默认关闭），而识别器对跨行大括号那类形状返回的
+     * 是空串 —— 主分支 `f(x,y) = 1/2(x+y)e^{-(x+y)}` 就是这样整块消失的。
+     * 本地重试补上的正是这一段：区域已经被定位好，放大后常常就能认出来
+     * （机制与成本上限见 `retryMissedInkLocally`）。
+     *
+     * 救回的词与普通词**同一条路**：并进 `words` 后一起成行、判上下标、
+     * 拼段落。排序只在真的救回时才做（`groupWordsIntoLines` 自己会分组，
+     * 但公式增强的替换与诊断输出都读顺序，顺手给一个确定的顺序）。
+     */
+    const recoveredWords = await this.retryMissedInkLocally(
+      imageData,
+      missedInkRegions,
+      words,
+      pageNum,
+    );
+    const wordsWithRecovery = recoveredWords.length
+      ? [...words, ...recoveredWords].sort((a, b) => a.bbox.y0 - b.bbox.y0 || a.bbox.x0 - b.bbox.x0)
+      : words;
+
+    /**
+     * 救回的词尽量也补一次字符级坐标。
+     *
+     * 识别器已经因为普通词热起来了（会话、字典都在内存里），
+     * 这一步只是对**新增的那些词**做一次裁剪识别；补不上不改变任何行为：
+     * 没有字符框的词照样成行、照样进 blocks，只是上下标只能靠词级判据。
+     *
+     * ⚠️ 对放大后才认出来的词，这张原尺度画布上的字符框可能对不上账
+     * （`attachCharBoxes` 的对账会拦住，不会写错坐标）—— 那只是
+     * 「没有字符框」，不是错误。第二意见（tesseract）暂不给救回的词补：
+     * 它读的是同一批字符框，字符框都没有时它也无从下手。
+     */
+    if (recoveredWords.length) {
+      try {
+        const recognizer = await this.ensureCharBoxRecognizer();
+        const attached = await attachCharBoxes(recoveredWords, recognizer, {
+          canvas: recognizedCanvas as unknown as OcrCanvasLike,
+          scale: factor < 0.999 ? factor : 1,
+          onSkip: (word, reason) => recordCharBoxSkip(word.text, `本地重试救回：${reason}`),
+        });
+        if (attached) {
+          console.info(
+            `[ocrEngine] 第 ${pageNum} 页救回的 ${recoveredWords.length} 个词中 ` +
+              `${attached} 个取到字符级坐标`,
+          );
+        }
+      } catch (err) {
+        console.warn('[ocrEngine] 救回词的字符级坐标附加失败（识别结果不受影响）：', err);
+      }
+    }
+
+    /**
+     * 救回之后**重新探测**漏识别区域。
+     *
+     * 不重新探测的话，刚救回来的那块在下面的公式增强里还会被当成
+     * 「仍然漏识别」—— 只认出了一个词的区域可能仍然触发一次 SimpleTex
+     * 请求（如果用户开了公式增强），而本地明明已经认出内容了。
+     * 没救回任何词时结果必然与第一次相同，不做第二次像素运算。
+     */
+    const remainingInkRegions = recoveredWords.length
+      ? detectMissedInkRegionsFromCanvas(imageData, wordsWithRecovery)
+      : missedInkRegions;
+
     // Enhance formula regions with SimpleTex cloud OCR
-    const enhancedWords = await this.enhanceFormulaRegions(words, imageData, missedInkRegions);
+    const enhancedWords = await this.enhanceFormulaRegions(
+      wordsWithRecovery,
+      imageData,
+      remainingInkRegions,
+    );
+
+    if (!wordsWithRecovery.length) {
+      console.warn(
+        `[ocrEngine] 第 ${pageNum} 页未提取到词（本地重试后仍为空）。` +
+          `识别结果数=${result.results.length}，纯文本长度=${result.text.length}`,
+      );
+    }
+
+    /**
+     * 平均置信度按**最终词表**算（含本地重试救回的词，不含 SimpleTex
+     * 的替换词）：救回的词也是识别出来的内容，把它排除在外会让
+     * 「救回了一整块公式」的页面仍然显示成低质量页。
+     * 排除替换词的原因不一样：那个 95 是写死的常数，不是识别置信度。
+     */
+    const avgConfidence = wordsWithRecovery.length
+      ? wordsWithRecovery.reduce((sum, w) => sum + w.confidence, 0) / wordsWithRecovery.length
+      : 0;
 
     onProgress?.({ pageNum, total, status: 'complete' });
 
@@ -546,15 +674,19 @@ class OcrEngine {
       words: enhancedWords,
       avgConfidence,
       pageText: result.text,
-      missedInkRegions: missedInkRegions.length ? missedInkRegions : undefined,
+      missedInkRegions: remainingInkRegions.length ? remainingInkRegions : undefined,
       extraction: {
-        source: words.length ? 'flat-words' : result.text.trim() ? 'page-text-only' : 'empty',
-        hasFlatWords: words.length > 0,
+        source: wordsWithRecovery.length
+          ? 'flat-words'
+          : result.text.trim()
+            ? 'page-text-only'
+            : 'empty',
+        hasFlatWords: wordsWithRecovery.length > 0,
         hasBlocks: false,
         blocks: 0,
         paragraphs: 0,
         lines: 0,
-        skippedBlank: result.results.length - words.length,
+        skippedBlank,
       },
     };
   }
@@ -774,6 +906,173 @@ class OcrEngine {
       // `ocrPostProcess.groupWordsIntoLines` 相同的「先上后下、先左后右」口径。
       .sort((a, b) => a.bbox.y0 - b.bbox.y0 || a.bbox.x0 - b.bbox.x0);
   }
+
+  /**
+   * 把「有墨迹但没有词覆盖」的区域放大后再识别一次 —— **纯本地**。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * 它要解决的那次真实内容丢失
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 用户在扫描版数学题 PDF 上实测到：跨行大括号里的主分支
+   * `f(x,y) = 1/2(x+y)e^{-(x+y)}` 整块从输出里消失，只剩 `0, 其他`。
+   * 根因在词提取循环里写得很清楚：识别器对那种形状（跨行大括号、
+   * 堆叠分数、指数上标）返回了空串，检测框被 `if (!text) continue`
+   * 无声丢掉 —— `words` 里连痕迹都没有。
+   *
+   * 丢掉之后的连锁反应是：公式增强靠**已识别出的词**聚类找候选，
+   * 没有词就永远发现不了那块区域；而它唯一的替代入口 SimpleTex 又在
+   * 隐私开关（默认关闭）后面。也就是说默认配置下这块内容
+   * **没有任何补救路径**。本函数把「本地最后能做的一次尝试」补上：
+   * 区域已经由墨迹探测定位好了（见 `lib/ocrInkRegions.ts`），
+   * 放大再送一次识别。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * 为什么是「放大重试」
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 原尺度上检测/识别已经失败过一次，原样再送只会得到同一个结果
+   * （同模型、同输入）。输入里唯一还没试过的变量就是尺度：
+   * 跨行大括号这类形状在原尺度下笔画粘连，检测器切不出干净的框；
+   * 放大后笔画分开，往往就能认出来。3 倍是本模块里有实测依据的量级
+   * （tesseract 第二意见的裁剪放大用的是同一档，见 `ocrTesseractScripts`）。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * 成本必须封顶（否则「补救」会变成「卡死」）
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 每次重试都是一次完整的检测 + 识别，所以有四道闸门：
+   *  · 尺寸闸门：太小的条（噪声/表格线）和太大的块（插图/整页失败）
+   *    都不试，只救「识别正常的页面上的一个洞」；
+   *  · 最多 8 个区域，按面积从大到小（丢得越多越先救）；
+   *  · 单个裁剪放大后的面积不超过 2.5MP（放不下就不放大，**不缩小**）；
+   *  · 整页重试有**总像素预算**（8MP）：预算是先算几何、后分配画布，
+   *    装不下的区域直接不试 —— 一页最多再花「两张页面」的推理量。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * ⚠️ 纯本地，绝不联网
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 这里只驱动本地 ONNX 引擎，与 `formulaOcrEnabled` 无关 ——
+   * 那个开关管的是 SimpleTex（全应用唯一会把内容送出本机的路径），
+   * 本函数既不读它、也不碰任何网络 API。
+   *
+   * 渐进增强：取不到画布、裁剪失败、某块推理抛错 —— 都只是那一块
+   * 没救回，`words` 与改动前逐字节相同。
+   *
+   * ⚠️ 诚实说明：救回的词**没有**字符级坐标（下面调用方会尽力补，
+   * 但对「放大后才认出来」的词可能补不上），因此它们内部的上下标
+   * 只能靠词级判据；这比整块消失仍然是严格更好的状态。
+   */
+  private async retryMissedInkLocally(
+    imageData: ImageData | HTMLCanvasElement | OffscreenCanvas,
+    regions: readonly MissedInkRegion[],
+    existing: readonly OcrWord[],
+    pageNum: number,
+  ): Promise<OcrWord[]> {
+    const service = this.service;
+    if (!service || !regions.length) return [];
+
+    const canvas = ensureCanvas(imageData);
+    if (!canvas) return [];
+
+    /**
+     * 两条尺寸闸门：
+     *  · 太细的条不试：24px 以下（200 DPI 下不到 3 毫米）基本是表格线、
+     *    扫描噪声或孤立标点 —— 不是「丢失的内容」，不值得花一次推理；
+     *  · 太大的块也不试：超过页面三成面积的区域**不再是「识别正常的页面
+     *    上的一个洞」**。那种尺寸更像是整幅插图（重试只会从图里读出垃圾
+     *    字符混进正文），或者整页都没认出来（这么大的区域也过了像素上限、
+     *    放大不了，等于把已经失败过的输入原样再送一次）。
+     */
+    const pageArea = canvas.width * canvas.height;
+    const candidates = regions
+      .filter(
+        (r) =>
+          r.x1 - r.x0 >= RETRY_MIN_SIDE &&
+          r.y1 - r.y0 >= RETRY_MIN_SIDE &&
+          (r.x1 - r.x0) * (r.y1 - r.y0) <= pageArea * RETRY_MAX_REGION_AREA_RATIO,
+      )
+      .sort((a, b) => (b.x1 - b.x0) * (b.y1 - b.y0) - (a.x1 - a.x0) * (a.y1 - a.y0));
+    if (!candidates.length) return [];
+
+    // 先算几何、后分配画布：预算必须在画布分配之前判掉
+    const jobs: Array<{ plan: RetryCropPlan; region: MissedInkRegion }> = [];
+    let budget = RETRY_PIXEL_BUDGET;
+    let skippedForBudget = 0;
+    for (const region of candidates) {
+      if (jobs.length >= RETRY_MAX_REGIONS) break;
+      const plan = planRetryCrop(
+        canvas.width,
+        canvas.height,
+        region,
+        RETRY_UPSCALE,
+        RETRY_MAX_CROP_PIXELS,
+      );
+      if (!plan) continue;
+
+      const cost = plan.targetW * plan.targetH;
+      // 第一个候选无论多大都试（用户看到的第一处丢失必须有人管），
+      // 之后的按预算放行
+      if (jobs.length > 0 && cost > budget) {
+        skippedForBudget++;
+        continue;
+      }
+      budget -= cost;
+      jobs.push({ plan, region });
+    }
+    if (!jobs.length) return [];
+
+    console.info(
+      `[ocrEngine] 第 ${pageNum} 页本地重试：${jobs.length} 处漏识别区域放大 ${RETRY_UPSCALE}× 重新识别` +
+        `（纯本地，不联网）` +
+        (skippedForBudget ? `，另有 ${skippedForBudget} 处超出像素预算未试` : ''),
+    );
+
+    const t0 = Date.now();
+    const recovered: OcrWord[] = [];
+
+    for (const { plan, region } of jobs) {
+      try {
+        const crop = renderRetryCrop(canvas, plan);
+        if (!crop) continue;
+
+        const result = await service.recognize(crop, { flatten: true });
+        const admitted = admitRetryWords(
+          result.results,
+          { originX: plan.px, originY: plan.py, scale: plan.scale },
+          // 已有的词 + 前面几块救回的词一起做去重基准：
+          // 裁剪的留白会把邻居正文也带进来，重复词是**比缺失更糟**的一类错误
+          // （同一句话里出现两遍，还可能是错位的）
+          [...existing, ...recovered],
+        );
+        if (!admitted.length) continue;
+
+        recovered.push(...admitted);
+        console.info(
+          `[ocrEngine] 第 ${pageNum} 页本地重试救回 ${admitted.length} 个词：` +
+            `${admitted
+              .map((w) => w.text)
+              .join(' ')
+              .slice(0, 60)}`,
+        );
+      } catch (err) {
+        console.warn(
+          `[ocrEngine] 第 ${pageNum} 页漏识别区域重试失败` +
+            `（${Math.round(region.x0)},${Math.round(region.y0)}，不影响其他区域）：`,
+          err,
+        );
+      }
+    }
+
+    if (recovered.length) {
+      console.info(
+        `[ocrEngine] 第 ${pageNum} 页本地重试共救回 ${recovered.length} 个词，` +
+          `耗时 ${((Date.now() - t0) / 1000).toFixed(1)} 秒`,
+      );
+    }
+    return recovered;
+  }
 }
 
 export const ocrEngine = new OcrEngine();
@@ -967,4 +1266,45 @@ function cropCanvas(
   ctx.fillRect(0, 0, pw, ph);
   ctx.drawImage(source, px, py, pw, ph, 0, 0, pw, ph);
   return crop;
+}
+
+// ── 漏识别区域「放大重试」的参数（见 `retryMissedInkLocally`） ──────────────
+/** 区域任一边小于这个值（像素）就不试：那是表格线/噪声，不是丢失的内容 */
+const RETRY_MIN_SIDE = 24;
+/** 区域面积超过页面的这个比例就不试：那是插图或整页失败，不是一个「洞」 */
+const RETRY_MAX_REGION_AREA_RATIO = 0.3;
+/** 一页最多重试几处（按面积从大到小取） */
+const RETRY_MAX_REGIONS = 8;
+/** 放大倍数（检测/识别都已在原尺度失败过，原样再送没有意义） */
+const RETRY_UPSCALE = 3;
+/** 单个裁剪放大后的面积上限；放不下就少放一点，但**不缩小** */
+const RETRY_MAX_CROP_PIXELS = 2_500_000;
+/** 整页重试的总像素预算 —— 一页最多再花两张页面的推理量 */
+const RETRY_PIXEL_BUDGET = 8_000_000;
+
+/**
+ * 把放大裁剪的计划渲染成画布。
+ *
+ * 计划本身（留白、放大倍数、像素上限）在 `lib/ocrInkRegions.ts` 的
+ * `planRetryCrop` 里 —— 它是纯算术，放在那边才能在没有 DOM 的环境里
+ * 单测；这里只负责「按计划画一张画布」。
+ */
+function renderRetryCrop(
+  source: HTMLCanvasElement,
+  plan: RetryCropPlan,
+): HTMLCanvasElement | null {
+  if (typeof document === 'undefined') return null;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = plan.targetW;
+  canvas.height = plan.targetH;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, plan.targetW, plan.targetH);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(source, plan.px, plan.py, plan.pw, plan.ph, 0, 0, plan.targetW, plan.targetH);
+  return canvas;
 }

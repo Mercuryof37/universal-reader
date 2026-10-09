@@ -39,7 +39,7 @@
 
 /** 疑似「有墨迹但没被识别」的区域（坐标与传入的 ImageData 同一坐标系） */
 export type { MissedInkRegion } from '@/lib/ocrTypes';
-import type { MissedInkRegion } from '@/lib/ocrTypes';
+import type { MissedInkRegion, OcrWord } from '@/lib/ocrTypes';
 
 export interface InkRegionOptions {
   /** 深色判定阈值：亮度低于它算墨迹。与空白页判定同一口径 */
@@ -339,4 +339,140 @@ export function overlapRatio(
   const smaller = Math.min((a.x1 - a.x0) * (a.y1 - a.y0), (b.x1 - b.x0) * (b.y1 - b.y0));
   if (smaller <= 0) return 0;
   return (w * h) / smaller;
+}
+
+/**
+ * 「局部重试」结果的准入：坐标换算回页面坐标系 + 去重。纯函数。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么重试结果不能直接追加
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 重试是在**裁剪片段**上跑的（裁剪带一圈 padding，给公式留上下文），
+ * 于是有两件事必须在准入时处理：
+ *
+ *  1. **坐标换算**：识别器量到的框是「放大后的裁剪图」坐标。
+ *     不换算就追加，救回的文字会出现在错误的位置 —— 比没有更糟；
+ *  2. **邻居文字**：padding 会把旁边的正文一起裁进来、一起被识别出来。
+ *     与既有词重叠的一律丢弃，否则重试会把内容**复制一遍**
+ *     （重复内容属于「更糟」的那一类错误，见文件顶部对空串丢失的说明）。
+ *
+ * @param items    重试返回的原始结果（坐标在裁剪图上，0-1 置信度）
+ * @param frame    裁剪帧：在页面上的原点与放大系数
+ * @param existing 已识别出的词（坐标在页面坐标系）
+ */
+export function admitRetryWords(
+  items: readonly {
+    text: string;
+    confidence: number;
+    box: { x: number; y: number; width: number; height: number };
+  }[],
+  frame: { originX: number; originY: number; scale: number },
+  existing: readonly { bbox: { x0: number; y0: number; x1: number; y1: number } }[],
+  overlapDrop = 0.5,
+): OcrWord[] {
+  const scale = frame.scale > 0 ? frame.scale : 1;
+  const admitted: OcrWord[] = [];
+
+  for (const item of items) {
+    const text = item.text.trim();
+    if (!text) continue;
+
+    const x0 = frame.originX + item.box.x / scale;
+    const y0 = frame.originY + item.box.y / scale;
+    const bbox = {
+      x0,
+      y0,
+      x1: x0 + item.box.width / scale,
+      y1: y0 + item.box.height / scale,
+    };
+    if (!(bbox.x1 > bbox.x0) || !(bbox.y1 > bbox.y0)) continue;
+
+    if (existing.some((w) => overlapRatio(w.bbox, bbox) >= overlapDrop)) continue;
+    if (admitted.some((w) => overlapRatio(w.bbox, bbox) >= overlapDrop)) continue;
+
+    admitted.push({
+      text,
+      // 与主识别路径同一口径：PaddleOCR 给 0-1，`OcrWord.confidence` 存 0-100
+      confidence: Math.round(item.confidence * 100),
+      bbox,
+      fontSize: item.box.height / scale,
+    });
+  }
+
+  return admitted;
+}
+
+/** 裁剪四周的留白比例（漏识别区域坐标来自 16px 网格，边缘是量化过的） */
+const RETRY_CROP_PAD_RATIO = 0.08;
+
+/**
+ * 「漏识别区域 → 放大裁剪」的几何计划（纯函数，不分配画布）。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么这段算术单独放一个函数
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 因为**像素预算必须在分配画布之前算出来**：预算要看放大后的面积，
+ * 而面积又取决于像素上限对放大倍数的压制。这段算术只留这一处实现，
+ * 规划与渲染两步（`ocrEngine` 里的 `renderRetryCrop`）就不会各算各的、
+ * 慢慢漂移；放在本模块里也意味着它可以**在没有 DOM 的环境里单测**。
+ *
+ * 坐标契约：`px/py` 是裁剪矩形在**原图坐标系**里的左上角，
+ * `scale` 是放大倍数（≥1）。识别结果映射回原图是
+ * `原图 = px + 裁剪坐标 / scale` —— 与 `admitRetryWords` 的 frame 参数一致。
+ *
+ * 边界处理：区域的一部分越出页面时按页面裁掉（`pw/ph` 只取剩下的部分），
+ * 而不是把画布画到页面外。
+ */
+export interface RetryCropPlan {
+  px: number;
+  py: number;
+  pw: number;
+  ph: number;
+  scale: number;
+  targetW: number;
+  targetH: number;
+}
+
+export function planRetryCrop(
+  sourceWidth: number,
+  sourceHeight: number,
+  bbox: { x0: number; y0: number; x1: number; y1: number },
+  upscale: number,
+  maxPixels: number,
+  padRatio = RETRY_CROP_PAD_RATIO,
+): RetryCropPlan | null {
+  if (!(sourceWidth > 0) || !(sourceHeight > 0)) return null;
+
+  const x = Math.max(0, Math.floor(bbox.x0));
+  const y = Math.max(0, Math.floor(bbox.y0));
+  const w = Math.min(Math.ceil(bbox.x1 - bbox.x0), sourceWidth - x);
+  const h = Math.min(Math.ceil(bbox.y1 - bbox.y0), sourceHeight - y);
+  if (w < 1 || h < 1) return null;
+
+  // 四周留白：检测器在紧贴笔画的位置切框时容易把大括号的钩切掉。
+  // 留白会把旁边的正文带进裁剪（重复词由 `admitRetryWords` 挡掉）。
+  const pad = Math.max(2, Math.round(Math.max(w, h) * padRatio));
+  const px = Math.max(0, x - pad);
+  const py = Math.max(0, y - pad);
+  const pw = Math.min(w + pad * 2, sourceWidth - px);
+  const ph = Math.min(h + pad * 2, sourceHeight - py);
+  if (pw < 1 || ph < 1) return null;
+
+  // 放大受像素上限的压制；**永远不缩小** —— 原尺度虽然是已经失败过的，
+  // 但不会更差，而缩小只会让失败的原因（笔画粘连）更严重。
+  // 上限不合法（≤0 或非有限值）时按「不放大」处理。
+  const fit = maxPixels > 0 && Number.isFinite(maxPixels) ? Math.sqrt(maxPixels / (pw * ph)) : 1;
+  const scale = Math.max(1, Math.min(upscale, fit));
+
+  return {
+    px,
+    py,
+    pw,
+    ph,
+    scale,
+    targetW: Math.max(1, Math.round(pw * scale)),
+    targetH: Math.max(1, Math.round(ph * scale)),
+  };
 }

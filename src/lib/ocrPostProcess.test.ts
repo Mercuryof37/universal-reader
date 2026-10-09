@@ -1788,3 +1788,85 @@ describe('真实第 1 词（整条链路）：真实的那些误判一个都不�
   });
 });
 
+
+// ═══════════════════════════════════════════════════════════════
+// 页眉页脚：裁剪而不是整行删（同一行里混着正文词）
+// ═══════════════════════════════════════════════════════════════
+
+describe('页眉页脚：同一行里混着正文时只裁掉家具词，不许整行删', () => {
+  /**
+   * 构造：页眉词与正文词落进**同一个 y 桶**（中心相距 5px，正好卡在
+   * `SAME_LINE_TOLERANCE` 上）。旧实现把整行判成页面家具后整行删掉，
+   * 正文「正文续行」随之消失 —— 段落断头，而且用户看不到原因。
+   */
+  const header = w('页眉', 440, 90, 36, 100, 95); // 中心 108 ≤ 111.15（上边缘带内）
+  const bodyOnSameLine = w('正文续行', 225, 92, 42, 600, 92); // 中心 113 > 111.15（带外）
+  const rest = [
+    w('接下来是正常的正文内容，用来把中位字号钉在 42。', 225, 250, 42, 1379, 92),
+    w('第二行正文内容同样要达到足够的宽度。', 225, 314, 42, 1200, 92),
+    w('第三行正文内容，保证页面至少有三行。', 225, 378, 42, 1100, 92),
+  ];
+
+  it('页眉词被裁掉，正文词一个都不能少', () => {
+    const blocks = ocrResultToBlocks(
+      pageResult({ words: [header, bodyOnSameLine, ...rest] }),
+      REAL_CANVAS_HEIGHT,
+    );
+    const text = blocks.map((b) => b.content).join('\n');
+
+    expect(text).toContain('正文续行');
+    expect(text).not.toContain('页眉');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// 英文换行断词回接（dehyphenation）
+// ═══════════════════════════════════════════════════════════════
+
+describe('英文换行断词回接', () => {
+  it('`inter-` + `national` 回接成一个词（词级坐标路径）', () => {
+    const words = [
+      w('This chapter introduces the inter-', 225, 200, 42, 900, 92),
+      w('national standard for floating point.', 225, 260, 42, 950, 92),
+      w('The rest of the paragraph continues here.', 225, 320, 42, 1000, 92),
+    ];
+    const content = ocrResultToBlocks(pageResult({ words }), REAL_CANVAS_HEIGHT)
+      .map((b) => b.content)
+      .join('\n');
+
+    expect(content).toContain('international');
+    expect(content).not.toContain('inter-');
+  });
+
+  it('数字开头的下一段不回接：`e-` + `5` 保留连字符与空格', () => {
+    const words = [
+      w('The value grows like e-', 225, 200, 42, 900, 92),
+      w('5 times per second in the limit.', 225, 260, 42, 950, 92),
+      w('Another sentence keeps the paragraph going.', 225, 320, 42, 1000, 92),
+    ];
+    const content = ocrResultToBlocks(pageResult({ words }), REAL_CANVAS_HEIGHT)
+      .map((b) => b.content)
+      .join('\n');
+
+    expect(content).toContain('e- 5');
+  });
+
+  it('大写开头的下一段不回接：`T-` + `cell` 保留连字符', () => {
+    const words = [
+      w('The device is called a T-', 225, 200, 42, 900, 92),
+      w('cell receptor in the paper.', 225, 260, 42, 950, 92),
+      w('Another sentence keeps the paragraph going.', 225, 320, 42, 1000, 92),
+    ];
+    const content = ocrResultToBlocks(pageResult({ words }), REAL_CANVAS_HEIGHT)
+      .map((b) => b.content)
+      .join('\n');
+
+    expect(content).toContain('T- cell');
+  });
+
+  it('纯文本兜底路径同样回接', () => {
+    const blocks = ocrTextToBlocks('The inter-\nnational standard');
+    expect(blocks[0]?.content).toContain('international');
+    expect(blocks[0]?.content).not.toContain('inter-');
+  });
+});

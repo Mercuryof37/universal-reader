@@ -233,9 +233,15 @@ function mergeShortChunks(chunks: string[], minLength = 20, maxMerged = 400): st
       !/[。！？!?.;；:：]$/.test(prev);
 
     if (shouldMerge) {
-      // 中文之间不加空格，英文之间加空格
-      const joiner = /[\u4e00-\u9fff]$/.test(prev) ? '' : ' ';
-      out[out.length - 1] = `${prev}${joiner}${chunk}`;
+      // 行尾断词先回接（`inter-` + `national` → `international`），
+      // 否则才按「中文之间不加空格，英文之间加空格」拼接
+      const dehyphenated = dehyphenate(prev, chunk);
+      if (dehyphenated !== null) {
+        out[out.length - 1] = dehyphenated;
+      } else {
+        const joiner = /[\u4e00-\u9fff]$/.test(prev) ? '' : ' ';
+        out[out.length - 1] = `${prev}${joiner}${chunk}`;
+      }
     } else {
       out.push(chunk);
     }
@@ -442,8 +448,13 @@ export function ocrResultToBlocks(
       currentFontSize = line.fontSize;
       currentScripts = line.hasScripts ? 1 : 0;
     } else {
-      const joiner = /[\u4e00-\u9fff]$/.test(currentText) ? '' : ' ';
-      currentText = `${currentText}${joiner}${line.text}`;
+      const dehyphenated = dehyphenate(currentText, line.text);
+      if (dehyphenated !== null) {
+        currentText = dehyphenated;
+      } else {
+        const joiner = /[\u4e00-\u9fff]$/.test(currentText) ? '' : ' ';
+        currentText = `${currentText}${joiner}${line.text}`;
+      }
       currentConfSum += line.avgConfidence * line.words.length;
       currentConfCount += line.words.length;
       if (line.hasScripts) currentScripts++;
@@ -555,6 +566,21 @@ export function ocrResultToBlocks(
  *   · 找不到同侧邻居时（整页只有一行等）不判。
  *
  * ⚠️ 为什么留标记而不是就地删掉：判断依据要能被追问（见 `OcrLine`）。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 摘除是**裁剪**而不是整行删（第二次修正）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 「判为页面家具 → 整行删掉」有一个代价：页眉/页脚的词与正文词被分进
+ * **同一行**时（同一 y 桶，见 `groupWordsIntoLines` 的分桶容差），
+ * 正文会跟着页眉一起消失 —— 段落就此断头，而用户看不到原因。
+ *
+ * 所以只在**整行的词都落在边缘带内**时才整行摘掉；只要行里还有带外的词
+ * （正文词天然如此），就只裁掉带内的词、保留带外的并重算该行的统计量。
+ *
+ * 判「词在带内」用**词中心**（与 `line.y` 同一口径）：实测那份习题 PDF 的
+ * 页眉框 y=[80,116]、中心 98，而边缘带只到 111 —— 若按「整框在带内」判，
+ * 这个真页眉会因为下沿越界 5px 而漏掉（既有回归用例会红）。
  */
 function filterHeaderFooter(
   lines: OcrLine[],
@@ -581,7 +607,32 @@ function filterHeaderFooter(
     }
   }
 
-  return marked.filter((line) => line.isPageFurniture !== true);
+  const kept: OcrLine[] = [];
+  for (const line of marked) {
+    if (line.isPageFurniture !== true) {
+      kept.push(line);
+      continue;
+    }
+
+    const isTop = line.y < topThreshold;
+    const bandEdge = isTop ? topThreshold : bottomThreshold;
+    const content = line.words.filter((word) =>
+      isTop ? centerY(word) > bandEdge : centerY(word) < bandEdge,
+    );
+
+    // 一个词都留不下 → 整行都在边缘带里，这就是页面家具，照旧整行摘掉
+    if (!content.length) continue;
+
+    kept.push({
+      ...line,
+      words: content,
+      fontSize: content.reduce((sum, w) => sum + w.fontSize, 0) / content.length,
+      avgConfidence: content.reduce((sum, w) => sum + w.confidence, 0) / content.length,
+      isPageFurniture: undefined,
+    });
+  }
+
+  return kept;
 }
 
 /**
@@ -1973,6 +2024,28 @@ function appendWithJoin(left: string, right: string): string {
     (WORD_CHAR_RE.test(b) || b === '(' || b === '[' || b === '{');
 
   return join ? `${left} ${right}` : `${left}${right}`;
+}
+
+/**
+ * 英文换行断词的连字符回接（dehyphenation）。
+ *
+ * `inter-` + `national` 是**同一个词**在行尾被断开，应当拼成 `international`；
+ * 英文书里这类断词极常见（中文没有，中文不在行尾插连字符）。
+ *
+ * 只在**两侧都是小写 ASCII 字母**时回接：`X-` + `ray`、`2-` + `3`、
+ * `e-` + `5` 这些一律原样保留连字符。没有词典可分「词内断开」与
+ * 「本来就带连字符」（`well-known` 在行尾断开时形态一模一样），
+ * 这条规则把误伤面压到最小：大写/数字开头的下一段几乎不可能是
+ * 被拆开的词内片段。
+ *
+ * 返回 `null` 表示「不是回接场景」，调用方走原来的加分隔符逻辑。
+ */
+const DEHYPHEN_TAIL_RE = /[a-z][-‐]$/;
+const DEHYPHEN_HEAD_RE = /^[a-z]/;
+
+function dehyphenate(left: string, right: string): string | null {
+  if (!DEHYPHEN_TAIL_RE.test(left) || !DEHYPHEN_HEAD_RE.test(right)) return null;
+  return left.slice(0, -1) + right;
 }
 
 // ───────────────────────────────────────────────────────────────
