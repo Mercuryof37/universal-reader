@@ -28,7 +28,9 @@ import {
   groupScriptFragments,
   type CharScript,
   type CharSizeTable,
+  type InkEvidenceBox,
 } from '@/lib/ocrCharBoxes';
+import { getTesseractEvidence } from '@/lib/ocrTesseractScripts';
 
 interface OcrLine {
   words: OcrWord[];
@@ -1317,6 +1319,7 @@ export const CHAR_SCRIPT_ENABLED = true;
 function resolveCharScripts(
   word: OcrWord,
   sizeTable?: CharSizeTable,
+  evidence?: ReadonlyArray<InkEvidenceBox> | null,
 ): { chars: OcrChar[]; scripts: CharScript[] } | null {
   const attached = getAttachedChars(word);
   if (!attached) return null;
@@ -1376,8 +1379,17 @@ function resolveCharScripts(
    * `sizeTable` 是**页级**的字符高度表（机制 5）：由 `groupWordsIntoLines`
    * 在建行之前扫一遍所有词算出来，逐层传到这里。为 `undefined` 时
    * 机制 5 不启用 —— 与「没有字符框」一样，是一条显式的降级路径。
+   *
+   * `evidence` 是**第二意见**（tesseract 的字符框）给出的证据框，由
+   * `ocrEngine` 在字符框挂完之后、建行之前算好并挂在词上（`WeakMap`，
+   * 与字符框同一套做法）。它只在 `findRescuableRuns` 圈出候选段、
+   * 且这段被证据覆盖时才起作用 —— 拿不到就是 `undefined`，
+   * 救回机制完全不启用（与改动前逐字节相同）。
+   *
+   * ⚠️ 坐标必须是**词框坐标系**：`attachTesseractEvidence` 负责映射
+   * （裁剪内 → 除以放大倍数 → 加裁剪原点 → 除以 scale），这里只管传。
    */
-  const scripts = classifyCharsByGeometry(measurements, chars, confidences, sizeTable);
+  const scripts = classifyCharsByGeometry(measurements, chars, confidences, sizeTable, evidence);
   return scripts.length ? { chars, scripts } : null;
 }
 
@@ -2216,8 +2228,15 @@ function assembleLineText(
      * `lib/ocrCharBoxes.ts` 给出的逐字符框能直接量出「x 比主字小、
      * 而且底边高出基线」，于是这里优先按字符切分。
      * **拿不到字符框的词走下面的原路径，输出与改动前逐字符一致。**
+     *
+     * `getTesseractEvidence(word)` 是**第二意见**的证据框：只有被它覆盖的
+     * 候选段才会绕开机制 2/5 被救回（实测第 1 词的真指数 `x+y−2` 走这条）。
+     * 没问过的词拿到 `undefined`，`classifyCharsByGeometry` 里救回一览
+     * 直接不启用 —— 这一段与引入第二意见之前逐字节相同。
      */
-    const charScripts = CHAR_SCRIPT_ENABLED ? resolveCharScripts(word, sizeTable) : null;
+    const charScripts = CHAR_SCRIPT_ENABLED
+      ? resolveCharScripts(word, sizeTable, getTesseractEvidence(word))
+      : null;
     if (charScripts) {
       const emitted = emitWordWithCharScripts(word.text, charScripts, charScripts.scripts);
       text = appendWithJoin(text, emitted.text);

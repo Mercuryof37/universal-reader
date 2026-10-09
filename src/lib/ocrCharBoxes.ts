@@ -157,7 +157,12 @@ export interface OcrCanvasLike {
 
 export type CanvasFactory = (width: number, height: number) => OcrCanvasLike;
 
-function defaultCanvasFactory(width: number, height: number): OcrCanvasLike {
+/**
+ * 默认画布工厂。除了本模块自己用，`ocrTesseractScripts` 也直接复用它 ——
+ * 「在浏览器里怎么造一块画布」不该有两个实现（两者面对的是同一批环境：
+ * 有 `OffscreenCanvas` 就用它，没有就退回 DOM 画布，都没有就抛）。
+ */
+export function defaultCanvasFactory(width: number, height: number): OcrCanvasLike {
   if (typeof OffscreenCanvas !== 'undefined') {
     return new OffscreenCanvas(width, height) as unknown as OcrCanvasLike;
   }
@@ -170,8 +175,15 @@ function defaultCanvasFactory(width: number, height: number): OcrCanvasLike {
   throw new Error('当前环境没有可用的画布实现');
 }
 
-/** 把一块源区域画到新画布上，尺寸由 drawImage 缩放（与库的 resize 路径一致） */
-function blitResized(
+/**
+ * 把一块源区域画到新画布上，尺寸由 drawImage 缩放（与库的 resize 路径一致）。
+ *
+ * 导出它的理由与 `defaultCanvasFactory` 相同：`ocrTesseractScripts` 要把
+ * 词框裁出来**并放大**（tesseract 在 4 倍上才分得开指数的笔画），
+ * 而「裁剪 + 缩放」这件事只能有一个实现 —— 两处各写一遍，
+ * 裁剪边界差一个像素就会让两套字符框对不上。
+ */
+export function blitResized(
   source: OcrCanvasLike,
   sx: number,
   sy: number,
@@ -1293,6 +1305,104 @@ function ownHeightAccepts(
   return px / full < SCRIPT_MECH5_SCALEDOWN_RATIO;
 }
 
+/** 机制 1 的产出：与 `kept` 逐位对齐的位置分类 */
+interface ScriptLayout {
+  /** 通过基准中位数与异常值过滤的字符下标（升序） */
+  kept: number[];
+  /** 与 `kept` 逐位对齐：每个字符是 normal / super / sub */
+  pos: Array<'normal' | ScriptKind>;
+}
+
+/**
+ * 机制 1（几何位置分类）的**独立实现**，供两处共用：
+ *
+ *  1. `classifyCharsByGeometry` 的逐字符过滤（原本就是这段内联代码）；
+ *  2. `findRescuableRuns` 的段发现 —— 救回机制必须与判定用**同一套**
+ *     候选定义，否则「哪一段是候选」会在两个地方各算一遍、各错一样。
+ *
+ * 返回 null 表示闸门没过（可测字符不足 / 基准高度非正 / 连基线都定不下来），
+ * 与原来各个 `return []` 的时机逐一对应。
+ */
+function computeScriptLayout(
+  measurements: ReadonlyArray<InkMeasurement | null | undefined>,
+): ScriptLayout | null {
+  const idx: number[] = [];
+  for (let i = 0; i < measurements.length; i++) {
+    const m = measurements[i];
+    if (m && m.h > 0) idx.push(i);
+  }
+  if (idx.length < SCRIPT_MIN_MEASURED_CHARS) return null;
+
+  /**
+   * ═══════════════════════════════════════════════════════════════
+   * 基准高度 = **中位数**（机制 1）
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 为什么是它而不是「最大值 / 上四分位数」：这份真实数据里
+   * p75 = 0.708 而 max = 1.361，两者相差一倍 —— 取分位数就等于让
+   * 「拉丁字母」去和「被异常框撑大的基准」比，那一定判成「更矮」。
+   * 中位数既挪不动（抗异常值），又不需要假设「总有更大的正常字」。
+   */
+  const mainHeight = medianOf(idx.map((i) => measurements[i]?.h ?? 0));
+  if (!(mainHeight > 0)) return null;
+
+  // 丢弃明显不是本行字形的测量值（超过基准 SCRIPT_OUTLIER_RATIO 倍）
+  const kept = idx.filter((i) => (measurements[i]?.h ?? 0) <= mainHeight * SCRIPT_OUTLIER_RATIO);
+  if (kept.length < SCRIPT_MIN_MEASURED_CHARS) return null;
+
+  const bottoms = kept.map((i) => measurements[i]?.y1 ?? 0);
+  const baseline = medianOf(bottoms);
+  // 闸门：连两个「底边落在基线附近」的字符都没有时，基线本身无从谈起
+  if (bottoms.filter((b) => b <= baseline + mainHeight * 0.25).length < SCRIPT_MIN_BASELINE_CHARS) {
+    return null;
+  }
+
+  const unit = mainHeight * SCRIPT_CHAR_SHIFT_UNIT_RATIO;
+  const minShift = unit * SCRIPT_CHAR_MIN_SHIFT_RATIO;
+
+  const maxCandidateHeight = mainHeight * SCRIPT_CHAR_MAX_HEIGHT_RATIO;
+
+  /**
+   * 位置分类（机制 1）。顺序与 Tesseract 的 `if / else if` 逐条对齐：
+   * 先问「底边是不是抬到了基线上方」→ 再问「顶边是不是掉到了基线下方」。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * ⚠️ 位移的**上限**（`SCRIPT_CHAR_MAX_SHIFT_RATIO`）在重写后被删掉了
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 旧实现有一条「位移 ≤ 0.5 × 主字高」的判据，用来挡「下一行的小字」。
+   * 锚到基线上之后它不能留 —— 会**把真正的指数挡掉**。
+   * 实测数字（第 1 词，`mainHeight = 0.5944`）：
+   *
+   *   · 指数 `x+y−2`：底边 0.3811，基线 0.7506 → 抬高 **0.3694**
+   *     = 0.62 × mainHeight。**远超 0.5 的上限**，会被旧判据拒掉；
+   *   · 同一份数据里旧代码挑出来的 `7`/`P`：抬高只有 0.18/0.21，
+   *     反而在门槛之内 —— 也就是说这条上限**只挡对的、不挡错的**。
+   *
+   * 根因同样在「参照物」：旧上限是相对**被异常框撑大的最高字**定的，
+   * 而真实排版里指数的抬升量本来就接近半个字号。
+   *
+   * 「下一行的小字」由另外两条挡住，而且挡得更准：
+   *   · 候选高度必须 ≤ 0.8 × mainHeight（`maxCandidateHeight`）——
+   *     邻行的正文与我们这行的中位字高同量级，第一个条件就不成立；
+   *   · **机制 2 的置信度门** —— 邻行正文是被高置信度认出来的普通字。
+   * 代价是如实记下的：**只靠几何**（没有置信度）那条路径上，
+   * 「比本行中位字高小得多的、恰好悬在基线上方一行距离处的小字」
+   * 现在会被判成上标。这条路径只出现在单测与拿不到置信度的降级场景里。
+   */
+  const pos = kept.map((i) => {
+    const m = measurements[i] as InkMeasurement;
+    if (m.h > maxCandidateHeight) return 'normal' as const;
+    const up = baseline - m.y1;
+    const down = m.y0 - baseline;
+    if (up >= minShift - SHIFT_EPSILON) return 'super' as const;
+    if (down >= minShift - SHIFT_EPSILON) return 'sub' as const;
+    return 'normal' as const;
+  });
+
+  return { kept, pos };
+}
+
 /**
  * 判定一组字符里哪些是上标 / 下标。
  *
@@ -1432,86 +1542,46 @@ function ownHeightAccepts(
  *   ⚠️ **不传（`undefined`/`null`）或空表时机制 5 完全不启用** ——
  *   行为与引入它之前**逐字节相同**。这条不变量由测试守着
  *   （`ocrCharBoxes.test.ts` 的机制 5 一组里那条「不变量」用例）。
+ *
+ * @param evidence 第二意见的证据框（`ocrTesseractScripts` 的产出，**画布坐标**，
+ *   与 `chars[i].x0..y1` 同一坐标系）。不给 / 空数组 → **救回机制完全不启用**
+ *   （与「不传表时机制 5 不启用」同一约定：没有测量就没有判据）。
  */
 export function classifyCharsByGeometry(
   measurements: Array<InkMeasurement | null | undefined>,
-  chars?: ReadonlyArray<{ char: string; y0?: number; y1?: number }> | null,
+  chars?: ReadonlyArray<{ char: string; y0?: number; y1?: number; x0?: number; x1?: number }> | null,
   confidences?: ReadonlyArray<number | null | undefined> | null,
   sizeTable?: CharSizeTable | null,
+  evidence?: ReadonlyArray<InkEvidenceBox> | null,
 ): CharScript[] {
-  const idx: number[] = [];
-  for (let i = 0; i < measurements.length; i++) {
-    const m = measurements[i];
-    if (m && m.h > 0) idx.push(i);
-  }
-  if (idx.length < SCRIPT_MIN_MEASURED_CHARS) return [];
+  const layout = computeScriptLayout(measurements);
+  if (!layout) return [];
+  const { kept, pos } = layout;
 
   /**
    * ═══════════════════════════════════════════════════════════════
-   * 基准高度 = **中位数**（机制 1）
+   * 第二意见救回（见 `findRescuableRuns`）
    * ═══════════════════════════════════════════════════════════════
    *
-   * 为什么是它而不是「最大值 / 上四分位数」：这份真实数据里
-   * p75 = 0.708 而 max = 1.361，两者相差一倍 —— 取分位数就等于让
-   * 「拉丁字母」去和「被异常框撑大的基准」比，那一定判成「更矮」。
-   * 中位数既挪不动（抗异常值），又不需要假设「总有更大的正常字」。
+   * 在逐字符过滤**之前**算出该救回哪些下标：救回的意义正是绕开
+   * 机制 2 / 机制 5 —— 而那两个门恰恰在指数 `x+y−2` 上全数拒绝。
+   * 三个条件（连续段、≥2 个字母数字字符确实被缩小、≥2 个字符被
+   * tesseract 证据框覆盖）与各自的实测依据见 `findRescuableRuns`。
+   *
+   * 拿不到表或拿不到证据 → 一个都不救 → 与引入本机制前逐字节相同。
    */
-  const mainHeight = medianOf(idx.map((i) => measurements[i]?.h ?? 0));
-  if (!(mainHeight > 0)) return [];
-
-  // 丢弃明显不是本行字形的测量值（超过基准 SCRIPT_OUTLIER_RATIO 倍）
-  const kept = idx.filter((i) => (measurements[i]?.h ?? 0) <= mainHeight * SCRIPT_OUTLIER_RATIO);
-  if (kept.length < SCRIPT_MIN_MEASURED_CHARS) return [];
-
-  const bottoms = kept.map((i) => measurements[i]?.y1 ?? 0);
-  const baseline = medianOf(bottoms);
-  // 闸门：连两个「底边落在基线附近」的字符都没有时，基线本身无从谈起
-  if (bottoms.filter((b) => b <= baseline + mainHeight * 0.25).length < SCRIPT_MIN_BASELINE_CHARS) {
-    return [];
+  const rescued = new Set<number>();
+  if (evidence?.length && sizeTable && sizeTable.size > 0 && chars) {
+    for (const run of findRescuableRuns(measurements, chars, sizeTable)) {
+      let covered = 0;
+      for (let i = run.from; i <= run.to; i++) {
+        if (coveredByEvidence(chars[i], evidence)) covered++;
+      }
+      if (covered >= SCRIPT_RESCUE_MIN_EVIDENCE_CHARS) {
+        for (let i = run.from; i <= run.to; i++) rescued.add(i);
+      }
+    }
   }
-
-  const unit = mainHeight * SCRIPT_CHAR_SHIFT_UNIT_RATIO;
-  const minShift = unit * SCRIPT_CHAR_MIN_SHIFT_RATIO;
-
-  const maxCandidateHeight = mainHeight * SCRIPT_CHAR_MAX_HEIGHT_RATIO;
-
-  /**
-   * 位置分类（机制 1）。顺序与 Tesseract 的 `if / else if` 逐条对齐：
-   * 先问「底边是不是抬到了基线上方」→ 再问「顶边是不是掉到了基线下方」。
-   *
-   * ═══════════════════════════════════════════════════════════════
-   * ⚠️ 位移的**上限**（`SCRIPT_CHAR_MAX_SHIFT_RATIO`）在重写后被删掉了
-   * ═══════════════════════════════════════════════════════════════
-   *
-   * 旧实现有一条「位移 ≤ 0.5 × 主字高」的判据，用来挡「下一行的小字」。
-   * 锚到基线上之后它不能留 —— 会**把真正的指数挡掉**。
-   * 实测数字（第 1 词，`mainHeight = 0.5944`）：
-   *
-   *   · 指数 `x+y−2`：底边 0.3811，基线 0.7506 → 抬高 **0.3694**
-   *     = 0.62 × mainHeight。**远超 0.5 的上限**，会被旧判据拒掉；
-   *   · 同一份数据里旧代码挑出来的 `7`/`P`：抬高只有 0.18/0.21，
-   *     反而在门槛之内 —— 也就是说这条上限**只挡对的、不挡错的**。
-   *
-   * 根因同样在「参照物」：旧上限是相对**被异常框撑大的最高字**定的，
-   * 而真实排版里指数的抬升量本来就接近半个字号。
-   *
-   * 「下一行的小字」由另外两条挡住，而且挡得更准：
-   *   · 候选高度必须 ≤ 0.8 × mainHeight（`maxCandidateHeight`）——
-   *     邻行的正文与我们这行的中位字高同量级，第一个条件就不成立；
-   *   · **机制 2 的置信度门** —— 邻行正文是被高置信度认出来的普通字。
-   * 代价是如实记下的：**只靠几何**（没有置信度）那条路径上，
-   * 「比本行中位字高小得多的、恰好悬在基线上方一行距离处的小字」
-   * 现在会被判成上标。这条路径只出现在单测与拿不到置信度的降级场景里。
-   */
-  const pos = kept.map((i) => {
-    const m = measurements[i] as InkMeasurement;
-    if (m.h > maxCandidateHeight) return 'normal' as const;
-    const up = baseline - m.y1;
-    const down = m.y0 - baseline;
-    if (up >= minShift - SHIFT_EPSILON) return 'super' as const;
-    if (down >= minShift - SHIFT_EPSILON) return 'sub' as const;
-    return 'normal' as const;
-  });
 
   /**
    * ═══════════════════════════════════════════════════════════════
@@ -1582,6 +1652,26 @@ export function classifyCharsByGeometry(
      */
     if (CJK_CHAR_ONLY_RE.test(chars?.[i]?.char ?? '')) continue;
 
+    /**
+     * ═══════════════════════════════════════════════════════════════
+     * 第二意见救回：这几个字符已被 `findRescuableRuns` + 证据框共同选中
+     * ═══════════════════════════════════════════════════════════════
+     *
+     * 位置在机制 3 与汉字门**之后**：这两条是「这个字符在语义上不可能是
+     * 上下标」的硬事实（标点、汉字），救回不推翻它们 —— 指数的 `+`/`−`
+     * 本来就靠减号类豁免与标点判据通过，不靠救回。
+     *
+     * 位置在机制 2 / 机制 5 **之前**：救回的全部意义就是绕开这两个门。
+     * 实测（第 1 词 53 个字符）：五个指数字符的置信度
+     * 0.9953 / 0.9997 / 0.9205 / 0.957 / 0.9883 全部高于机制 2 的门槛
+     * （≈0.91），机制 5 又只能接受其中 `x`/`y`/`2` 三个 —— 不绕开
+     * 就被全数拒绝，而它恰恰是全页唯一真实的公式角标。
+     */
+    if (rescued.has(i)) {
+      out.push({ index: i, kind });
+      continue;
+    }
+
     // 机制 2：置信度正常 → 不是上下标
     if (unlikelyThreshold !== null) {
       const c = confidences?.[i];
@@ -1617,6 +1707,263 @@ export function classifyCharsByGeometry(
   }
 
   return out.sort((a, b) => a.index - b.index);
+}
+
+// ───────────────────────────────────────────────────────────────
+// 4c. 第二意见救回（tesseract 的字符框证据）
+// ───────────────────────────────────────────────────────────────
+
+/**
+ * 第二意见给出的**证据框**：一个「墨迹小且抬高了」的字符。
+ *
+ * ⚠️ 坐标系：与 `chars[i]` 的 `x0/y0/x1/y1` **同一空间**（词框 / 导出坐标，
+ * 见 `attachCharBoxes` 的 `(cropOrigin + c) / scale`）。`ocrTesseractScripts`
+ * 负责把 tesseract 的裁剪内坐标映射过来 —— 映射错了这里不会报错，
+ * 只会安静地判成「没覆盖」，所以两边都有测试盯着。
+ */
+export interface InkEvidenceBox {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+/**
+ * ═══════════════════════════════════════════════════════════════
+ * 救回段的条件 (b)：至少两个「确实被缩小的字母数字」
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 这条是**正向测量**：字符的身份是可比的字母/数字，且它在**本页**的
+ * 最大形态（`sizeTable`）比它现在大 —— 也就是「它被缩小了」这件事
+ * 有同页的对照物作证，而不是靠某一处的绝对值。
+ *
+ * 为什么是 2 而不是 1：单个字符的「更小」有太多解释（一个矮字形、
+ * 一次测量抖动、一个被切掉一半的框）。两个**连着的**字符同时成立，
+ * 才说得上「这一串是排版上特殊的」。实测第 1 词指数 `x+y−2` 里
+ * 有 `x`(7.2/20.4)、`y`(7.2/20.4)、`2`(12.3/23) 三个成立。
+ */
+export const SCRIPT_RESCUE_MIN_CONFIRM_CHARS = 2;
+
+/**
+ * ═══════════════════════════════════════════════════════════════
+ * 救回段的条件 (c)：至少两个字符被 tesseract 的证据框覆盖
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 这条是**独立证据**：另一个引擎在同一位置也量到了「小且抬高」的墨迹。
+ * 它与 (b) 量的是两件不同的事 —— (b) 只看**大小**（不与位置有关），
+ * (c) 只看**位置**（不与大小有关，因为证据框的判据已经在 tesseract 侧
+ * 用过一次高度与基线）。两条同时成立才算数，实测依据见 `findRescuableRuns`。
+ */
+export const SCRIPT_RESCUE_MIN_EVIDENCE_CHARS = 2;
+
+/**
+ * 证据框要「覆盖」一个字符，两条轴上的重叠都得达到**较短边**的这个比例。
+ *
+ * 取「较短边」而不是「字符边」：tesseract 的字形框与 CTC 的时间步框
+ * 不是一个切法，两者宽度常有系统差（CTC 框含字间距、tesseract 只框墨迹）。
+ * 拿较短的做分母，等于要求「小的一边被大的一边吃掉至少一半」——
+ * 方向保守（宁可不覆盖），与全文件一致。
+ *
+ * 实测（第 1 词指数，见测试夹具）：`x` 0.56、`y` 0.88、`2` 0.86，
+ * 三个都过线；其中 `x` 是最紧的一个，阈值每加 0.1 就会少一个覆盖 ——
+ * 但它仍有 3 个 ≥ 2，所以这条阈值的具体取值在这份数据上不翻面。
+ */
+export const SCRIPT_RESCUE_COVER_RATIO = 0.5;
+
+/** 救回的候选：可比的字母 / 数字（`\p{L}` 含汉字，故下方要单独排除） */
+const LETTER_OR_DIGIT_RE = /[\p{L}\p{N}]/u;
+
+/** `findRescuableRuns` 的一段产出：字符下标区间（含两端）与 (b) 的计数 */
+export interface ScriptRescueRun {
+  from: number;
+  to: number;
+  /** 段内同时满足「是字母数字」与「确实被缩小了」的字符数（≥ 2 才会出现在结果里） */
+  confirmChars: number;
+}
+
+/**
+ * 找出**值得请第二意见复核**的字符段。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 它要解决的缺口：机制 2 与机制 5 会**联手**把真指数拒掉
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 第 1 词（真实导出）的指数 `x+y−2` 是五个字符的连续段，实测：
+ *
+ *   · 机制 2（置信度门）：五个字符的置信度 0.9953 / 0.9997 / 0.9205 /
+ *     0.957 / 0.9883，**全部高于**门槛（≈0.91）→ 全数被拒。
+ *     这不是阈值没调好：PP-OCR 对这几个字形认得很确定 ——
+ *     而 Tesseract 的 superscript.cpp 敢用「置信度低」当判据，是因为
+ *     它的**小字天生识别得更差**。这份数据里不成立。
+ *   · 机制 5（页级字符高度）：只能接受 `x`/`y`/`2` 三个；`+` 与 `−`
+ *     在整页只以缩小形态出现（`+` 的另一个实例在第 16 词、只有 1.8 高）
+ *     → H = h → 比值 1.0 → 被拒。
+ *
+ * 两门联手的结果：**全页唯一真实的公式角标，五个字符一个都留不下。**
+ * 所以救回必须**整段绕开机制 2 与机制 5**（而不是放宽它们 ——
+ * 放宽会立刻把第 16 词、第 20 词那些误判放回来，见下）。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么段必须是**连续下标**，且救回要覆盖整段
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 组装端 `groupScriptFragments` 只把 `chars` 里**连续**的同类上下标
+ * 并成一个 `$^{...}$`。只救 `x`/`y`/`2` 三个（`+`/`−` 仍被机制 5 拒）
+ * 会输出 `$^{x}$+$^{y}$-$^{2}$` —— 三个单字上标加两个正文符号，
+ * 比不判更糟。段一旦成立就整段救回，`x+y−2` 才能成段。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 两条条件都必须存在 —— 这是两个**实测反例**逼出来的
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 反例一（第 16 词，`⋯ Z = √X² + Y 的概率密度为`）：机制 1 给出的候选段
+ * 是 `2+Y` 三个连续字符（`2` 是 X 的真上标，`+Y` 是正文）。条件 (b) 成立
+ * （`2` 11.4/23 = 0.496、`Y` 13.1/21.4 = 0.61），**只凭 (b) 就会把整段
+ * 救回来** → 输出 `$^{2+Y}$`，把正文 `+Y` 吞进上标。实测 tesseract
+ * 在这一区域的证据框是 **0 个** → (c) 拦住。
+ *
+ * 反例二（第 20 词，`⋯ X ∼ b(n₁,p),Y∼ b(n₂,p),…`）：候选段是
+ * `=∼∼∼`（等号带三个 `∼`，全是误判）。实测 tesseract 的证据框
+ * **3 个，全部压在 `∼` 上**（它就是「小而抬高」的墨迹，只是不是角标）。
+ * **只凭 (c) 就会把整段救回来** → 把 `=∼∼∼` 包成上标，恰好退回
+ * 机制 5 存在的意义。条件 (b) 在这里是 0（`=`/`∼` 都不是字母数字）→ 拦住。
+ *
+ * 于是这两条条件在这份真实数据上**各自都是载荷**：去掉任何一条，
+ * 都有一个已知的坏输出立刻回来。三个词各自的读数：
+ *
+ *   · 第 1 词指数：(b) 3 个（x/y/2）、(c) 3 个覆盖（实测 x 0.56、y 0.88、2 0.86）→ 救回 ✔
+ *   · 第 16 词 `2+Y`：(b) 2 个、(c) **0** 个 → 不救 ✔
+ *   · 第 20 词 `=∼∼∼`：(b) **0** 个、(c) 3 个 → 不救 ✔
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 拿不到输入时的行为
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * `chars` / `sizeTable` 缺任一个、或表为空 → 返回空数组（无段可救）。
+ * 这是**显式的降级路径**，与机制 5「没有表就不启用」同一约定：
+ * 没有测量就没有判据，绝不拿缺省值去判。
+ */
+export function findRescuableRuns(
+  measurements: ReadonlyArray<InkMeasurement | null | undefined>,
+  chars?: ReadonlyArray<{ char: string; y0?: number; y1?: number }> | null,
+  sizeTable?: CharSizeTable | null,
+): ScriptRescueRun[] {
+  if (!chars || !sizeTable || sizeTable.size === 0) return [];
+
+  const layout = computeScriptLayout(measurements);
+  if (!layout) return [];
+  const { kept, pos } = layout;
+
+  const runs: ScriptRescueRun[] = [];
+  let cur: { from: number; to: number } | null = null;
+
+  // 收尾时才算 (b)：段内「是的字母数字 **且** 确实被缩小了」的字符个数
+  const finish = (): void => {
+    if (!cur) return;
+    let confirmChars = 0;
+    for (let i = cur.from; i <= cur.to; i++) {
+      if (isScaledDownLetterOrDigit(chars[i], sizeTable)) confirmChars++;
+    }
+    if (confirmChars >= SCRIPT_RESCUE_MIN_CONFIRM_CHARS) {
+      runs.push({ from: cur.from, to: cur.to, confirmChars });
+    }
+    cur = null;
+  };
+
+  for (let k = 0; k < kept.length; k++) {
+    const i = kept[k] as number;
+    if (pos[k] === 'normal') {
+      finish();
+      continue;
+    }
+    // 段内必须**下标连续**：`kept` 里相邻但在原串里隔了一个字符（正常字符
+    // 或没量到墨迹的字符）就不是同一段，组装端也并不起来。
+    if (cur && i === cur.to + 1) {
+      cur.to = i;
+      continue;
+    }
+    finish();
+    cur = { from: i, to: i };
+  }
+  finish();
+
+  return runs;
+}
+
+/**
+ * 条件 (b) 的单字符判定。
+ *
+ * 与机制 5 的 `ownHeightAccepts` 有两处**刻意的不同**，都是因为这里要的是
+ * 「正向确认」而不是「不拒绝」：
+ *
+ *  1. `ownHeightAccepts` 在**拿不到像素框**时返回 `true`（不判），这里返回
+ *     `false` —— (b) 是计数，缺值不能算一个确认；
+ *  2. 这里要求字符身份是**字母 / 数字**（并排除汉字与 Unicode 上下标字符）——
+ *     实测依据就是反例二：第 20 词那三个 `∼` 与一个 `=` 在机制 5 的
+ *     「缩小」判据下全部成立（表里 `∼` 5.1 vs 它自己 5.1 不成立，
+ *     但 `=` 6.2 vs 6.2 同样不成立 —— 总之它们提供不了正向的
+ *     「被缩小」证据），而真正的问题是**它们根本不是角标该有的字符**。
+ *
+ * ⚠️ `\p{L}` **包含汉字**（`均`/`为`/`正` 都是 `Lo`），所以必须显式排除 ——
+ * 与 `classifyCharsByGeometry` 里那道汉字门同一个理由、同一个正则。
+ */
+function isScaledDownLetterOrDigit(
+  entry: { char: string; y0?: number; y1?: number } | undefined,
+  table: CharSizeTable,
+): boolean {
+  const char = entry?.char ?? '';
+  if (!char.trim()) return false;
+  if (isUnicodeScriptChar(char)) return false;
+  if (CJK_CHAR_ONLY_RE.test(char)) return false;
+  if (!LETTER_OR_DIGIT_RE.test(char)) return false;
+
+  const y0 = entry?.y0;
+  const y1 = entry?.y1;
+  if (typeof y0 !== 'number' || typeof y1 !== 'number') return false;
+  const px = y1 - y0;
+  if (!Number.isFinite(px) || px <= 0) return false;
+
+  const full = table.get(charSizeKey(char));
+  if (full === undefined || !(full > 0)) return false;
+  return px / full < SCRIPT_MECH5_SCALEDOWN_RATIO;
+}
+
+/** 一条轴上，`[b0,b1]` 被 `[a0,a1]` 覆盖的比例（分母 = 两条里**较短**的那条） */
+function axisCoverage(a0: number, a1: number, b0: number, b1: number): number {
+  const overlap = Math.min(a1, b1) - Math.max(a0, b0);
+  if (!(overlap > 0)) return 0;
+  const minDim = Math.min(a1 - a0, b1 - b0);
+  if (!(minDim > 0)) return 0;
+  return overlap / minDim;
+}
+
+/**
+ * 条件 (c) 的单字符判定：这个字符的像素框是否被**任一个**证据框覆盖
+ * （两条轴的重叠都 ≥ `SCRIPT_RESCUE_COVER_RATIO`）。
+ *
+ * 拿不到字符框 → `false`（覆盖是计数，缺值不算）。
+ * 证据框里只要有一个成立即可 —— 多个证据框是**多个**独立观察，
+ * 任意一个与这个字符对上就够，不需要它们互相一致。
+ */
+function coveredByEvidence(
+  entry: { x0?: number; y0?: number; x1?: number; y1?: number } | undefined,
+  evidence: ReadonlyArray<InkEvidenceBox>,
+): boolean {
+  const x0 = entry?.x0;
+  const y0 = entry?.y0;
+  const x1 = entry?.x1;
+  const y1 = entry?.y1;
+  if (typeof x0 !== 'number' || typeof x1 !== 'number') return false;
+  if (typeof y0 !== 'number' || typeof y1 !== 'number') return false;
+  if (!(x1 > x0) || !(y1 > y0)) return false;
+
+  for (const e of evidence) {
+    if (axisCoverage(x0, x1, e.x0, e.x1) >= SCRIPT_RESCUE_COVER_RATIO &&
+        axisCoverage(y0, y1, e.y0, e.y1) >= SCRIPT_RESCUE_COVER_RATIO) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**

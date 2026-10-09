@@ -45,8 +45,9 @@ export default defineConfig({
      * - **预缓存**（precache）：构建产物里的入口 chunk、样式、图标。
      *   这些是「能打开页面」的最小集合，必须离线可用。
      * - **运行时缓存**（runtimeCaching）：pdfjs 的 WASM 解码器、
-     *   PaddleOCR 的模型与 ONNX Runtime WASM。它们的体积大（合计数十 MB）、
-     *   按需下载，不适合预缓存，用 CacheFirst 让「用过一次之后离线也能用」。
+     *   PaddleOCR 的模型与 ONNX Runtime WASM、tesseract 的 core / worker /
+     *   语言数据。它们的体积大（合计数十 MB）、按需下载，不适合预缓存，
+     *   用 CacheFirst 让「用过一次之后离线也能用」。
      */
     VitePWA({
       registerType: 'autoUpdate',
@@ -86,10 +87,24 @@ export default defineConfig({
         //   quickjs-eval.wasm / quickjs-eval.js —— pdf.js 的 JS 沙箱求值特性
         //   *_nowasm_fallback.js —— 浏览器不支持 WASM 时的纯 JS 兜底
         // 合计约 1MB。预缓存它们会让首访的安装体积白白翻倍。
+        //
+        // ⚠️ tesseract 第二意见资产（tess/、tess-core/、tessdata/，约 14.8MB）
+        // 同理**必须排除**：默认 globPatterns 里的 `**/*.js` 会把
+        //   tess/worker.min.js                    111KB
+        //   tess-core/tesseract-core-*-lstm.wasm.js  ×3 变体 ≈11.7MB
+        // 全部卷进预缓存 —— 而这三个 core 变体浏览器**只会用到其中一个**
+        // （SIMD × 多线程 的组合探测），首访白下 11.8MB。
+        // 它们和 OCR 模型同一性质：功能可用性不依赖 SW，
+        // 走运行时 CacheFirst（见下方 runtimeCaching 的 tess 路由），
+        // 第一次真正用到才下载，之后离线可用。
+        // 注意 scripts/verify-dist.mjs 的第 2d/5 节会把这条约束当构建门禁来查。
         globIgnores: [
           '**/pdfjs-wasm/quickjs-eval*',
           '**/pdfjs-wasm/*_nowasm_fallback.js',
           '**/ort-wasm*',
+          '**/tess/**',
+          '**/tess-core/**',
+          '**/tessdata/**',
         ],
 
         // 单文件预缓存上限。pdfWorkerEntry 有 1.15MB，默认的 2MB 够用，
@@ -185,6 +200,31 @@ export default defineConfig({
             options: {
               cacheName: 'ocr-models',
               expiration: { maxEntries: 30, maxAgeSeconds: 60 * 60 * 24 * 365 },
+              cacheableResponse: { statuses: [0, 200] },
+            },
+          },
+          {
+            /**
+             * tesseract 第二意见的资产（core 的 3 个 lstm 变体 ≈ 12MB、
+             * worker ≈ 0.03MB、`eng.traineddata.gz` ≈ 3MB），全部同源 ——
+             * `scripts/fetch-tess-assets.mjs` 在构建时落盘。
+             *
+             * ⚠️ **不能漏掉任何一类路径**，否则对应的那次调用会去
+             * 联网重下：
+             *   · `/tess-core/` —— core 的 wasm.js（内含 base64 的 wasm）；
+             *   · `/tess/`      —— worker 脚本本体；
+             *   · `/tessdata/`  —— 语言数据。
+             * 三者里漏一个，离线时那条 fetch 就失败 → worker 建不起来 →
+             * 第二意见静默降级（识别结果不受影响，但角标救回不生效）。
+             *
+             * 与 OCR 模型同理：**不预缓存**（可选功能，十几 MB 不该
+             * 计入首访安装体积），CacheFirst 保证「用过一次之后离线也能用」。
+             */
+            urlPattern: /\/(tess-core|tess|tessdata)\//,
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'tess-assets',
+              expiration: { maxEntries: 20, maxAgeSeconds: 60 * 60 * 24 * 365 },
               cacheableResponse: { statuses: [0, 200] },
             },
           },

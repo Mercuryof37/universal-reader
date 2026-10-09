@@ -29,5 +29,19 @@ public/pdfjs-wasm
 # 同源请求不受这些差异影响。
 public/ocr-models
 
+# tesseract.js 的资产（角标第二意见用），由 scripts/fetch-tess-assets.mjs 在
+# predev/prebuild 时搬运/下载生成，与站点同源发布。
+#
+# 三个子目录各自的角色：
+#   tess-core/   wasm 内核（三个 -lstm 变体，各约 3.9MB、内嵌 wasm 本体）
+#   tess/        worker 脚本（worker.min.js，111KB）
+#   tessdata/    eng 语言模型（eng.traineddata.gz，2.95MB）
+#
+# 为什么不入库：与 pdfjs-wasm / ocr-models 同理，第三方依赖的产物，
+# 入库会在依赖升级后留下与版本不一致的副本（脚本用 sha256 钉住版本）。
+public/tess-core
+public/tess
+public/tessdata
+
 # Wrangler 本地开发变量（含密钥，绝不入库）
 .dev.vars

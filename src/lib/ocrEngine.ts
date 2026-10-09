@@ -22,11 +22,17 @@ import { resolveExecutionProviders } from '@/lib/ocrExecutionProvider';
 import { noteOcrStage } from '@/lib/sessionDiagnostics';
 import {
   attachCharBoxes,
+  buildCharSizeTable,
   clearCharBoxSkips,
   createWordCharBoxRecognizer,
   recordCharBoxSkip,
 } from '@/lib/ocrCharBoxes';
 import type { OcrCanvasLike } from '@/lib/ocrCharBoxes';
+import {
+  attachTesseractEvidence,
+  clearTesseractEvidence,
+  resetScriptSecondOpinion,
+} from '@/lib/ocrTesseractScripts';
 import {
   detectMissedInkRegionsFromCanvas,
   overlapRatio,
@@ -375,6 +381,12 @@ class OcrEngine {
     const words: OcrWord[] = [];
     // 每页开始前清空「取不到字符框」的原因记录，否则会跨页累积
     clearCharBoxSkips();
+    /**
+     * 第二意见的证据同样**按页**清空（worker 留着不销毁，见
+     * `clearTesseractEvidence` 的说明）：证据挂在词上，词换了就再也
+     * 查不到，留着只会在诊断里制造「上一页的坐标」这种假象。
+     */
+    clearTesseractEvidence();
     for (const item of result.results) {
       const text = item.text.trim();
       if (!text) continue;
@@ -430,6 +442,57 @@ class OcrEngine {
         }
       } catch (err) {
         console.warn('[ocrEngine] 字符级坐标附加失败（识别结果不受影响）：', err);
+      }
+
+      /**
+       * ═══════════════════════════════════════════════════════════════
+       * 第二意见：用 tesseract 的字符框复核角标候选段（懒加载、可缺席）
+       * ═══════════════════════════════════════════════════════════════
+       *
+       * 机制 1~5 全部建立在**同一次识别**的产出上，所以同一个引擎的系统
+       * 偏差会被四条判据一起继承 —— 实测第 1 词的真指数 `x+y−2` 就是这样
+       * 被机制 2（置信度 0.99+）与机制 5（`+`/`−` 在整页只有缩小形态）
+       * 联手拒掉的。这里换一个引擎（tesseract.js，资产自托管、懒加载）
+       * 在同一位置量一次「小而抬高的墨迹」作为**独立证据**。
+       *
+       * 顺序有两条硬要求：
+       *  1. **必须在 `attachCharBoxes` 之后**：预筛（`findRescuableRuns`）
+       *     要读 CTC 的逐字符框，没有它一个词都不会被筛出来；
+       *  2. **必须在 `ocrResultToBlocks` 之前**（也就是这里）：判据在
+       *     后处理里跑，证据那时必须已经挂在词上。
+       *
+       * `sizeTable` 与后处理里用的是**同一个函数、同一批词**算出来的
+       * （`buildCharSizeTable` 只读挂好的字符框，纯函数、无副作用），
+       * 所以两边的「全尺寸高度」逐字节一致 —— 预筛与判定看到的
+       * 是同一个世界。
+       *
+       * ⚠️ 同样是**渐进增强**：worker 建不起来（离线首次访问、资产被拦）
+       * 时返回 0，`words` 与改动前逐字节相同，只是这一页没有救回。
+       */
+      if (words.length) {
+        try {
+          const sizeTable = buildCharSizeTable(words);
+          const evidenceCount = await attachTesseractEvidence(words, {
+            canvas: recognizedCanvas as unknown as OcrCanvasLike,
+            scale: factor < 0.999 ? factor : 1,
+            sizeTable,
+            onSkip: (word, reason) => {
+              recordCharBoxSkip(word.text, `第二意见：${reason}`);
+              console.info(
+                `[ocrEngine] 第 ${pageNum} 页词「${word.text.slice(0, 20)}」无第二意见：${reason}`,
+              );
+            },
+            onInfo: (message) => console.info(`[ocrEngine] ${message}`),
+          });
+          if (evidenceCount) {
+            console.info(
+              `[ocrEngine] 第 ${pageNum} 页 ${evidenceCount} 个词取到第二意见证据` +
+                `（tesseract 字符框，用于救回被机制 2/5 误拒的角标段）`,
+            );
+          }
+        } catch (err) {
+          console.warn('[ocrEngine] 第二意见附加失败（识别结果不受影响）：', err);
+        }
       }
     }
 
@@ -610,6 +673,9 @@ class OcrEngine {
     this.initialized = false;
     this.charBoxRecognizer = null;
     this.charBoxRecognizerPromise = null;
+    // 第二意见的 worker 也要收掉：它自己持有一份 WASM 运行时与语言数据，
+    // 不 terminate 就是一段活到页面关闭的内存（若一直没建过，这里是空操作）
+    resetScriptSecondOpinion();
   }
 
   get isReady(): boolean {

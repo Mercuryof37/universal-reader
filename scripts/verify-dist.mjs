@@ -136,6 +136,40 @@ for (const file of walk(dist)) {
   );
 }
 
+// ── 2d. tesseract 第二意见资产（自托管，懒加载）──────────────
+// 由 prebuild 的 fetch-tess-assets.mjs 落盘。**必须硬校验**，理由与 OCR 模型
+// 完全一样：缺了它站点照常能打开、识别也照常出结果，只是「角标救回」
+// 静默失效 —— 而那正是这一版要交付的功能。
+//
+// ⚠️ core 的三个 `-lstm` 变体**逐个都要查**：浏览器按
+// `wasm-feature-detect` 的结果三选一（relaxedsimd → simd → 标量），
+// 少哪一个，就是**那一类浏览器**上第二意见整个不可用。
+const tessAssets = [
+  ['tess/worker.min.js', 'worker 脚本（importScripts 的入口）'],
+  ['tessdata/eng.traineddata.gz', '英文语言数据（只做几何复核，eng 够用）'],
+  ['tess-core/tesseract-core-lstm.wasm.js', 'core 标量变体'],
+  ['tess-core/tesseract-core-simd-lstm.wasm.js', 'core SIMD 变体'],
+  ['tess-core/tesseract-core-relaxedsimd-lstm.wasm.js', 'core RelaxedSIMD 变体'],
+];
+
+{
+  let tessBytes = 0;
+  let missing = 0;
+  for (const [rel, what] of tessAssets) {
+    const full = join(dist, rel);
+    if (!check(existsSync(full), `dist/${rel} 缺失（${what}）—— 请用 npm run build`)) {
+      missing++;
+      continue;
+    }
+    const size = statSync(full).size;
+    tessBytes += size;
+    check(size > 1024, `dist/${rel} 只有 ${size} 字节，像是下载/复制失败`);
+  }
+  if (!missing) {
+    notes.push(`tesseract 第二意见资产 ${tessAssets.length} 个，合计 ${mb(tessBytes)}（同源发布）`);
+  }
+}
+
 // ── 3. 不应存在 sourcemap ───────────────────────────────────
 const allFiles = walk(dist);
 const maps = allFiles.filter((f) => f.endsWith('.map'));
@@ -197,6 +231,25 @@ if (check(existsSync(swPath), 'dist/sw.js 缺失 —— PWA 插件未生效，�
   check(
     !sw.includes('quickjs-eval') && !sw.includes('nowasm_fallback'),
     'sw.js 预缓存了本项目不会请求的解码器（quickjs-eval / *_nowasm_fallback），白占约 1MB',
+  );
+
+  // tesseract 第二意见资产同理**必须留在预缓存之外**（走运行时 CacheFirst）。
+  // 这里曾真实漏过一次：默认 globPatterns 的 `**/*.js` 把 worker 与三个 core
+  // 变体（≈11.8MB）全卷进了预缓存清单 —— 而三个 core 变体浏览器只会用到
+  // 其中一个，首访白下 11.8MB。这条检查的字面量选得很讲究：
+  //   · `tess-core/tesseract-core-` —— 只出现在预缓存清单的 URL 里；
+  //     运行时路由的正则序列化成 `tess-core|tess|tessdata)//`，
+  //     不含这个字面量（下一行就靠这个区分）。
+  check(
+    !sw.includes('tess-core/tesseract-core-') && !sw.includes('tess/worker.min.js'),
+    'sw.js 预缓存了 tesseract 第二意见资产（worker / core 变体 ≈11.8MB）——' +
+      '它们应走运行时 CacheFirst（见 vite.config.ts 的 globIgnores），否则首访白下整个体积',
+  );
+  // 排除预缓存之余，运行时路由必须还在 —— 否则这些资产离线就取不到了
+  check(
+    sw.includes('tess-assets'),
+    'sw.js 里没有 tesseract 资产的运行时缓存路由（cacheName: tess-assets）——' +
+      '它们既不预缓存、也不缓存，离线时第二意见必然失败',
   );
 
   notes.push('Service Worker 已生成并包含导航回退');
