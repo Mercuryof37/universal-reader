@@ -1568,17 +1568,36 @@ export function classifyCharsByGeometry(
    * 三个条件（连续段、≥2 个字母数字字符确实被缩小、≥2 个字符被
    * tesseract 证据框覆盖）与各自的实测依据见 `findRescuableRuns`。
    *
+   * ⚠️ 段内**每个**下标记入（含中间拿不到几何的字符）—— 线上第 1 词的
+   * `+`/`−` 是坏框（测量值 `null`），逐字符循环根本走不到它们，
+   * 必须在这里一并补上，否则组装端拿到的是 `$^{x}$+$^{y}$-$^{2}$`
+   * 这种半段公式。间隔字符继承它前面第一个有自身分类的字符的 kind；
+   * 标点 / 汉字这两条语义门与逐字符同口径 —— 救回不推翻它们。
+   *
    * 拿不到表或拿不到证据 → 一个都不救 → 与引入本机制前逐字节相同。
    */
-  const rescued = new Set<number>();
+  const rescued = new Map<number, ScriptKind>();
+  const posAt = new Map<number, ScriptKind>();
   if (evidence?.length && sizeTable && sizeTable.size > 0 && chars) {
+    for (let k = 0; k < kept.length; k++) {
+      const kind = pos[k];
+      if (kind !== 'normal') posAt.set(kept[k] as number, kind);
+    }
     for (const run of findRescuableRuns(measurements, chars, sizeTable)) {
       let covered = 0;
       for (let i = run.from; i <= run.to; i++) {
         if (coveredByEvidence(chars[i], evidence)) covered++;
       }
-      if (covered >= SCRIPT_RESCUE_MIN_EVIDENCE_CHARS) {
-        for (let i = run.from; i <= run.to; i++) rescued.add(i);
+      if (covered < SCRIPT_RESCUE_MIN_EVIDENCE_CHARS) continue;
+      let lastKind: ScriptKind | null = null;
+      for (let i = run.from; i <= run.to; i++) {
+        const own = posAt.get(i);
+        if (own) lastKind = own;
+        if (!lastKind) continue;
+        const ch = chars[i];
+        if (ch && isPunctuationChar(ch.char)) continue;
+        if (CJK_CHAR_ONLY_RE.test(ch?.char ?? '')) continue;
+        rescued.set(i, lastKind);
       }
     }
   }
@@ -1654,12 +1673,13 @@ export function classifyCharsByGeometry(
 
     /**
      * ═══════════════════════════════════════════════════════════════
-     * 第二意见救回：这几个字符已被 `findRescuableRuns` + 证据框共同选中
+     * 第二意见救回：这个字符已被 `findRescuableRuns` + 证据框共同选中
      * ═══════════════════════════════════════════════════════════════
      *
      * 位置在机制 3 与汉字门**之后**：这两条是「这个字符在语义上不可能是
-     * 上下标」的硬事实（标点、汉字），救回不推翻它们 —— 指数的 `+`/`−`
-     * 本来就靠减号类豁免与标点判据通过，不靠救回。
+     * 上下标」的硬事实（标点、汉字），救回不推翻它们。走到这里的都是
+     * `kept` 里的字符；段内**拿不到几何**的字符（线上指数里的 `+`/`−`）
+     * 不走这个循环，由上面的救回块按同样的语义门直接写入 `rescued`。
      *
      * 位置在机制 2 / 机制 5 **之前**：救回的全部意义就是绕开这两个门。
      * 实测（第 1 词 53 个字符）：五个指数字符的置信度
@@ -1667,8 +1687,9 @@ export function classifyCharsByGeometry(
      * （≈0.91），机制 5 又只能接受其中 `x`/`y`/`2` 三个 —— 不绕开
      * 就被全数拒绝，而它恰恰是全页唯一真实的公式角标。
      */
-    if (rescued.has(i)) {
-      out.push({ index: i, kind });
+    const rescueKind = rescued.get(i);
+    if (rescueKind) {
+      out.push({ index: i, kind: rescueKind });
       continue;
     }
 
@@ -1704,6 +1725,16 @@ export function classifyCharsByGeometry(
     }
 
     out.push({ index: i, kind });
+  }
+
+  /**
+   * 段内拿不到几何的字符（线上指数里的 `+`/`−`）不在 `kept` 里，上面的
+   * 逐字符循环走不到 —— 在这里补进输出。`rescued` 里 `kept` 之外的
+   * 下标只可能来自救回块（见那里的说明），`posAt` 的键恰好是 `kept`
+   * 里被救回的字符，用它区分。
+   */
+  for (const [i, kind] of rescued) {
+    if (!posAt.has(i)) out.push({ index: i, kind });
   }
 
   return out.sort((a, b) => a.index - b.index);
@@ -1804,13 +1835,32 @@ export interface ScriptRescueRun {
  * 放宽会立刻把第 16 词、第 20 词那些误判放回来，见下）。
  *
  * ═══════════════════════════════════════════════════════════════
- * 为什么段必须是**连续下标**，且救回要覆盖整段
+ * 段的边界：两端必须有几何，中间允许跨过「拿不到几何的字符」
  * ═══════════════════════════════════════════════════════════════
  *
  * 组装端 `groupScriptFragments` 只把 `chars` 里**连续**的同类上下标
  * 并成一个 `$^{...}$`。只救 `x`/`y`/`2` 三个（`+`/`−` 仍被机制 5 拒）
  * 会输出 `$^{x}$+$^{y}$-$^{2}$` —— 三个单字上标加两个正文符号，
- * 比不判更糟。段一旦成立就整段救回，`x+y−2` 才能成段。
+ * 比不判更糟。段一旦成立就**整段**救回（区间 `[from..to]` 的每个字符
+ * 都标记为同类角标），`x+y−2` 才能成段。
+ *
+ * ⚠️ 段内允许隔着字符 —— 这不是放宽，而是**线上数据的直接教训**
+ * （用户导出，buildId 2026-10-09）：第 1 词里 `+` 与 `−` 是两个 49 高的
+ * 坏框 —— 墨迹太淡、逐列分析量不到（`measureCharPixelSpans` 的
+ * `hasInk = false`，测量值为 `null`），被机制 1 挡在 `kept` 之外；
+ * 于是 `x`/`y`/`2` 在原串里隔了字符。旧规则「下标必须连续」把段拆成
+ * 三个独字候选（确认字符各 1 个 < 2），**预筛一个词都选不出来** ——
+ * tesseract 连建都没建起来，线上表现就是「什么都没有发生」。
+ *
+ * 但 `+`/`−` 本来就是段的一部分：判不出来不等于不存在。段区间是**原串
+ * 上的连续区间**，救回按区间整体标记，组装端拿到的是完整的 `$^{x+y-2}$`。
+ * 所以正确的规则是：两端必须是 `kept` 里的候选字符，中间跨过的字符
+ * 必须**不在 `kept` 里**（没测量值 / 被异常值滤掉）—— 凡在 `kept` 里的
+ * 中间字符，升序遍历时要么已扩展了本段、要么已按「正常字符」断段。
+ * 唯一的例外是**空白**：`x + y` 里的空格在排版上不属于指数（与
+ * `groupScriptFragments` 的「空白打断」同一口径），跨过它段会在组装端
+ * 被拆开、留下半个 `$^{x}$`，比不判更糟 —— 空白处必须断（见
+ * `spansOnlyGaps`）。
  *
  * ═══════════════════════════════════════════════════════════════
  * 两条条件都必须存在 —— 这是两个**实测反例**逼出来的
@@ -1822,16 +1872,24 @@ export interface ScriptRescueRun {
  * 救回来** → 输出 `$^{2+Y}$`，把正文 `+Y` 吞进上标。实测 tesseract
  * 在这一区域的证据框是 **0 个** → (c) 拦住。
  *
+ * ⚠️ 线上这份导出的第 16 词里，`2`/`+`/`Y` **之间各隔着一个空格** ——
+ * 空白先一步断段，预筛就把它排除了（夹具里连写的 `2+Y` 是「紧排题面」
+ * 的形状，比如 `√X2+Y` 不空格写的时候）。(c) 拦的是紧排形状 ——
+ * 两条路都在，少了哪条都能被另一个补上，但都留着才两端都安全。
+ *
  * 反例二（第 20 词，`⋯ X ∼ b(n₁,p),Y∼ b(n₂,p),…`）：候选段是
  * `=∼∼∼`（等号带三个 `∼`，全是误判）。实测 tesseract 的证据框
  * **3 个，全部压在 `∼` 上**（它就是「小而抬高」的墨迹，只是不是角标）。
  * **只凭 (c) 就会把整段救回来** → 把 `=∼∼∼` 包成上标，恰好退回
  * 机制 5 存在的意义。条件 (b) 在这里是 0（`=`/`∼` 都不是字母数字）→ 拦住。
+ * （线上导出的 `∼` 同样多是空格隔开的，同上一段 —— 夹具取紧排形状。）
  *
  * 于是这两条条件在这份真实数据上**各自都是载荷**：去掉任何一条，
  * 都有一个已知的坏输出立刻回来。三个词各自的读数：
  *
- *   · 第 1 词指数：(b) 3 个（x/y/2）、(c) 3 个覆盖（实测 x 0.56、y 0.88、2 0.86）→ 救回 ✔
+ *   · 第 1 词指数：(b) 3 个（x/y/2）、(c) 2 个覆盖（实测 y 1.00、
+ *     `−` 的坏框 1.00；`x`/`2` 的 CTC 切片框与墨迹错开约 20 像素、
+ *     覆盖为 0 —— 覆盖只统计「真的对上」的）→ 救回 ✔
  *   · 第 16 词 `2+Y`：(b) 2 个、(c) **0** 个 → 不救 ✔
  *   · 第 20 词 `=∼∼∼`：(b) **0** 个、(c) 3 个 → 不救 ✔
  *
@@ -1876,9 +1934,9 @@ export function findRescuableRuns(
       finish();
       continue;
     }
-    // 段内必须**下标连续**：`kept` 里相邻但在原串里隔了一个字符（正常字符
-    // 或没量到墨迹的字符）就不是同一段，组装端也并不起来。
-    if (cur && i === cur.to + 1) {
+    // 段内允许跨过「拿不到几何的字符」（没测量值 / 被异常值滤掉），但空白必须断
+    // —— 为什么是这两条，见上面「段的边界」一节。
+    if (cur && spansOnlyGaps(chars, cur.to, i)) {
       cur.to = i;
       continue;
     }
@@ -1888,6 +1946,29 @@ export function findRescuableRuns(
   finish();
 
   return runs;
+}
+
+/**
+ * `cur.to` 与下一个候选 `i` 之间能不能连成一段：中间的字符必须都不是空白。
+ *
+ * 中间隔着的字符一定**不在** `kept` 里（`kept` 升序遍历，凡在其中早就处理了
+ * —— 候选字符扩展本段，正常字符断段），也就是两类「拿不到几何的字符」：
+ * 没量到墨迹的（空格、`+`/`−` 这种笔画太淡测不出来的）与被异常值滤掉的
+ * （混进邻行墨迹的坏框）。它们判不出来，但**本来就是段的一部分**，
+ * 救回按区间整体标记，组装端要的正是连续区间。
+ *
+ * 空白是唯一的例外：它在排版上不属于指数，跨过它段会在组装端被拆开
+ * （`groupScriptFragments` 的「空白打断」），留下半个 `$^{x}$` 比不判更糟。
+ */
+function spansOnlyGaps(
+  chars: ReadonlyArray<{ char: string }>,
+  from: number,
+  to: number,
+): boolean {
+  for (let g = from + 1; g < to; g++) {
+    if (!(chars[g]?.char ?? '').trim()) return false;
+  }
+  return true;
 }
 
 /**

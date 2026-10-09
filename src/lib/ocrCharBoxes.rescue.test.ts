@@ -21,6 +21,28 @@
  * 证据框的来源是 `.spike/dump-cinfo.mjs` 在 `page-0001.png` 上跑出来的
  * **实测值**（4 倍 + PSM 7 + eng + hocr_char_boxes），页坐标已按
  * `(origin + t / 4)` 换算 —— 与生产代码 `attachTesseractEvidence` 的映射同一公式。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 2026-10-09 线上导出的一次教训（本文件按它改过）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 线上（buildId 2026-10-09T03:44:00.823Z）第 1 词的 `hasScripts` 是
+ * `false` —— 救回一个字符都没生效，`charBoxSkips` 里也没有任何「第二意见」
+ * 记录。对照导出里的字符框找到了原因，**夹具当时没有如实抄录**：
+ *
+ *   · 指数里的 `+`（索引 57）与 `−`（索引 59）是两个 **49 高的坏框**
+ *     —— `[209,258]` 恰好是整条裁剪的纵向范围（词框 `[212,255]` 上下各留
+ *     3px 的 8% 白）。墨迹太淡、逐列分析量不到 → `hasInk = false`、
+ *     测量值为 `null` —— 而旧夹具把它们抄成了 7.2 高的小框；
+ *   · `x`/`y`/`2` 的框是 **CTC 切片**（`[1156,1172]` 等），与墨迹
+ *     （`x` 实测 1180–1189）错开约 20 像素 —— 旧夹具直接用了墨迹列。
+ *
+ * 前者让 `x`/`y`/`2` 在原串里隔了字符、旧规则「下标必须连续」把段拆成
+ * 三个独字候选（预筛一个词都选不出来）；后者让「覆盖数」的判据换了
+ * 一批完全不同的框。这两处都是**生产路径的输入**，夹具必须照抄 ——
+ * 下面 `REAL17_ROWS` 的指数行与 `REAL17_EXP_X` 即线上导出原值，
+ * 另外两个词也各自补了「线上形状」的对照（线上它们在 `2`/`+`/`Y`
+ * 之间、`∼` 两侧都有空格，见 `W16_SPACED` —— 空白断段）。
  */
 import { describe, expect, it } from 'vitest';
 import {
@@ -36,14 +58,23 @@ import {
 } from '@/lib/ocrCharBoxes';
 import type { OcrWord } from '@/lib/ocrTypes';
 
-type Row = [string, number, number];
+type Row = [string, number, number, ('noink' | undefined)?];
 
-/** 一行实测：`[字符, y0, y1]`（画布像素） */
+/** 一行实测：`[字符, y0, y1]`（画布像素）；第 4 项 `'noink'` 标记坏框（见下） */
 interface WordInput {
   chars: Array<{ char: string; y0: number; y1: number; x0?: number; x1?: number }>;
   measurements: Array<InkMeasurement | null>;
   confidences: number[];
 }
+
+/**
+ * 坏框行：`y0/y1` 仍是线上导出原值（`[209,258]` = 整条裁剪范围），但
+ * **测量值为 `null`** —— `hasInk = false`。两者必须一起出现：框还在
+ * （`chars[i]` 是覆盖判据的输入），几何却拿不到（机制 1 放进 `kept` 的前提
+ * 是 `measurements[i]` 存在）。旧夹具只抄了框、没抄 `null`，
+ * 于是 49 高被当成一次「异常测量」滤掉 —— 结果相似，但预筛的输入形状不同。
+ */
+const isNoInk = (r: Row): boolean => r[3] === 'noink';
 
 // ───────────────────────────────────────────────────────────────
 // 第 1 词：53 个字符（`ocrCharBoxes.mech5.test.ts` 的同一份数据）
@@ -73,7 +104,7 @@ const REAL17_ROWS: Row[] = [
   ['X', 226.4, 244.7],
   ['=', 231.5, 237.6],
   ['x', 231.5, 244.7],
-  [',', 209, 258], // 异常框（49 高）：建表与机制 1 都要丢掉它
+  [',', 209, 258, 'noink'], // 线上原值：坏框（旧夹具写作「异常框，建表与机制 1 都要丢掉它」）
   ['Y', 223.3, 244.7],
   ['=', 231.5, 237.6],
   ['y', 231.5, 248.8],
@@ -82,13 +113,13 @@ const REAL17_ROWS: Row[] = [
   ['p', 227.4, 249.8],
   ['(', 223.3, 245.8],
   ['1', 223.3, 244.7],
-  ['-', 209, 258], // 异常框
+  ['-', 209, 258, 'noink'], // 坏框
   ['p', 227.4, 249.8],
   [')', 223.3, 245.8],
   ['x', 225.3, 232.5], // ── 指数段（35..39）
-  ['+', 225.3, 232.5],
+  ['+', 209, 258, 'noink'], // 坏框：墨迹太淡、逐列分析量不到 → 测量值 null
   ['y', 225.3, 232.5],
-  ['-', 225.3, 232.5],
+  ['-', 209, 258, 'noink'], // 坏框（同上）
   ['2', 220.2, 232.5],
   [',', 237.6, 245.8],
   ['0', 224.3, 244.7],
@@ -108,21 +139,28 @@ const REAL17_ROWS: Row[] = [
 const REAL17_EXP = [35, 36, 37, 38, 39];
 
 /**
- * 指数五个字符的**实测横向范围**（`.spike/ink-cols.mjs`，区域 1130–1330 × 205–265）：
+ * 指数五个字符的**字符框横向范围**（线上导出原值）：
  *
- *     1180–1189  `x`      1208–1215  `y`      1235–1241  `2`
+ *     35 `x` [1156,1172]   36 `+` [1172,1188]   37 `y` [1188,1200]
+ *     38 `−` [1200,1212]   39 `2` [1212,1224]
  *
- * `+`（≈1199–1200，字形分段只测到 2 列）与 `−`（没测到）**不给横向值** ——
- * 它们的墨迹太淡，逐列分析测不出来。这不是回避：覆盖数必须 ≥ 2，
- * 而 `x`/`y`/`2` 三个已经能给出 3 个覆盖，所以这两个字符的读数不影响结论。
+ * ⚠️ 这是 **CTC 切片**，不是墨迹列：切片按等分给框，与墨迹错开约 20 像素
+ * （`x` 的墨迹实测在 1180–1189，切片给的是 [1156,1172]）。旧夹具直接抄了
+ * 墨迹列 —— 那就等于换了一批框去判覆盖（条件 c）：覆盖判据在生产里读的是
+ * `chars[i]`，而生产路径的 `chars[i]` 就是这个坐标。
  *
- * ⚠️ 这是**保守**读数：CTC 的字符框含字间距、比墨迹段更宽，
- * 更宽只会让重叠比例更大。用字形段当夹具，等于按最不利的情况判。
+ * 五个字符对 `EVIDENCE_A` 的覆盖（两条轴都 ≥ 0.5 才算，逐轴比值见测试）：
+ *   `x` 0.00（切片整体在 `"` 框左侧）、`+` 0.28（横向 4.5/16 不足）、
+ *   `y` 1.00（横向 12/12、纵向 7.2/7.2）、`−` 1.00（坏框纵横都盖住
+ *   `"` 框 —— 框大不是错，覆盖的分母取两条里较短的那条）、
+ *   `2` 0.36（横向 4.3/12 不足）→ **覆盖 2 个（`y`/`−`）**。
  */
 const REAL17_EXP_X: Record<number, [number, number]> = {
-  35: [1180, 1189],
-  37: [1208, 1215],
-  39: [1235, 1241],
+  35: [1156, 1172],
+  36: [1172, 1188],
+  37: [1188, 1200],
+  38: [1200, 1212],
+  39: [1212, 1224],
 };
 
 /**
@@ -240,7 +278,7 @@ const wordOf = (rows: Row[], xs: Record<number, [number, number]>, y: number, te
       const x = xs[i];
       return x ? { char, x0: x[0], y0, x1: x[1], y1 } : { char, x0: 0, y0, x1: 0, y1 };
     }),
-    measurements: rows.map(([, y0, y1]) => ({ y0, y1, h: y1 - y0 })),
+    measurements: rows.map((r) => (isNoInk(r) ? null : { y0: r[1], y1: r[2], h: r[2] - r[1] })),
   });
   return word;
 };
@@ -268,7 +306,7 @@ const mkWord = (rows: Row[], xs: Record<number, [number, number]>, conf: number[
     const x = xs[i];
     return x ? { char, y0, y1, x0: x[0], x1: x[1] } : { char, y0, y1 };
   }),
-  measurements: rows.map(([, y0, y1]) => ({ y0, y1, h: y1 - y0 })),
+  measurements: rows.map((r) => (isNoInk(r) ? null : { y0: r[1], y1: r[2], h: r[2] - r[1] })),
   confidences: conf,
 });
 
@@ -276,6 +314,48 @@ const W1 = mkWord(REAL17_ROWS, REAL17_EXP_X, REAL17_CONF);
 const W16 = mkWord(W16_ROWS, {}, W16_CONF);
 const W16_X = mkWord(W16_ROWS, W16_RUN_X, W16_CONF);
 const W20 = mkWord(W20_ROWS, {}, W20_CONF);
+
+/**
+ * 「假如第 1 词的指数里也带空格」的对照形状（线上它没有）：与 `W1` 的
+ * 唯一差别是 `y` 与 `−` 之间插一个空格字符。空白必须断段 —— 与
+ * `groupScriptFragments` 的「空白打断」同口径（跨过去的话组装端会在空格处
+ * 拆开，留下半个 `$^{x+y}$` 比不判更糟）。于是段在 `y` 处止步：[35..37]，
+ * 确认字符 2 个（`x`/`y`），覆盖只剩 `y` 一个（1 < 2）→ 救回不发生；
+ * 机制 2 也不放行（三个候选的置信度都在门槛之上）→ 输出为空。
+ */
+const W1_SPACED_ROWS: Row[] = REAL17_ROWS.flatMap((r, i) =>
+  i === 37 ? [r, [' ', 209, 258, 'noink'] as Row] : [r],
+);
+/** 后移一位：`−`→39、`2`→40；空格不给框（`mkWord` 里没有它的横向值） */
+const W1_SPACED_X: Record<number, [number, number]> = {
+  35: [1156, 1172],
+  36: [1172, 1188],
+  37: [1188, 1200],
+  39: [1200, 1212],
+  40: [1212, 1224],
+};
+/** 空格没有置信度 → NaN（机制 2 的缺值分支：不拿缺值当拒绝理由） */
+const W1_SPACED_CONF = REAL17_ROWS.flatMap((_r, i) =>
+  i === 37 ? [REAL17_CONF[37] as number, Number.NaN] : [REAL17_CONF[i] as number],
+);
+const W1_SPACED = mkWord(W1_SPACED_ROWS, W1_SPACED_X, W1_SPACED_CONF);
+
+/**
+ * 线上第 16 词的**真实形状**：`2`/`+`/`Y` 之间各隔一个空格（连写的
+ * `W16_ROWS` 是「紧排题面」的形状，那条「(c) 是载荷」的伪证探针用的就是它）。
+ * 空格先一步断段 → 预筛一个段都选不出来（`run` 为空）—— 反例一在线上
+ * 其实是被这条规则先拦下的；即便走到覆盖判据，`EVIDENCE_B` 也是 0 个框。
+ * 真上标 `2` 不受影响：它走机制 2（置信度 0.7097 低于门槛）单独通过。
+ */
+const W16_SPACED_ROWS: Row[] = W16_ROWS.flatMap((r, i) =>
+  i === W16_TWO || i === W16_TWO + 1 ? [r, [' ', 1465, 1465, 'noink'] as Row] : [r],
+);
+const W16_SPACED_CONF = W16_ROWS.flatMap((_r, i) =>
+  i === W16_TWO || i === W16_TWO + 1
+    ? [W16_CONF[i] as number, Number.NaN]
+    : [W16_CONF[i] as number],
+);
+const W16_SPACED = mkWord(W16_SPACED_ROWS, {}, W16_SPACED_CONF);
 
 const run = (w: WordInput, table = sizeTable()) => findRescuableRuns(w.measurements, w.chars, table);
 const classify = (
@@ -296,6 +376,17 @@ describe('救回段的条件 (b)：≥2 个「确实被缩小的字母数字」'
     expect(runs).toEqual([{ from: 35, to: 39, confirmChars: 3 }]);
 
     /**
+     * ⭐ 段跨过 36（`+`）与 38（`−`）—— 这两位的测量值是 `null`
+     * （线上坏框：`hasInk = false`），不在 `kept` 里。旧规则「下标必须连续」
+     * 会把段拆成三个独字候选（确认字符各 1 个），**预筛一个词都选不出来**
+     * —— 这正是线上 buildId 2026-10-09 里「什么都没发生」的全部原因。
+     * 段的边界规则见 `spansOnlyGaps`：两端要有几何，中间只许跨过
+     * 「拿不到几何的字符」，空白仍然断段（见 `W1_SPACED`）。
+     */
+    expect(W1.measurements[36]).toBeNull();
+    expect(W1.measurements[38]).toBeNull();
+
+    /**
      * 数值探针：逐一算出五个字符的比值（页级全尺寸来自表）。
      * `+` 与 `−` 不在计数里 —— 它们**不是字母数字**（`\p{L}\p{N}` 之外），
      * 与「表里有没有它们的全尺寸实例」无关。
@@ -304,9 +395,15 @@ describe('救回段的条件 (b)：≥2 个「确实被缩小的字母数字」'
     expect(7.2 / (table.get('x') as number)).toBeCloseTo(0.3529, 3);
     expect(7.2 / (table.get('y') as number)).toBeCloseTo(0.3529, 3);
     expect(12.3 / (table.get('2') as number)).toBeCloseTo(0.5348, 3);
-    // `+` 即便拿它的实测比值也过不了（页内只有缩小形态 → 比值 1.0），
-    // 但它压根不参与计数；这里把两件事都钉住
-    expect(7.2 / (table.get('+') as number)).toBeCloseTo(1, 6);
+    /**
+     * `+`/`−` 即便按像素比也过不了，两件事都钉住：
+     *   · `+` 在整页唯一的实例是第 16 词那个 1.8 高的（第 1 词的 `+` 是坏框、
+     *     不进表），它自己的框 49 高 → 49 / 1.8 = 27.2 > 0.8；
+     *   · `−` 的表项根本不存在（第 1 词两个 `−` 都是坏框，其余词没有）。
+     */
+    expect(table.get('+')).toBeCloseTo(1.8, 6);
+    expect(table.get('-')).toBeUndefined();
+    expect(49 / (table.get('+') as number)).toBeGreaterThan(0.8);
     expect(table.get('2')).toBe(23);
   });
 
@@ -395,54 +492,101 @@ describe('第 1 词 `x+y−2`：真实证据框把整段救回来', () => {
     }
   });
 
-  it('⭐ 有实测的 4 个证据框 → 指数整段（35..39）被救回，连成一段', () => {
+  it('⭐ 有实测的 4 个证据框 → 指数整段（35..39，含两个坏框字符）被救回，连成一段', () => {
     const out = classify(W1, EVIDENCE_A);
     expect(indexes(out)).toEqual(REAL17_EXP);
     expect(out.every((s) => s.kind === 'super')).toBe(true);
+    /**
+     * 36（`+`）/38（`−`）不在 `kept` 里，逐字符循环根本走不到它们 ——
+     * 它们由救回块按区间整体补进输出（`kind` 继承前一个候选的 `super`）。
+     * 少了这一步，组装端拿到的是 `$^{x}$+$^{y}$-$^{2}$` 这种半段公式。
+     */
+    expect(W1.measurements[36]).toBeNull();
+    expect(W1.measurements[38]).toBeNull();
   });
 
-  it('⭐ 覆盖计数是载荷：只留 `2` 那个框 → 覆盖 1 < 2 → 不救回', () => {
-    // 第 4 个框（页X[1235,1242]）只压住指数末尾的 `2`
+  it('⭐ 覆盖计数是载荷：只留 `2` 那个框 → 覆盖 0 < 2 → 不救回', () => {
+    // 第 4 个框（页X[1235,1242]）压在指数的**墨迹**上，而字符框是 CTC 切片
     expect(SCRIPT_RESCUE_MIN_EVIDENCE_CHARS).toBe(2);
     const onlyTwo = EVIDENCE_A.filter((e) => e.x0 > 1200);
     expect(onlyTwo).toHaveLength(1);
     expect(indexes(classify(W1, onlyTwo))).toEqual([]);
+    /**
+     * 数值探针：`2` 的切片 [1212,1224] 与这个框 [1235,1242] 横向重叠 **0**
+     * （切片与墨迹错开约 20 像素：墨迹在该框内，切片不在）。五个字符的
+     * 覆盖数因此是 0 —— 连 1 都不到。
+     */
+    expect(Math.min(1224, 1242) - Math.max(1212, 1235)).toBeLessThanOrEqual(0);
   });
 
-  it('⭐ 一个框可以覆盖两个字符：只留 `"` 那个框 → 覆盖 {x, y} = 2 → 仍救回', () => {
+  it('⭐ 一个框可以覆盖两个字符：只留 `"` 那个框 → 覆盖 {y, −} = 2 → 仍救回', () => {
     const onlyQuote = EVIDENCE_A.filter((e) => e.x0 > 1180 && e.x1 < 1220);
     expect(onlyQuote).toHaveLength(1);
     expect(indexes(classify(W1, onlyQuote))).toEqual(REAL17_EXP);
 
     /**
      * 数值探针（两条轴的重叠比例，阈值 0.5）：
-     *   `x` 页X[1180,1189] vs 框 [1183.5,1216.3] → 5.5 / 9   = **0.611**
-     *   `y` 页X[1208,1215] vs 框 [1183.5,1216.3] → 7   / 7   = **1.000**
-     * 纵向两者都是 1.000（框比字符高）。`x` 是最紧的一个 ——
-     * 阈值加到 0.65 才会掉出去，而那时仍有 `y` + `2` 两个覆盖。
+     *   `y`      [1188,1200] × [225.3,232.5] vs 框 → 12/12、7.2/7.2 = **1.000**
+     *   `−` 坏框 [1200,1212] × [209,258]     vs 框 → 12/12、10.8/10.8 = **1.000**
+     *   `x`      [1156,1172] → 横向 0（切片整体在框左侧）
+     *   `+`      [1172,1188] → 横向 4.5/16 = 0.281
+     *   `2`      [1212,1224] → 横向 4.3/12 = 0.358
+     * 覆盖的恰好 2 个。`−` 是靠**坏框**盖上的 —— 框比字符大不是错：
+     * 覆盖的分母取两条里**较短**的那条。`y` 是唯一的「干净」覆盖。
      */
-    const covX = (1189 - 1183.5) / 9;
-    const covY = 7 / 7;
-    expect(covX).toBeGreaterThanOrEqual(SCRIPT_RESCUE_COVER_RATIO);
-    expect(covY).toBeGreaterThanOrEqual(SCRIPT_RESCUE_COVER_RATIO);
-    expect(covX).toBeCloseTo(0.611, 3);
+    const covYh = (Math.min(1200, 1216.3) - Math.max(1188, 1183.5)) / 12;
+    const covYv = (Math.min(232.5, 235.8) - Math.max(225.3, 225.0)) / 7.2;
+    expect(covYh).toBeCloseTo(1, 6);
+    expect(covYv).toBeCloseTo(1, 6);
+    const covMinusH = (Math.min(1212, 1216.3) - Math.max(1200, 1183.5)) / 12;
+    const covMinusV = (Math.min(258, 235.8) - Math.max(209, 225.0)) / 10.8;
+    expect(covMinusH).toBeGreaterThanOrEqual(SCRIPT_RESCUE_COVER_RATIO);
+    expect(covMinusV).toBeGreaterThanOrEqual(SCRIPT_RESCUE_COVER_RATIO);
+    const covPlus = (1188 - 1183.5) / 16;
+    const covTwo = (1216.3 - 1212) / 12;
+    expect(covPlus).toBeCloseTo(0.2813, 3);
+    expect(covTwo).toBeCloseTo(0.3583, 3);
+    expect(covPlus).toBeLessThan(SCRIPT_RESCUE_COVER_RATIO);
+    expect(covTwo).toBeLessThan(SCRIPT_RESCUE_COVER_RATIO);
   });
 
-  it('⭐ 比例是载荷：把 `"` 的左边缩到 1204 → 只覆盖 `y` 一个 → 不救回', () => {
+  it('⭐ 比例是载荷：把 `"` 的左边缩到 1204 → 只覆盖 `−` 一个 → 不救回', () => {
     const narrowed = [{ x0: 1204, y0: 225.0, x1: 1216.3, y1: 235.8 }];
-    // `x` 的右边界 1189 < 1204 → 横向重叠为 0；`y` 仍被完全覆盖
+    /**
+     * `y` 的右边界 1200 < 1204 → 横向重叠为 0（`x`/`+` 更靠左，同样 0；
+     * `2` 的横向比例本就不足）。只剩 `−` 的坏框还被盖住：
+     * 横向 (1212−1204)/12 = **0.667**、纵向 1.0 → 覆盖数 1 < 2。
+     */
     expect(indexes(classify(W1, narrowed))).toEqual([]);
+    const covMinus = (1212 - 1204) / 12;
+    expect(covMinus).toBeCloseTo(0.667, 3);
+    expect(covMinus).toBeGreaterThanOrEqual(SCRIPT_RESCUE_COVER_RATIO);
+    expect(1200).toBeLessThan(1204);
 
     /**
      * 数值探针：抬高阈值 0.25 在这份数据上的**余量**（如实记录，因为它很紧）。
      * `"` 框的底边 111 vs 门槛 160 − 0.25×170 = 117.5 —— 只差 6.5 裁剪像素
-     * （= 1.6 页像素）。换成 0.3（门槛 109）它就会掉出去，覆盖数降到 1
-     * （只剩 `2` 那个框）→ 救回失败。这条余量来自实测裁剪（区域 A 整行）
-     * 与生产裁剪（词框 + 15% 留白）之间的差异，测试钉不住生产端的实际值。
+     * （= 1.6 页像素）。换成 0.3（门槛 109）它就会掉出去，证据框只剩 3 个、
+     * 覆盖数降到 0（`2` 的切片框不与任何证据框重叠）→ 救回失败。这条余量
+     * 来自实测裁剪（区域 A 整行）与生产裁剪（词框 + 15% 留白）之间的差异，
+     * 测试钉不住生产端的实际值。
      */
     expect(160 - 0.25 * 170).toBeCloseTo(117.5, 6);
     expect(111).toBeLessThan(117.5);
     expect(111).toBeGreaterThan(160 - 0.3 * 170);
+  });
+
+  it('⭐ 空白断段：`y` 与 `−` 之间插一格空格 → 段止步在 37，覆盖只剩 1 → 不救回', () => {
+    /**
+     * 线上第 16/20 词的真实形状里就是有空格的（见 `W16_SPACED` 与第 20 词
+     * 一节的注）。这一条钉住「跨过空白」不被允许：段变成 [35..37]
+     * （确认字符 `x`/`y` 2 个），覆盖在 `y` 处只剩 1 个 < 2 → 不救；
+     * 逐字符过滤也不放行（三个候选的置信度全在门槛之上，见「不变量」一节）。
+     */
+    expect(run(W1_SPACED)).toEqual([{ from: 35, to: 37, confirmChars: 2 }]);
+    expect(indexes(classify(W1_SPACED, EVIDENCE_A))).toEqual([]);
+    // 对照：同一个词、同一批证据，只差这一格空格 —— 没有空格就救回
+    expect(indexes(classify(W1, EVIDENCE_A))).toEqual(REAL17_EXP);
   });
 
   it('⭐ 表是载荷：拿不到 / 空表时预筛一个词都筛不出来', () => {
@@ -477,6 +621,19 @@ describe('第 16 词 `2+Y`：(b) 成立、(c) 为 0 → 不救（条件 c 是载
     const out = classify(W16_X, EVIDENCE_B_FAKE);
     expect(indexes(out)).toEqual([W16_RUN.from, W16_RUN.from + 1, W16_RUN.to]);
   });
+
+  it('⭐ 空白断段（线上形状）：`2`/`+`/`Y` 之间各隔一格空格 → 预筛一个段都没有', () => {
+    /**
+     * 线上这份导出的第 16 词就是隔空格的（`W16_ROWS` 的连写是「紧排题面」
+     * 形状）。空白先一步断段：三个候选各自成段、确认字符各 1 个 < 2
+     * → `run` 为空，第二个引擎根本不会被请（预筛就把词排除了）。
+     * 真上标 `2` 不受影响：它走机制 2（置信度 0.7097 低于门槛）单独通过。
+     */
+    expect(run(W16_SPACED)).toEqual([]);
+    expect(indexes(classify(W16_SPACED, EVIDENCE_B))).toEqual([W16_TWO]);
+    // 对照：连写形状下 (b) 成立 —— 段真的存在，靠 (c) 拦（见上一条）
+    expect(run(W16)).toEqual([{ from: W16_RUN.from, to: W16_RUN.to, confirmChars: 2 }]);
+  });
 });
 
 describe('第 20 词 `=∼∼∼`：(c) 成立、(b) 为 0 → 不救（条件 b 是载荷）', () => {
@@ -488,5 +645,10 @@ describe('第 20 词 `=∼∼∼`：(c) 成立、(b) 为 0 → 不救（条件 b
     const out = classify(W20, EVIDENCE_C);
     expect(indexes(out)).toEqual([]);
     expect(run(W20)).toEqual([]);
+    /**
+     * ⚠️ 线上的第 20 词里 `∼` 之间也多是空格隔开的（同 `W16_SPACED`）：
+     * 那种形状下段根本形不成，空白先断。这里取**紧排**形状，让 (b)
+     * 成为唯一拦得住它的那条 —— 否则这条反例证明不了 (b) 是载荷。
+     */
   });
 });
