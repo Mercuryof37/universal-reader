@@ -42,10 +42,12 @@ import {
   type RetryCropPlan,
 } from '@/lib/ocrInkRegions';
 import {
+  alternateBandBox,
   buildInkGrid,
   findInkBands,
   mergeFormulaRegions,
   planRegionReplacement,
+  preferRicherReading,
   regionGateDecision,
   type FormulaBox,
   type LayoutRegionLike,
@@ -865,9 +867,46 @@ class OcrEngine {
           if (!crop) continue;
 
           const result = await service.recognize(crop, { flatten: true });
+
+          /**
+           * 第二读数：同一个行带、横向扩边 8% 的 2× 裁剪。
+           *
+           * 紧边裁剪在窄条两端没有留白，识别器切候选框时容易丢字符
+           * （实测 Q20 上排丢指数）；扩边后同样的模型读回完整内容。
+           * 但取景优劣逐带不同（±2px 就能翻转输出），所以不直接换：
+           * 两个读数在**文本层竞价**（`preferRicherReading`），只有
+           * 新读数「内容严格更全、记号不减」才允许顶替（宁可漏不可错）。
+           *
+           * 只对分带做：不分带的裁剪已带 8% 四周留白，是另一种取景，
+           * 没有扩边的实测增益。像素计入同一预算（条带很小，实测
+           * 80–180k，预算几乎无感）。
+           */
+          let chosenPlan = plan;
+          let chosenResult = result;
+          if (split) {
+            const altBox = alternateBandBox(band, canvas.width);
+            const altPlan = altBox
+              ? planExactCrop(canvas.width, canvas.height, altBox, FORMULA_ALTERNATE_UPSCALE)
+              : null;
+            const altCost = altPlan ? altPlan.targetW * altPlan.targetH : 0;
+            if (altPlan && altCost <= budget) {
+              budget -= altCost;
+              const altCrop = renderRetryCrop(canvas, altPlan);
+              const alt = altCrop ? await service.recognize(altCrop, { flatten: true }) : null;
+              if (alt && preferRicherReading(result.text, alt.text)) {
+                console.info(
+                  `[ocrEngine] 第 ${pageNum} 页公式区域行带改用横向扩边读数：` +
+                    `${alt.text.trim().replace(/\s+/g, ' ').slice(0, 80)}`,
+                );
+                chosenPlan = altPlan;
+                chosenResult = alt;
+              }
+            }
+          }
+
           const admitted = admitRetryWords(
-            result.results,
-            { originX: plan.px, originY: plan.py, scale: plan.scale },
+            chosenResult.results,
+            { originX: chosenPlan.px, originY: chosenPlan.py, scale: chosenPlan.scale },
             // 基准 = 区域外已确认的词（不含垃圾词）+ 前面已救回的词
             [...outside, ...recoveredAll],
           );
@@ -1608,6 +1647,14 @@ const FORMULA_MAX_REGIONS = 6;
 const FORMULA_MAX_BANDS = 4;
 /** 放大倍数（与 ③ 同口径；原尺度已经错读过，原样再送没有意义） */
 const FORMULA_UPSCALE = 3;
+/**
+ * 行带**第二读数**（横向扩边裁剪）的放大倍数。
+ *
+ * 实测（2026-10-10，Q20 上排）：紧边裁剪 3× 读丢指数（`λe−x`），
+ * 横向扩边 8% 的 2× 读回完整 `(λe−λx, x > 0 (µe−µy, y> 0`。
+ * 两读数在文本层竞价（`preferRicherReading`），赢才采。
+ */
+const FORMULA_ALTERNATE_UPSCALE = 2;
 /** 区域任一边小于这个值（像素）的不试（版面模型偶有碎片区域） */
 const FORMULA_MIN_SIDE = 16;
 /** 区域面积超过页面的这个比例的不试：更像插图或整页内容 */
@@ -1640,4 +1687,39 @@ function renderRetryCrop(
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(source, plan.px, plan.py, plan.pw, plan.ph, 0, 0, plan.targetW, plan.targetH);
   return canvas;
+}
+
+/**
+ * 精确几何的裁剪计划（**不加任何留白**）—— 行带第二读数专用。
+ *
+ * 与 `planRetryCrop` 的差别只有一条：不加那个 2px 的最小留白。
+ * 横向扩边的取景是按像素测出来的（见 `alternateBandBox`），
+ * 实测 ±2px 的位移就会把获胜窗口挪走（同一行带、同一尺度，
+ * 加 2px 留白后输出从 `(λe−λx...` 变成 `> (λe−x...`）——所以
+ * 第二读数必须精确落框，不能复用带留白的计划。
+ */
+function planExactCrop(
+  sourceWidth: number,
+  sourceHeight: number,
+  box: FormulaBox,
+  upscale: number,
+  maxPixels = RETRY_MAX_CROP_PIXELS,
+): RetryCropPlan | null {
+  if (!(sourceWidth > 0) || !(sourceHeight > 0)) return null;
+  const x = Math.max(0, Math.floor(box.x0));
+  const y = Math.max(0, Math.floor(box.y0));
+  const w = Math.min(Math.ceil(box.x1 - box.x0), sourceWidth - x);
+  const h = Math.min(Math.ceil(box.y1 - box.y0), sourceHeight - y);
+  if (w < 1 || h < 1) return null;
+  const fit = maxPixels > 0 && Number.isFinite(maxPixels) ? Math.sqrt(maxPixels / (w * h)) : 1;
+  const scale = Math.max(1, Math.min(upscale, fit));
+  return {
+    px: x,
+    py: y,
+    pw: w,
+    ph: h,
+    scale,
+    targetW: Math.max(1, Math.round(w * scale)),
+    targetH: Math.max(1, Math.round(h * scale)),
+  };
 }

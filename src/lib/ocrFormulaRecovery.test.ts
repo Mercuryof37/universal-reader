@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   HOLE_MIN_RATIO,
+  alnumSequence,
+  alternateBandBox,
   buildInkGrid,
   findFragmentWordsInRegion,
   findGarbageWordsInRegion,
@@ -10,8 +12,11 @@ import {
   holeRatio,
   isGarbageWord,
   isPunctuationOnly,
+  isSubsequence,
   mergeFormulaRegions,
+  notationCount,
   planRegionReplacement,
+  preferRicherReading,
   regionGateDecision,
 } from '@/lib/ocrFormulaRecovery';
 import type { OcrWord } from '@/lib/ocrTypes';
@@ -361,5 +366,93 @@ describe('planRegionReplacement：恢复结果替换既有词', () => {
     const plan = planRegionReplacement({ x0: 293, y0: 1505, x1: 708, y1: 1620 }, [garbage], [], opts);
     expect(plan.survivors).toEqual([garbage]);
     expect(plan.drops).toEqual([]);
+  });
+});
+
+describe('preferRicherReading：行带双读数择优（实测语料标定）', () => {
+  it('Q20 上排生产档误读 vs 横向扩边 2× 正读 → 顶替（新增 λx/µy 共 3 字符）', () => {
+    const primary = '  (λe−x, x>0  (µe−^, y>0  '; // 生产裁剪（紧边 3×）
+    const alternate = '(λe−λx, x > 0 (µe−µy, y> 0'; // 横向扩边 8% + 2×
+    expect(preferRicherReading(primary, alternate)).toBe(true);
+  });
+
+  it('同框 2× 的垃圾读数（凭空多一个 e、丢一个真记号的 ^ 变体）→ 挡回', () => {
+    const primary = '  (λe−x, x>0  (µe−^, y>0  ';
+    const alternate = 'e > (λe−x, x >0 > (µe-\\", y>0'; // 实测 run54 的误判样本
+    expect(preferRicherReading(primary, alternate)).toBe(false);
+  });
+
+  it('Q20 下排两标签读数（fx(y) vs fy(y)）内容互不为子序列 → 挡回', () => {
+    const primary = 'fx(x) = { 0, x ≤ 0 fy(y) = { 0, y≤ 0 ';
+    const alternate = 'fx(x) = { 0, x ≤ 0 fx(y) = { 0, y ≤ 0';
+    expect(preferRicherReading(primary, alternate)).toBe(false);
+  });
+
+  it('同内容仅空格差异 → 不换（字母数字没有增益）', () => {
+    const primary = 'fx(x) = { 0, x ≤ 0 fx(y) = { 0, y≤ 0';
+    const alternate = 'fx(x) = { 0, x ≤ 0 fx(y) = { 0, y ≤ 0 ';
+    expect(preferRicherReading(primary, alternate)).toBe(false);
+  });
+
+  it('新读数丢真记号（`≥`）换内容 → 记号不减条件挡回', () => {
+    const primary = 'fz(z) = σe−/2 , z≥0';
+    const alternate = 'fz(z) = σe−/2 , zz0 ²';
+    expect(preferRicherReading(primary, alternate)).toBe(false);
+  });
+
+  it('空读数、纯空白读数 → 不换', () => {
+    expect(preferRicherReading(', (λeλx,x>0', '')).toBe(false);
+    expect(preferRicherReading(', (λeλx,x>0', '   ')).toBe(false);
+  });
+
+  it('alnumSequence 去掉一切非字母数字（含 −、^、空格、逗号）', () => {
+    expect(alnumSequence('(λe−λx, x > 0')).toBe('λeλxx0');
+    expect(alnumSequence('²')).toBe('²');
+  });
+
+  it('notationCount 不计 `^`（坏读数里的指数占位符），计 − 与关系号', () => {
+    expect(notationCount('µe−^')).toBe(1); // ^ 不计
+    expect(notationCount('µe−µy')).toBe(1);
+    expect(notationCount('x ≤ 0')).toBe(1);
+  });
+
+  it('isSubsequence：顺序一致可跳过，乱序不算', () => {
+    expect(isSubsequence('eλxx0eµy0', 'λeλxx0µeµyy0')).toBe(true);
+    expect(isSubsequence('fy', 'fx')).toBe(false);
+    expect(isSubsequence('', 'anything')).toBe(true);
+  });
+});
+
+describe('alternateBandBox：第二读数的横向扩边框（实测坐标）', () => {
+  it('Q20 上排行带 [297,479,1085,503] → [234,479,1148,503]（实测获胜取景）', () => {
+    expect(alternateBandBox({ x0: 297, y0: 479, x1: 1085, y1: 503 }, 1667)).toEqual({
+      x0: 234,
+      y0: 479,
+      x1: 1148,
+      y1: 503,
+    });
+  });
+
+  it('窄带用 16px 下限（100px 宽的 8% 只有 8px）', () => {
+    expect(alternateBandBox({ x0: 300, y0: 100, x1: 400, y1: 130 }, 1667)).toEqual({
+      x0: 284,
+      y0: 100,
+      x1: 416,
+      y1: 130,
+    });
+  });
+
+  it('贴页边的带扩边后夹回页面内', () => {
+    expect(alternateBandBox({ x0: 10, y0: 5, x1: 300, y1: 40 }, 400)).toEqual({
+      x0: 0,
+      y0: 5,
+      x1: 323,
+      y1: 40,
+    });
+  });
+
+  it('非法几何返回 null', () => {
+    expect(alternateBandBox({ x0: 10, y0: 5, x1: 10, y1: 40 }, 400)).toBeNull();
+    expect(alternateBandBox({ x0: 10, y0: 40, x1: 300, y1: 40 }, 400)).toBeNull();
   });
 });

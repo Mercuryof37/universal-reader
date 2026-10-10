@@ -634,3 +634,124 @@ export function planRegionReplacement(
 
   return { survivors, recovered: admitted, drops };
 }
+
+// ───────────────────────────────────────────────────────────────
+// 双读数择优：同一行带换一个裁剪尺度重认，取信息更全的那份
+// ───────────────────────────────────────────────────────────────
+
+/**
+ * 记号字符集 —— 择优判据的第一把尺。
+ *
+ * 公式的信息几乎全在这些字符上（关系号、正负号、括号），而识别退化
+ * 最典型的形态就是**丢记号**（`e^{−λx}` → `e^{λx}`、`x ≤ 0` → `x0`）。
+ *
+ * 刻意**不含**三类字符，全部有实测理由：
+ *  · `^`：坏读数把它当指数占位符吐出来（实测 `µe−^` vs 好读数
+ *    `µe−µy`）——它出现在坏读数里，计进去会让坏读数多一个假记号，
+ *    正好把「按记号择优」判反；
+ *  · `,`：两种读数各有一份，计数差为零（实测），只会扩大误判面；
+ *  · `/` `_`：同上，实测两读数净差为零。
+ */
+const NOTATION_CHARS = new Set('=<>≤≥−-±×÷√{}[]()');
+
+/** 读数里记号字符的个数 */
+export function notationCount(text: string): number {
+  let n = 0;
+  for (const ch of text ?? '') if (NOTATION_CHARS.has(ch)) n++;
+  return n;
+}
+
+/** 读数里的字母数字序列（照原顺序，去掉一切其它字符） */
+export function alnumSequence(text: string): string {
+  let out = '';
+  for (const ch of text ?? '') if (/[\p{L}\p{N}]/u.test(ch)) out += ch;
+  return out;
+}
+
+/** `needle` 是否是 `haystack` 的子序列（顺序一致，可跳过字符） */
+export function isSubsequence(needle: string, haystack: string): boolean {
+  if (!needle) return true;
+  let i = 0;
+  for (const ch of haystack) {
+    if (ch === needle[i]) {
+      i++;
+      if (i >= needle.length) return true;
+    }
+  }
+  return false;
+}
+
+/** 新读数至少要新增的字母数字个数（1 个的增益实测是垃圾插入，2 个起才是内容补全） */
+const ALNUM_GAIN_MIN = 2;
+
+/**
+ * 行带的第二个读数（横向扩边裁剪 + 2× 放大）是否比第一个（现行裁剪
+ * 3×）**严格更好**，可以顶替它。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么需要这条规则（实测，2026-10-10 分辨率/取景实验）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 公式行带的裁剪尺度与左右留白都是**真实的质量杠杆**，而且没有哪个
+ * 组合全面更好（Q20 上排：3× 紧裁剪丢指数 `λe−x`，2× 横向扩边
+ * 8% 读回 `λe−λx`；Q20 下排 `f_Y(y)` 标签则只有部分取景读得对）。
+ * 取景相差 2px 就能翻转输出（实测），所以只能逐带比：新读数要拿出
+ * **可验证的增益证据**才允许顶替现行读数。
+ *
+ * 判据三条，对着实测的全部读数对标定（4 段公式区域 × 各 2 行带 ×
+ * 三种裁剪）：
+ *
+ *  1. **内容保留**：旧读数的字母数字序列是新读数序列的子序列 ——
+ *     新读数是「补全」不是「重写」。`fx`→`fy` 这类同长改写、
+ *     中途丢内容的截断都在这一步挡回（实测 Q20 下排 `fy(y)` vs
+ *     `fx(y)` 就是靠这条挡住「看起来更整齐」的错误顶替）；
+ *  2. **至少新增 2 个字母数字**：实测 +1 的增益是垃圾插入
+ *     （`e > (λe−x...` 凭空多一个 `e`），+3 的增益是真内容
+ *     （`λe−λx` 的 `λx` 与 `µe−µy` 的 `µy`）。1 与 3 在唯一
+ *     正例/反例上各归一边，取 2 当中线；
+ *  3. **记号不减**：新读数的记号个数 ≥ 旧读数（见 `NOTATION_CHARS`
+ *     的设计说明）。增益必须在内容上，丢一个真记号换两个字母
+ *     不算优化。
+ *
+ * 反例保护：两读数相同、空读数、只多出逗号/空格/噪点都在上面挡回。
+ * **故意不放松** —— 现行 3× 读数是生产上验证过的基线，宁漏不错。
+ */
+export function preferRicherReading(primary: string, alternate: string): boolean {
+  if (!alternate?.trim()) return false;
+  if (alternate === primary) return false;
+  const p = alnumSequence(primary);
+  const a = alnumSequence(alternate);
+  if (a.length < p.length + ALNUM_GAIN_MIN) return false;
+  if (!isSubsequence(p, a)) return false;
+  return notationCount(alternate) >= notationCount(primary);
+}
+
+/** 第二读数裁剪的横向扩边比例（带宽的 8%，实测 Q20 上排的获胜取景） */
+export const ALTERNATE_BAND_PAD_RATIO = 0.08;
+/** 横向扩边的下限（像素）：窄带的 8% 太小，撑不出识别器需要的两端留白 */
+export const ALTERNATE_BAND_MIN_PAD = 16;
+
+/**
+ * 第一读数的第二候选裁剪框：**只在左右扩边、上下不动**。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么只扩左右（实测，2026-10-10）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 行带是**水平切片**：上下紧贴行墨迹，扩就会切进相邻行（实测行带
+ * 上下的相邻行正是同一段公式的另一半）——现有裁剪对分带用 0 留白
+ * 正是这个原因。而左右是空档：实测 Q20 上排把左右各扩 8% 得到
+ * `(λe−λx, x > 0 (µe−µy, y> 0` 的完整读数，紧边裁剪则丢指数
+ * （`λe−x`）。识别器在窄条两端需要留白才能把候选框切干净。
+ *
+ * 纯函数：返回夹到页面内的框，不分配画布。宽度不成框时返回 null。
+ */
+export function alternateBandBox(band: FormulaBox, pageWidth: number): FormulaBox | null {
+  const width = band.x1 - band.x0;
+  if (!(width > 0) || !(band.y1 > band.y0) || !(pageWidth > 0)) return null;
+  const pad = Math.max(ALTERNATE_BAND_MIN_PAD, Math.round(width * ALTERNATE_BAND_PAD_RATIO));
+  const x0 = Math.max(0, Math.floor(band.x0 - pad));
+  const x1 = Math.min(pageWidth, Math.ceil(band.x1 + pad));
+  if (x1 - x0 <= 0) return null;
+  return { x0, y0: band.y0, x1, y1: band.y1 };
+}
