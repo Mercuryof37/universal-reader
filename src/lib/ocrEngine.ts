@@ -41,6 +41,17 @@ import {
   type MissedInkRegion,
   type RetryCropPlan,
 } from '@/lib/ocrInkRegions';
+import {
+  buildInkGrid,
+  findInkBands,
+  mergeFormulaRegions,
+  planRegionReplacement,
+  regionGateDecision,
+  type FormulaBox,
+  type LayoutRegionLike,
+  type RegionGateDecision,
+} from '@/lib/ocrFormulaRecovery';
+import { dominantFontSize } from '@/lib/ocrPostProcess';
 
 /** 「裁剪 → 字符框」的识别器；建不起来时是 null（见 `ensureCharBoxRecognizer`） */
 type CharBoxRecognizer = Awaited<ReturnType<typeof createWordCharBoxRecognizer>>;
@@ -483,6 +494,18 @@ class OcrEngine {
               `[ocrEngine] 第 ${pageNum} 页词「${word.text.slice(0, 20)}」未取到字符级坐标：${reason}`,
             );
           },
+          /**
+           * 识别多出的 Unicode 上下标字符被补回 `word.text`（实测第 1 词
+           * 的 `²`）—— 「凭空多出来的字」必须有日志，否则将来看到
+           * 「文本比主识别多一个字符」只会当成 bug 查。
+           */
+          onInsert: (word, insertion) => {
+            console.info(
+              `[ocrEngine] 第 ${pageNum} 页词「${word.text.slice(0, 20)}」补回识别多出的字符` +
+                `「${insertion.char}」（第 ${insertion.atIndex} 位，` +
+                `置信度 ${insertion.confidence != null ? insertion.confidence.toFixed(2) : '未知'}）`,
+            );
+          },
         });
         if (attachedCount) {
           console.info(
@@ -619,6 +642,12 @@ class OcrEngine {
           canvas: recognizedCanvas as unknown as OcrCanvasLike,
           scale: factor < 0.999 ? factor : 1,
           onSkip: (word, reason) => recordCharBoxSkip(word.text, `本地重试救回：${reason}`),
+          onInsert: (word, insertion) => {
+            console.info(
+              `[ocrEngine] 第 ${pageNum} 页救回词「${word.text.slice(0, 20)}」补回识别多出的字符` +
+                `「${insertion.char}」（第 ${insertion.atIndex} 位）`,
+            );
+          },
         });
         if (attached) {
           console.info(
@@ -689,6 +718,210 @@ class OcrEngine {
         skippedBlank,
       },
     };
+  }
+
+  /**
+   * ═══════════════════════════════════════════════════════════════
+   * 版面包带式公式恢复：把「被垃圾词覆盖的公式」整段重认一遍
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 为什么 ③（`retryMissedInkLocally`）救不了这类区域：③ 的输入是
+   * 「有墨迹但**没有词覆盖**」的区域；而实测的一段（`Z= 当X>Y=10, 当X>Y`、
+   * 下面的 `fz(e)= 0`）**有**词覆盖 —— 只是词本身是低置信的垃圾。
+   * 墨迹探测因此看不到它们，③ 也永远不会去救。
+   *
+   * 本方法的候选来源是**版面模型的公式标签**（`analyzePageLayout` 的输出，
+   * 与识别同一坐标系）。判定「要不要重认」用三条判据（垃圾词 / 空洞 /
+   * 标点碎片，全部在 `lib/ocrFormulaRecovery.ts` 里，可单测），重认本身
+   * 与 ③ 同一条路径：并区域 → 切行带 → 3× 裁剪 → 本地识别 → 去重准入 →
+   * 替换计划。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * 为什么必须切行带（本次修复的核心）
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 跨行大括号的分段函数高度是两行，而识别器读单行（输入高度 48px）——
+   * 整块裁剪时两行叠在一起，3× 放大也读不出（实测得到 `x(c) {。`）。
+   * 按墨迹行剖面切带、逐带裁剪后，同一个识别器输出立刻变成
+   * `fx(x) = { 0, x ≤ 0`、`Z = {1, 当X≤Y` 这类可用文本。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * 缺省行为（这两条比「救回多少」更重要）
+   * ═══════════════════════════════════════════════════════════════
+   *
+   *  · **纯本地**：只驱动本地 ONNX 引擎，与 `formulaOcrEnabled` 无关，
+   *    不发任何网络请求（与 ③ 同上）；
+   *  · **渐进增强**：没有任何区域命中、或命中了但一个词都没救回时
+   *    返回 `null`，调用方保持原词表逐字节不动；替换只走三条明确理由
+   *    （见 `planRegionReplacement`），宁可重复不丢内容。
+   *
+   * @returns 替换后的完整词表；无改动时返回 null（调用方沿用原数组）
+   */
+  async recoverFormulaRegions(
+    source: ImageData | HTMLCanvasElement | OffscreenCanvas,
+    regions: readonly LayoutRegionLike[],
+    words: readonly OcrWord[],
+    pageNum: number,
+  ): Promise<OcrWord[] | null> {
+    const service = this.service;
+    if (!service || !words.length || !regions.length) return null;
+
+    const merged = mergeFormulaRegions(regions);
+    if (!merged.length) return null;
+
+    const canvas = ensureCanvas(source);
+    if (!canvas) return null;
+    const inkImage = source instanceof ImageData ? source : readCanvasImageData(canvas);
+    if (!inkImage) return null;
+
+    const dominant = dominantFontSize([...words]);
+    const pageArea = canvas.width * canvas.height;
+
+    /**
+     * 第一遍：门控（纯投影，不改任何东西）。
+     *
+     * 垃圾词必须**先全页收集齐**：去重准入的基准要把它们排除在外 ——
+     * 否则垃圾词自己会把正确的救回词挡在门外（实测 `Z= 当X>Y` 的框
+     * 与救回的行带框交叠 1.0，先准入救回词就会被判重复丢掉）。
+     */
+    const jobs: Array<{ region: FormulaBox; decision: RegionGateDecision }> = [];
+    const garbageAll = new Set<OcrWord>();
+    for (const region of merged) {
+      if (jobs.length >= FORMULA_MAX_REGIONS) break;
+      const width = region.x1 - region.x0;
+      const height = region.y1 - region.y0;
+      if (width < FORMULA_MIN_SIDE || height < FORMULA_MIN_SIDE) continue;
+      if (width * height > pageArea * FORMULA_MAX_REGION_AREA_RATIO) continue;
+
+      const grid = buildInkGrid(inkImage, region);
+      const decision = regionGateDecision(region, words, grid, dominant);
+      if (!decision.fire) continue;
+      for (const g of decision.garbageWords) garbageAll.add(g);
+      jobs.push({ region, decision });
+    }
+    if (!jobs.length) return null;
+
+    console.info(
+      `[ocrEngine] 第 ${pageNum} 页公式区域恢复：${jobs.length} 段命中 —— ` +
+        jobs.map((j) => j.decision.reasonText).join('；') +
+        '（纯本地，不联网）',
+    );
+
+    // 第二遍：逐段（多行带时逐带）裁剪识别。
+    const confirmed = words.filter((w) => !garbageAll.has(w));
+    const recoveredAll: OcrWord[] = [];
+    const recoveredByRegion = new Map<FormulaBox, OcrWord[]>();
+    let budget = FORMULA_PIXEL_BUDGET;
+    let plans = 0;
+
+    for (const { region } of jobs) {
+      const bands = findInkBands(inkImage, region, { dominantFontSize: dominant });
+      const planBands = (bands.length ? bands : [region]).slice(0, FORMULA_MAX_BANDS);
+      if (bands.length > planBands.length) {
+        console.warn(
+          `[ocrEngine] 第 ${pageNum} 页公式区域（${Math.round(region.x0)},${Math.round(region.y0)}）` +
+            `切成 ${bands.length} 个行带，只识别前 ${planBands.length} 个（成本封顶）`,
+        );
+      }
+
+      const recovered: OcrWord[] = [];
+      const split = planBands.length > 1;
+
+      /**
+       * 去重基准**剔除本区域内部的词**。
+       *
+       * 区域内部现有的词正是要被这次重识别替换的碎片
+       * （`x >0`、`0，` 这类半截词），救回词与它们重叠是**预期内**的。
+       * 若照旧拿它们当去重基准，整行救回词会被"几何重叠 ≥0.5"一票否决
+       * （小碎片几乎完全落在整行框里），区域外一个词都没进来 ——
+       * 实测 FXFY/24 两段因此一个词都没救回、连垃圾词也没清掉。
+       * 内部词的去留交给第三遍 `planRegionReplacement` 判：垃圾词删除 +
+       * 文本包含的重复删除（整行救回词包含 `x >0` 时才删碎片）。
+       *
+       * 区域外的词（邻居正文被留白带进来的重复）仍然参与去重。
+       */
+      const outside = confirmed.filter((w) => overlapRatio(w.bbox, region) < 0.5);
+
+      for (const band of planBands) {
+        const plan = planRetryCrop(
+          canvas.width,
+          canvas.height,
+          band,
+          FORMULA_UPSCALE,
+          RETRY_MAX_CROP_PIXELS,
+          split ? BAND_CROP_PAD_RATIO : undefined,
+        );
+        if (!plan) continue;
+
+        const cost = plan.targetW * plan.targetH;
+        // 第一个要试的带无论多大都试（用户看到的第一处错读必须有人管），
+        // 之后的按预算放行
+        if (plans > 0 && cost > budget) continue;
+        budget -= cost;
+        plans++;
+
+        try {
+          const crop = renderRetryCrop(canvas, plan);
+          if (!crop) continue;
+
+          const result = await service.recognize(crop, { flatten: true });
+          const admitted = admitRetryWords(
+            result.results,
+            { originX: plan.px, originY: plan.py, scale: plan.scale },
+            // 基准 = 区域外已确认的词（不含垃圾词）+ 前面已救回的词
+            [...outside, ...recoveredAll],
+          );
+          if (!admitted.length) continue;
+
+          // 行带内切的词要夹回带边界，见 `clampWordsToBox` 的说明
+          const bandWords = split ? clampWordsToBox(admitted, band) : admitted;
+          recovered.push(...bandWords);
+          recoveredAll.push(...bandWords);
+          console.info(
+            `[ocrEngine] 第 ${pageNum} 页公式区域行带救回 ${bandWords.length} 个词：` +
+              `${bandWords
+                .map((w) => w.text)
+                .join(' ')
+                .slice(0, 80)}`,
+          );
+        } catch (err) {
+          console.warn(
+            `[ocrEngine] 第 ${pageNum} 页公式区域行带识别失败` +
+              `（${Math.round(band.x0)},${Math.round(band.y0)}，不影响其他区域）：`,
+            err,
+          );
+        }
+      }
+      recoveredByRegion.set(region, recovered);
+    }
+
+    if (!recoveredAll.length) {
+      console.warn(
+        `[ocrEngine] 第 ${pageNum} 页公式区域恢复：${jobs.length} 段命中但一个词都没救回` +
+          `（识别结果不变）`,
+      );
+      return null;
+    }
+
+    // 第三遍：替换计划（垃圾词删除、重复删除、碎片删除、去重准入）
+    let current: OcrWord[] = [...words];
+    let droppedTotal = 0;
+    for (const { region, decision } of jobs) {
+      const recovered = recoveredByRegion.get(region) ?? [];
+      if (!recovered.length) continue;
+      const plan = planRegionReplacement(region, current, recovered, {
+        dominantFontSize: dominant,
+        garbageWords: decision.garbageWords,
+      });
+      droppedTotal += plan.drops.length;
+      current = [...plan.survivors, ...plan.recovered];
+    }
+
+    console.info(
+      `[ocrEngine] 第 ${pageNum} 页公式区域恢复完成：救回 ${recoveredAll.length} 个词、` +
+        `清掉 ${droppedTotal} 个垃圾/重复/碎片词（纯本地，不联网）`,
+    );
+    return current.sort((a, b) => a.bbox.y0 - b.bbox.y0 || a.bbox.x0 - b.bbox.x0);
   }
 
   private async recognizeWithFallback(
@@ -996,43 +1229,79 @@ class OcrEngine {
       .sort((a, b) => (b.x1 - b.x0) * (b.y1 - b.y0) - (a.x1 - a.x0) * (a.y1 - a.y0));
     if (!candidates.length) return [];
 
+    /**
+     * 行带切分：漏识别块**高度是两行**时必须拆开裁。
+     *
+     * 跨行大括号的漏识别块（整个分支一列文字）高度是两行，而识别器
+     * 读单行（输入高度 48px）—— 整块裁剪时两行叠在一起，3× 放大也读不对
+     * （实测返回 `x(c) {。`）。先按墨迹行剖面切成行带、逐带裁剪识别，
+     * 同一个识别器就能读出 `fx(x) = { 0, x ≤ 0`。
+     *
+     * 切不出带（单行、或墨迹太浅不构成行）时退回整块裁剪，
+     * 行为与改动前逐字节一致。
+     */
+    const dominant = dominantFontSize([...existing]);
+    const inkImage = imageData instanceof ImageData ? imageData : readCanvasImageData(canvas);
+
     // 先算几何、后分配画布：预算必须在画布分配之前判掉
-    const jobs: Array<{ plan: RetryCropPlan; region: MissedInkRegion }> = [];
+    const jobs: Array<{
+      plan: RetryCropPlan;
+      region: MissedInkRegion;
+      band: FormulaBox;
+      split: boolean;
+    }> = [];
     let budget = RETRY_PIXEL_BUDGET;
     let skippedForBudget = 0;
+    let regionsTried = 0;
     for (const region of candidates) {
-      if (jobs.length >= RETRY_MAX_REGIONS) break;
-      const plan = planRetryCrop(
-        canvas.width,
-        canvas.height,
-        region,
-        RETRY_UPSCALE,
-        RETRY_MAX_CROP_PIXELS,
-      );
-      if (!plan) continue;
-
-      const cost = plan.targetW * plan.targetH;
-      // 第一个候选无论多大都试（用户看到的第一处丢失必须有人管），
-      // 之后的按预算放行
-      if (jobs.length > 0 && cost > budget) {
-        skippedForBudget++;
-        continue;
+      if (regionsTried >= RETRY_MAX_REGIONS) break;
+      const bands = inkImage ? findInkBands(inkImage, region, { dominantFontSize: dominant }) : [];
+      const planBands = (bands.length ? bands : [region]).slice(0, RETRY_MAX_BANDS);
+      if (bands.length > planBands.length) {
+        console.warn(
+          `[ocrEngine] 第 ${pageNum} 页漏识别区域（${Math.round(region.x0)},${Math.round(region.y0)}）` +
+            `切成 ${bands.length} 个行带，只识别前 ${planBands.length} 个（成本封顶）`,
+        );
       }
-      budget -= cost;
-      jobs.push({ plan, region });
+
+      let plans = 0;
+      const split = planBands.length > 1;
+      for (const band of planBands) {
+        const plan = planRetryCrop(
+          canvas.width,
+          canvas.height,
+          band,
+          RETRY_UPSCALE,
+          RETRY_MAX_CROP_PIXELS,
+          split ? BAND_CROP_PAD_RATIO : undefined,
+        );
+        if (!plan) continue;
+
+        const cost = plan.targetW * plan.targetH;
+        // 第一个要试的带无论多大都试（用户看到的第一处丢失必须有人管），
+        // 之后的按预算放行
+        if (jobs.length > 0 && cost > budget) {
+          skippedForBudget++;
+          continue;
+        }
+        budget -= cost;
+        jobs.push({ plan, region, band, split });
+        plans++;
+      }
+      if (plans) regionsTried++;
     }
     if (!jobs.length) return [];
 
     console.info(
-      `[ocrEngine] 第 ${pageNum} 页本地重试：${jobs.length} 处漏识别区域放大 ${RETRY_UPSCALE}× 重新识别` +
-        `（纯本地，不联网）` +
-        (skippedForBudget ? `，另有 ${skippedForBudget} 处超出像素预算未试` : ''),
+      `[ocrEngine] 第 ${pageNum} 页本地重试：${regionsTried} 处漏识别区域切成 ${jobs.length} 个行带` +
+        `放大 ${RETRY_UPSCALE}× 重新识别（纯本地，不联网）` +
+        (skippedForBudget ? `，另有 ${skippedForBudget} 个带超出像素预算未试` : ''),
     );
 
     const t0 = Date.now();
     const recovered: OcrWord[] = [];
 
-    for (const { plan, region } of jobs) {
+    for (const { plan, region, band, split } of jobs) {
       try {
         const crop = renderRetryCrop(canvas, plan);
         if (!crop) continue;
@@ -1048,10 +1317,12 @@ class OcrEngine {
         );
         if (!admitted.length) continue;
 
-        recovered.push(...admitted);
+        // 行带内切的词要夹回带边界，见 `clampWordsToBox` 的说明
+        const bandWords = split ? clampWordsToBox(admitted, band) : admitted;
+        recovered.push(...bandWords);
         console.info(
-          `[ocrEngine] 第 ${pageNum} 页本地重试救回 ${admitted.length} 个词：` +
-            `${admitted
+          `[ocrEngine] 第 ${pageNum} 页本地重试救回 ${bandWords.length} 个词：` +
+            `${bandWords
               .map((w) => w.text)
               .join(' ')
               .slice(0, 60)}`,
@@ -1241,6 +1512,44 @@ function ensureCanvas(
   return c;
 }
 
+/**
+ * 读回画布的像素（行剖面分析用）。
+ *
+ * 会失败时返回 null —— 调用方退回整块裁剪，识别结果不受影响
+ * （取不到像素只是「切不出行带」，不是错误）。
+ */
+function readCanvasImageData(canvas: HTMLCanvasElement): ImageData | null {
+  try {
+    const ctx = canvas.getContext('2d');
+    return ctx ? ctx.getImageData(0, 0, canvas.width, canvas.height) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 把识别框夹回行带边界。
+ *
+ * 检测框会向外「渗」出裁剪框（实测跨行大括号场景：上带词的框下沿
+ * 压过下带词的框上沿 4px）。渗出本身无害，但两带的词因此纵向交叠，
+ * 成行时被并成一行、再被判成上下标 —— 实测 `{1, 当X≤Y` 变成
+ * `Z = {0, 当X>Y` 的上标。行带是墨迹紧贴切出来的**几何事实**：
+ * 带外的部分不可能是这个词的内容，夹掉即可。
+ *
+ * 夹取后框退化（宽或高 ≤0，理论不可达）的词保持原状 —— 宁可不管，
+ * 不制造非法框。
+ */
+function clampWordsToBox(words: OcrWord[], box: FormulaBox): OcrWord[] {
+  return words.map((w) => {
+    const x0 = Math.max(w.bbox.x0, box.x0);
+    const y0 = Math.max(w.bbox.y0, box.y0);
+    const x1 = Math.min(w.bbox.x1, box.x1);
+    const y1 = Math.min(w.bbox.y1, box.y1);
+    if (x1 <= x0 || y1 <= y0) return w;
+    return { ...w, bbox: { x0, y0, x1, y1 } };
+  });
+}
+
 function cropCanvas(
   source: HTMLCanvasElement,
   bbox: { x0: number; y0: number; x1: number; y1: number },
@@ -1275,12 +1584,36 @@ const RETRY_MIN_SIDE = 24;
 const RETRY_MAX_REGION_AREA_RATIO = 0.3;
 /** 一页最多重试几处（按面积从大到小取） */
 const RETRY_MAX_REGIONS = 8;
+/** 单个区域最多切成几个行带识别（成本封顶；实测大括号系统最多两行） */
+const RETRY_MAX_BANDS = 4;
+/**
+ * 行带裁剪的留白比例。**必须接近 0**：`planRetryCrop` 的留白按
+ * `max(宽,高)×比例` 算，行带又宽又矮（实测 785×32），8% 就是 63px ——
+ * 纵向多出来的留白会把**相邻行重新带进裁剪**（切带的意义荡然无存），
+ * 两带识别结果的框也因此大幅交叠，去重准入会把正确的一带丢掉。
+ * 行带本身是墨迹紧贴切出来的（上下边界外没有笔画），2px 足够。
+ */
+const BAND_CROP_PAD_RATIO = 0;
 /** 放大倍数（检测/识别都已在原尺度失败过，原样再送没有意义） */
 const RETRY_UPSCALE = 3;
 /** 单个裁剪放大后的面积上限；放不下就少放一点，但**不缩小** */
 const RETRY_MAX_CROP_PIXELS = 2_500_000;
 /** 整页重试的总像素预算 —— 一页最多再花两张页面的推理量 */
 const RETRY_PIXEL_BUDGET = 8_000_000;
+
+// ── 版面包带式公式恢复的参数（见 `recoverFormulaRegions`） ────────────────
+/** 一次最多处理几段公式区域（版面模型给的公式标签，实测一页 ≤4 段） */
+const FORMULA_MAX_REGIONS = 6;
+/** 单个区域最多切成几个行带 */
+const FORMULA_MAX_BANDS = 4;
+/** 放大倍数（与 ③ 同口径；原尺度已经错读过，原样再送没有意义） */
+const FORMULA_UPSCALE = 3;
+/** 区域任一边小于这个值（像素）的不试（版面模型偶有碎片区域） */
+const FORMULA_MIN_SIDE = 16;
+/** 区域面积超过页面的这个比例的不试：更像插图或整页内容 */
+const FORMULA_MAX_REGION_AREA_RATIO = 0.25;
+/** 公式区域恢复的总像素预算（独立于 ③ 的 8MP，最多再花约两张页面） */
+const FORMULA_PIXEL_BUDGET = 6_000_000;
 
 /**
  * 把放大裁剪的计划渲染成画布。

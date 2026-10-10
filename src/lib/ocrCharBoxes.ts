@@ -2397,7 +2397,18 @@ export interface CharBoxAttachOptions {
   createCanvas?: CanvasFactory;
   /** 诊断回调：某个词为什么没拿到字符框 */
   onSkip?: (word: OcrWord, reason: string) => void;
+  /** 诊断回调：把「识别多出来的字符」补回 `word.text` 时逐个报出 */
+  onInsert?: (word: OcrWord, insertion: ReconciledInsertion) => void;
 }
+
+/**
+ * 一个词最多允许补回几个「识别多出来」的字符。
+ *
+ * 取 2 的依据：真实多认的场景是**单个**角标字符（实测第 1 词多一个 `²`），
+ * 2 已经留了一倍余量；再多就不像「多认了个字符」，而像这次识别与词文本
+ * 结构性分歧（裁到了别的内容、整串串位之类）—— 那种情况一条都不该补。
+ */
+const MAX_SCRIPT_INSERTIONS_PER_WORD = 2;
 
 /**
  * 给一批词补上字符框 —— **能补多少补多少，补不上就保持原样**。
@@ -2411,8 +2422,35 @@ export interface CharBoxAttachOptions {
  *    「整页识别」失败。
  * 2. **每个词独立 try/catch**：一个词的裁剪/推理炸了，只是这个词没有
  *    字符框，其余词照常。
- * 3. **不改 `OcrWord` 本身**：字符框挂在 `WeakMap` 上，没有字符框的词
- *    与改动前完全一样（连一个 `undefined` 属性都不多）。
+ * 3. **不改 `OcrWord` 的字段集合**：字符框挂在 `WeakMap` 上，没有字符框
+ *    的词与改动前完全一样（连一个 `undefined` 属性都不多）。唯一的例外
+ *    是下面 ⭐ 一节：把「识别多出来」的 Unicode 上下标字符补回
+ *    `word.text` —— 那是文本内容的一次有意修正，且与坐标数组同时生效，
+ *    不是新字段。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * ⭐ 补回「识别多出来」的上标字符（`p²` 的平方为什么在这里长回来）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 背景：主识别把 `p²` 读成 `p`（丢了 `²`），而本模块的重识别读出了
+ * `²` —— 对账把这多出来的字符放在 `insertions` 里（见
+ * `ReconciledInsertion`）。此前它被**静默跳过**，于是最终输出永远是
+ * `= p (1 − p )…`，平方凭空消失。
+ *
+ * 补回的闸门有两道，缺一不可：
+ *
+ *  · `measurement !== null`：这个字符真的量到了墨迹。没量到时它可能
+ *    只是识别器凭空加出来的，补进文本等于**伪造内容**；
+ *  · `isUnicodeScriptChar(char)`：只补 Unicode 上下标字符
+ *    （`²`/`₃`/`ⁿ` 这一族）。它们本身就是「角标」语义，
+ *    补进 `word.text` 只有一种解释 —— 不可能是正文用字被写歪。
+ *    而 ASCII 字符（多认的 `x`、`1`）有真实语义，万一是识别噪声，
+ *    补进去就是往正文里塞错字 —— 宁可漏，不可错。
+ *
+ * 应用是**原子**的：`word.text` 的插入与三条坐标数组（`chars` /
+ * `measurements` / `confidences`）的插入必须同步 —— 只改一边，
+ * `emitWordWithCharScripts` 按下标切出来的就是别的字。
+ * 多过 `MAX_SCRIPT_INSERTIONS_PER_WORD` 时一条都不补（宁可少补）。
  *
  * @returns 成功挂上字符框的词数；`recognizer` 为 null 时返回 0。
  */
@@ -2487,19 +2525,53 @@ export async function attachCharBoxes(
 
       // 裁剪内坐标 → 画布坐标：加回裁剪原点、再除以 scale
       // （词框是在缩放画布上量的，字符框要回到同一坐标系）
-      const chars: OcrChar[] = aligned.chars.map((c) => ({
-        char: c.char,
+      const toCanvas = (c: { x0: number; y0: number; x1: number; y1: number }) => ({
         x0: (cropped.originX + c.x0) / scale,
         y0: (cropped.originY + c.y0) / scale,
         x1: (cropped.originX + c.x1) / scale,
         y1: (cropped.originY + c.y1) / scale,
-      }));
-
-      charBoxRegistry.set(word, {
-        chars,
-        measurements: aligned.measurements,
-        ...(aligned.confidences ? { confidences: aligned.confidences } : {}),
       });
+
+      const finalChars: OcrChar[] = aligned.chars.map((c) => ({
+        char: c.char,
+        ...toCanvas(c),
+      }));
+      const finalMeasure: Array<InkMeasurement | null> = aligned.measurements.slice();
+      const finalConfidence = aligned.confidences ? aligned.confidences.slice() : null;
+
+      /**
+       * ⭐ 闸门（两道，见函数文档）：量到墨迹 + Unicode 上下标字符。
+       * 其余多出的字符一个都不碰 —— 它们照旧被跳过，与改动前一致。
+       */
+      const candidates = (aligned.insertions ?? []).filter(
+        (ins) => ins.measurement !== null && isUnicodeScriptChar(ins.char),
+      );
+      if (candidates.length > MAX_SCRIPT_INSERTIONS_PER_WORD) {
+        // 结构性分歧（不像「多认了个角标」）—— 宁可一条都不补
+        candidates.length = 0;
+      }
+
+      let nextText = word.text;
+      // 从后往前补：前面的下标在后续插入中不会失效
+      for (let k = candidates.length - 1; k >= 0; k--) {
+        const ins = candidates[k]!;
+        finalChars.splice(ins.atIndex, 0, { char: ins.char, ...toCanvas(ins) });
+        finalMeasure.splice(ins.atIndex, 0, ins.measurement);
+        finalConfidence?.splice(ins.atIndex, 0, ins.confidence ?? Number.NaN);
+        nextText = nextText.slice(0, ins.atIndex) + ins.char + nextText.slice(ins.atIndex);
+      }
+
+      // 文本与坐标数组**一起**生效：只改一边，下游按 `word.text` 下标
+      // 切片时就会切到别的字（见 `emitWordWithCharScripts`）
+      charBoxRegistry.set(word, {
+        chars: finalChars,
+        measurements: finalMeasure,
+        ...(finalConfidence ? { confidences: finalConfidence } : {}),
+      });
+      if (candidates.length) {
+        word.text = nextText;
+        for (const ins of candidates) options.onInsert?.(word, ins);
+      }
       attached++;
     } catch (err) {
       options.onSkip?.(word, `字符框失败：${err instanceof Error ? err.message : String(err)}`);
@@ -2553,8 +2625,17 @@ interface SequenceAlignment {
   map: number[];
   /** 逐字符相等的配对数（删除/替换的位置不计入） */
   matches: number;
-  /** 识别多出来、没配到目标的字符数 */
+  /** 识别多出来、没配到目标的字符数（等于 `unmatched.length`） */
   ins: number;
+  /**
+   * 多出来的那些字符在**识别序列**里的下标，以及它们落在目标的哪个
+   * 边界（0..目标序列长度）——「边界 B」= 它前面有 B 位目标字符配上了，
+   * 也就是它该插在目标第 B-1 个字符之后。
+   *
+   * 顺序保证：`recIndex` 升序、`boundary` 非递减（回溯后反转得到）——
+   * 下游刷入（flush）只需从左到右一次扫描。
+   */
+  unmatched: { recIndex: number; boundary: number }[];
 }
 
 /**
@@ -2592,6 +2673,7 @@ function alignSequences(targetSeq: string[], recSeq: string[]): SequenceAlignmen
   let j = m;
   let matches = 0;
   let ins = 0;
+  const unmatched: { recIndex: number; boundary: number }[] = [];
   while (i > 0 || j > 0) {
     if (i > 0 && j > 0) {
       const equal = targetSeq[i - 1] === recSeq[j - 1];
@@ -2610,9 +2692,34 @@ function alignSequences(targetSeq: string[], recSeq: string[]): SequenceAlignmen
       continue;
     }
     ins++;
+    unmatched.push({ recIndex: j - 1, boundary: i });
     j--;
   }
-  return { map, matches, ins };
+  // 回溯是**倒着**走的：反转后 `recIndex` 升序、`boundary` 非递减
+  unmatched.reverse();
+  return { map, matches, ins, unmatched };
+}
+
+/**
+ * 「识别多出来、目标里没有」的一个字符，连同它的几何 —— 由
+ * `reconcileWithWordText` 交出去，`attachCharBoxes` 决定补不补。
+ *
+ * ⚠️ 坐标是**裁剪内**的（与 `reconcileWithWordText` 的入参同一坐标系），
+ * 调用方负责加裁剪原点、除缩放（`(originX + x) / scale`）。
+ */
+export interface ReconciledInsertion {
+  /** 插到目标文本的哪个下标之前（= 它前面已发出多少位目标字符） */
+  atIndex: number;
+  /** 多出来的字符（**原样**，不做归一化 —— 补进 `word.text` 的就是它） */
+  char: string;
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  /** 归一化墨迹测量；null = 没量到墨迹（调用方一概不敢补） */
+  measurement: InkMeasurement | null;
+  /** 逐字符置信度；缺省为 null */
+  confidence: number | null;
 }
 
 /**
@@ -2641,7 +2748,15 @@ export function reconcileWithWordText(
   recognizedText: string,
   wordText: string,
   confidences?: ReadonlyArray<number | null | undefined> | null,
-): { chars: OcrChar[]; measurements: Array<InkMeasurement | null>; confidences?: number[] } | null {
+):
+  | {
+      chars: OcrChar[];
+      measurements: Array<InkMeasurement | null>;
+      confidences?: number[];
+      /** 识别多出来的字符（含几何）；一条都没有时**不带这个键** */
+      insertions?: ReconciledInsertion[];
+    }
+  | null {
   const target = wordText.trim();
   if (!target) return null;
 
@@ -2734,7 +2849,11 @@ export function reconcileWithWordText(
    *   识别 `…=p²(1−p)x+y−2…`   期望 `…=p(1−p)x+y−2…`
    *                              ↑ 识别多出一个 `²`
    *
-   * 其余逐个吻合 —— 多出来的那个跳过即可，**期望里每个字符仍然都有框**。
+   * 其余逐个吻合 —— 多出来的那个跳过即可，**期望里每个字符仍然都有框**；
+   * 而那个 `²` 本身也不再被白白扔掉：它连同字符框与墨迹测量一起
+   * 以 `insertions` 交出去（见 `ReconciledInsertion` 与 `attachCharBoxes`
+   * 的 ⭐ 一节），由调用方决定是否补回 `word.text` ——
+   * 这正是「`p` 的平方」在最终输出里能出现的原因。
    *
    * 但「只许多、不许少」也丢掉过真词，原始记录就在同一次浏览器实测的
    * 告警里（下面两条都该放行）：
@@ -2826,8 +2945,49 @@ export function reconcileWithWordText(
    * 置信度同理必须逐位补齐：占位处填 `NaN`（而不是 0），
    * 好让下游一眼看出「这个位置没有置信度」而不是「它的置信度极低」。
    */
+  /**
+   * ⭐ 把「识别多出来」的字符连同几何一起收集起来。
+   *
+   * 收集是**纯**的（不改 `word.text`、不替调用方做决定）：补不补、补哪
+   * 几类字符，由 `attachCharBoxes` 按自己的闸门判断 —— 那里看得到
+   * 「测量值是不是 null」「是不是 Unicode 上下标字符」这类信息，
+   * 而这里只负责一视同仁地交出去。
+   *
+   * 落位规则（`atIndex`）：插在**它物理上紧跟着的那个目标字符之后**
+   * （`unmatched` 的边界 B = 它前面有 B 位目标字符配上了，于是
+   * `keptChars` 刚发出第 B 个字符时刷出的插入位就是 B）。
+   * 实测第 1 词的 `²` 因此落在 `p` 之后、空格之前 ——
+   * `= p² (1− p )…`，与图上的排版一致。
+   */
+  const insList = aligned.unmatched;
+  const insertions: ReconciledInsertion[] = [];
+  let insSeq = 0;
+  /** 把边界已到的插入字符落位（`boundary` 非递减，指针一次扫完） */
+  const flushInsAt = (boundary: number): void => {
+    while (insSeq < insList.length && insList[insSeq]!.boundary <= boundary) {
+      const u = insList[insSeq++]!;
+      const srcIndex = recSeqSrc[u.recIndex] ?? -1;
+      const c = srcIndex >= 0 ? trimmed.chars[srcIndex] : undefined;
+      // 映射是按 `recSeqSrc` 造的，理论上到不了这里；真到了就不给这一条
+      if (!c) continue;
+      const conf = trimmed.confidences?.[srcIndex];
+      insertions.push({
+        atIndex: keptChars.length,
+        char: c.char,
+        x0: c.x0,
+        y0: c.y0,
+        x1: c.x1,
+        y1: c.y1,
+        measurement: trimmed.measurements[srcIndex] ?? null,
+        confidence: Number.isFinite(conf) ? (conf as number) : null,
+      });
+    }
+  };
+
   let prevX = 0;
   let prevY = 0;
+  // 边界 0：多出的字符在目标第一个字符之前
+  flushInsAt(0);
   for (const want of targetChars) {
     /** 缺框（空白位 / 识别漏掉）：占位，无墨迹、无置信度 */
     const placeholder = (): void => {
@@ -2844,6 +3004,7 @@ export function reconcileWithWordText(
     const recIndex = map[seqIndex++] ?? -1;
     if (recIndex < 0) {
       placeholder();
+      flushInsAt(seqIndex);
       continue;
     }
 
@@ -2858,6 +3019,8 @@ export function reconcileWithWordText(
     keptConfidence.push(trimmed.confidences?.[srcIndex] ?? Number.NaN);
     prevX = hit.x1;
     prevY = hit.y0;
+    // 刚发出第 `seqIndex` 个目标字符 —— 边界为 `seqIndex` 的插入位就在它后面
+    flushInsAt(seqIndex);
   }
 
   if (keptChars.length !== targetChars.length) return null;
@@ -2873,5 +3036,6 @@ export function reconcileWithWordText(
     chars: keptChars,
     measurements: keptMeasure,
     ...(anyConfidenceKnown ? { confidences: keptConfidence } : {}),
+    ...(insertions.length ? { insertions } : {}),
   };
 }

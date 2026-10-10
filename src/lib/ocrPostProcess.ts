@@ -63,6 +63,26 @@ const SAME_LINE_TOLERANCE = 5;
 const PARAGRAPH_BREAK_RATIO = 1.2;
 /** 段间距的绝对下限（字号倍数）：与字号相比明显拉开的行距就算换段 */
 const PARAGRAPH_BREAK_FONT_RATIO = 1.8;
+/**
+ * 「字号突变 → 另起一段」的容差：相邻两行字号的差超过**较大者**的
+ * 这个比例，才算不同排面。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么不能用绝对像素（这是一次真实的内容错切）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 原来这里是 `> 2`：行字号差 2px 就断段。可**行的字号是词字号的
+ * 均值，词字号又等于检测框高**，而检测框会随内容被撑大 ——
+ * 一个含分式/指数的词，框高能比周围文字高出一大截。实测用户那份
+ * 习题 PDF 第 17 题：首行含 `p(1−p)^{x+y−2}`，行字号 43；续行是
+ * 纯文字 `整数，问X，Y是否相互独立.`，行字号 36。7px 的差被绝对
+ * 判据判成「不同排面」，一句话在 `均为 正 / 整数` 之间被劈成两段
+ * （用户实测报障「正整数处出现错误换行」）。
+ *
+ * 7/43 ≈ 16% 显然是同一排面的检测框噪声；而真正需要断开的字号突变
+ * （正文 42 → 小标题 58）差约 28%。取 0.25 同时满足两侧。
+ */
+const FONT_SIZE_BREAK_RATIO = 0.25;
 const HEADING_FONT_RATIO = 1.3;
 const HEADING_MAX_CHARS = 80;
 const HEADER_FOOTER_MARGIN_RATIO = 0.05;
@@ -115,6 +135,26 @@ const SCRIPT_SUB_BAND = 1.2;
 const SCRIPT_FRAGMENT_GAP = 0.6;
 /** 同一个上下标被切成多个词时，兄弟词之间的纵向错位上限（较小字高倍数） */
 const SCRIPT_FRAGMENT_DY = 0.5;
+/**
+ * 上下标候选的宽度上限（参考字号倍数）。
+ *
+ * 堆叠两行的紧贴公式会把整行误判成上下标：实测跨行大括号系统里
+ * 下行词 `Z = {0, 当X > Y`（框被 `{` 撑到 52px 高、字号量成 56）与
+ * 上行词 `_(1，当 X≤Y`（312px 宽，中心错位 40px）—— 中心错位
+ * 40 ≤ 1.5 倍字号（54）、水平重叠、中间无词，`findScriptAnchors`
+ * 的五条判据全部通过，上行的**整行**被挂成下行的上标。
+ * FXFY 例更极端：基词是整行 788px 的 `fx(x) = { 0, ...`，上一行
+ * 两个 342/282px 的词也全被判成上标。
+ *
+ * 真正的词级上下标是**小片段**（实测 `-(x+y)` 宽 ~90px），而这些
+ * 候选都超过 4 倍参考字号（fs36 时 144px）。判据只看**绝对宽度**：
+ * 比 4em 还宽的候选按独立行处理。不能用「与基字同宽的比例」——
+ * 基字本身是整行宽时，比例判据够不着（实测的反例）。
+ *
+ * 更长的指数（`p(1−p)^{x+y−2}` 这类整段打包）由字符级机制在词内
+ * 处理，不经过这里，不受这条判据影响。
+ */
+const SCRIPT_MAX_WIDTH_EM = 4;
 /**
  * 孤立成行的上下标候选，文本长度上限（字符）。
  *
@@ -439,6 +479,15 @@ export function ocrResultToBlocks(
   const medianGap = median(gaps) || 0;
   const medianFontSize = median(lines.map((l) => l.fontSize)) || 12;
 
+  // 回卷续行判据（见下面 `wrappedContinuation`）要用的整页左/右缘：
+  // 行内词框并集的两端，再取全页极值。含义是「版心大致的左右边界」。
+  const lineLeftEdge = (l: OcrLine): number =>
+    l.words.reduce((min, word) => Math.min(min, word.bbox.x0), Number.POSITIVE_INFINITY);
+  const lineRightEdge = (l: OcrLine): number =>
+    l.words.reduce((max, word) => Math.max(max, word.bbox.x1), Number.NEGATIVE_INFINITY);
+  const pageLeftEdge = lines.reduce((min, l) => Math.min(min, lineLeftEdge(l)), Number.POSITIVE_INFINITY);
+  const pageRightEdge = lines.reduce((max, l) => Math.max(max, lineRightEdge(l)), Number.NEGATIVE_INFINITY);
+
   const blocks: Omit<ContentBlock, 'id'>[] = [];
   let currentText = '';
   let currentConfSum = 0;
@@ -453,6 +502,8 @@ export function ocrResultToBlocks(
    */
   let currentFirstText = '';
   let prevY: number | null = null;
+  /** 上一行的原始行：回卷续行判据要看它的右缘与行尾标点 */
+  let prevLine: OcrLine | null = null;
 
   for (const line of lines) {
     const gap = prevY === null ? 0 : Math.abs(prevY - line.y);
@@ -486,20 +537,74 @@ export function ocrResultToBlocks(
      * 但有个几何之外的强信号一直被浪费了 —— **每一题都以编号开头**。
      *
      * 编号是排版意图的显式声明，比任何间距阈值都可靠：
-     * `17.` `20.` `24.` 这种形式在中文教材/习题集里没有歧义
-     * （它们不会出现在句子中间，也不像小数那样被误用）。
+     * `17.` `20.` `24.` 这种形式在中文教材/习题集里没有歧义。
      *
      * 所以这里补上「结构信号优先于几何信号」这一层 ——
      * 几何判不出来的时候，让文档自身的结构说话。
+     *
+     * ───────────────────────────────────────────────────────────
+     * 两种编号形式，以及「小数不在此列」的分界
+     * ───────────────────────────────────────────────────────────
+     *
+     *  ① 数字 + 分隔符：`17.` `20、` `7)` `8）`
+     *  ② 括号包裹：`(1)` `（2）` `(3）` —— 习题的**小问**编号。
+     *
+     * ⚠️ 小问编号（形式 ②）同样是「另起一段」的结构信号，不能只有大题号
+     * 才算：`(1）求…` 紧跟在被撑大的公式行后面时，字号判据会把它当续行
+     * 吞掉（实测第 20 题的 `(1)问 X 和 Y 是否相互独立？` 就是这样并进
+     * 上面那段 `x>0,y>0 ） 0，其他` 的）。它和小数一样**不会**出现在
+     * 句子中间 —— `(1)` 后面必须跟空白或正文，`(1.5)` 这种小数不会匹配。
+     *
+     * ⚠️ 小数点后必须跟非数字才认（`(?!\d)`）：旧正则 `/^\s*\d{1,3}\s*[.、)）]\s*\S/`
+     * 里的 `\S` 会被小数点后的第一位数字满足，于是 `3.14 是…` 这种以
+     * 小数开头的正文行**被误判成题号行**（同页单行时不显形，多行时
+     * 平白多切一段）。
      */
-    const NUMBERED_ITEM_RE = /^\s*\d{1,3}\s*[.、)）]\s*\S/;
+    const NUMBERED_ITEM_RE = /^\s*(?:\d{1,3}\s*(?:[、)）]|\.(?!\d))|[（(]\s*\d{1,3}\s*[)）])\s*\S/;
     const startsNumberedItem = NUMBERED_ITEM_RE.test(line.text);
+
+    // 字号突变：改为**相对**容差（绝对 2px 会把公式行被撑大的检测框
+    // 误判成「不同排面」，见 FONT_SIZE_BREAK_RATIO 的说明）。
+    const fontBreak =
+      currentText.length > 0 &&
+      Math.abs(line.fontSize - currentFontSize) >
+        Math.max(line.fontSize, currentFontSize) * FONT_SIZE_BREAK_RATIO;
+
+    /**
+     * 回卷续行救援（排版逻辑，与扫描全能王一类工具同源）。
+     *
+     * ═══════════════════════════════════════════════════════════════
+     * 几何事实比字号可靠时，字号判据必须让路
+     * ═══════════════════════════════════════════════════════════════
+     *
+     * 相对容差能挡住绝大多数检测框噪声，但噪声没有上界：一个把分式
+     * 排上下的词可以让行的字号均值再高一截。与其继续放宽比率
+     * （真字号突变会被一起放过），不如补一条**与字号无关的几何事实**：
+     *
+     *   上一行**写满整栏**（右缘顶到版心右缘一个多字以内）
+     *   且本行**从版心左缘起排**、上一行**没有句末标点** ——
+     *   这就是排版上的「行未写完、回卷接排」，在任何字号下都成立。
+     *
+     * 实测第 17 题的两行就是这条：首行右缘 1604 = 全页最右，续行
+     * `整数，问…` 左缘 147 = 全页最左，首行以「正」结尾（无标点）。
+     *
+     * ⚠️ 只在「其余判据都要求续行、只有字号判据要求断开」时生效：
+     * 编号开头、段间距拉开、句末标点 + 拉开间距这些强信号不受影响
+     * （它们在 `isNewParagraph` 里各自独立成立）。
+     */
+    const wrappedContinuation =
+      fontBreak &&
+      prevLine !== null &&
+      !/[。！？!?.;；:：]\s*$/.test(prevLine.text) &&
+      lineRightEdge(prevLine) >=
+        pageRightEdge - Math.max(prevLine.fontSize * 1.2, (pageRightEdge - pageLeftEdge) * 0.03) &&
+      lineLeftEdge(line) <= pageLeftEdge + line.fontSize * 2;
 
     const isNewParagraph =
       !currentText ||
       startsNumberedItem ||
       gap > breakGap ||
-      Math.abs(line.fontSize - currentFontSize) > 2 ||
+      (fontBreak && !wrappedContinuation) ||
       (endsSentence && gap > line.fontSize * 0.95);
 
     if (isNewParagraph) {
@@ -546,6 +651,7 @@ export function ocrResultToBlocks(
       if (line.hasScripts) currentScripts++;
     }
     prevY = line.y;
+    prevLine = line;
   }
 
   if (currentText.trim()) {
@@ -1658,6 +1764,15 @@ function findScriptAnchors(words: OcrWord[], pageMainFontSize: number): Map<numb
       const band = isSuper ? SCRIPT_SUPER_BAND : SCRIPT_SUB_BAND;
       if (Math.abs(candCenter - baseCenter) > pageMainFontSize * band) continue;
 
+      // 判据 6：宽片段不是上下标（见 `SCRIPT_MAX_WIDTH_EM`）。
+      // **只看绝对宽度**：实测跨行大括号的上一行是 342/282px 的公式行，
+      // 基词是整行 788px 的 `fx(x) = { 0, x ≤ 0 fx(y) = ...` ——
+      // 「0.8×基宽」的相对判据在宽基词上够不着，把上一行判成了头上上标。
+      // 4em 以上按独立行处理；词级锚定里的真实指数最长不过 3em 上下
+      // （更长的指数由字符级机制在词内处理，不走这里）。
+      const candWidth = cand.bbox.x1 - cand.bbox.x0;
+      if (candWidth >= pageMainFontSize * SCRIPT_MAX_WIDTH_EM) continue;
+
       if (gap < bestGap) {
         bestGap = gap;
         best = j;
@@ -1684,6 +1799,8 @@ function findScriptAnchors(words: OcrWord[], pageMainFontSize: number): Map<numb
       const cand = words[i];
       if (!cand || !cand.text.trim()) continue;
       if (!(cand.fontSize > 0) || cand.fontSize > maxScriptHeight) continue;
+      // 宽片段不是上下标（见 `SCRIPT_MAX_WIDTH_EM`）：整行宽的词不跟兄弟走
+      if (cand.bbox.x1 - cand.bbox.x0 >= pageMainFontSize * SCRIPT_MAX_WIDTH_EM) continue;
 
       for (const [siblingIndex, anchorIndex] of anchors) {
         const sibling = words[siblingIndex];
@@ -2071,7 +2188,27 @@ function mergeContainedBranches(lines: OcrLine[], pageMainFontSize: number): Ocr
     const cluster: OcrLine[] = [seed];
     let mergedSpan = horizontalSpanOf(seed);
     let mergedV = verticalSpanOf(seed);
-    let refFont = Math.max(seed.fontSize, pageMainFontSize);
+
+    // ═══════════════════════════════════════════════════════════════
+    // 纵向邻近的尺子 = **版面主字号**，不是主机检测框的字号
+    // ═══════════════════════════════════════════════════════════════
+    //
+    // `canMergeAsBranch` 的纵向带宽按这个字号折算（1.4 倍）。尺子必须是
+    // 「行距」的尺度 —— 行距由版面主字号决定，而公式检测框的高度会被
+    // 跨行大括号/分式**撑高**（实测一个字高 42 的行被撑到 fontSize 56），
+    // 拿撑高的字号当尺子等于把允许的行距放大 1.4 倍。
+    //
+    // 实测（用户第 1 页，版面主字号 36）：恢复出的词「fx(x) = { 0, x ≤ 0
+    // fx(y) = { 0, y≤ 0」框高被大括号撑到 52px（fontSize 56）—— 带宽随之
+    // 放宽到 78.4px，于是把 67px 下方、属于**另一行**的「_(1，当 X≤Y」
+    // 当成分支吞了进来（它应当跟着下面的大括号式走）。
+    // 钉回主字号后带宽 36 × 1.4 = 50.4px：67 判不进；而真正贴合的分支
+    //（实测「0，」「其他」距主机 12px、旧导出「0,」距主式 28px）照常通过 ——
+    // 行内构件与主机的距离天然在一个字高之内。
+    //
+    // 注意这**不是**「从严」调阈值：合法构件的合并大都走判据 1（纵向重叠）
+    // 与判据 2（横向压得实），两者与这把尺子无关；它只拦住「隔着一行还
+    // 想按撑高字号进来的」候选。
 
     // 反复扫描直到不再有新的行被并进来（一条分支下方可能还有分支）
     let extended = canHost;
@@ -2081,7 +2218,7 @@ function mergeContainedBranches(lines: OcrLine[], pageMainFontSize: number): Ocr
         if (used[j]) continue;
         const cand = byWidth[j];
         if (!cand) continue;
-        if (!canMergeAsBranch(cand, mergedSpan, mergedV, refFont, medianGap)) continue;
+        if (!canMergeAsBranch(cand, mergedSpan, mergedV, pageMainFontSize, medianGap)) continue;
 
         used[j] = true;
         cluster.push(cand);
@@ -2097,7 +2234,6 @@ function mergeContainedBranches(lines: OcrLine[], pageMainFontSize: number): Ocr
           y0: Math.min(mergedV.y0, candV.y0),
           y1: Math.max(mergedV.y1, candV.y1),
         };
-        refFont = Math.max(refFont, cand.fontSize);
       }
     }
 
@@ -2318,10 +2454,15 @@ function canMergeAsBranch(
 
   // 判据 3：数学分支 + 纵向紧邻。
   //
-  // 纵向上限按**主机字号**算：分支紧贴主机时，行间距离与主机字高同量级。
-  // 实测（主机字号 20）三组数据说明 1.4 这个尺度刚好把两类分开：
+  // 纵向上限按**版面主字号**算：分支紧贴主机时，行间距离由行距决定，
+  // 而行距是版面主字号的量级。
+  // 实测（版面主字号 20）三组数据说明 1.4 这个尺度刚好把两类分开：
   //   · 合法分支 `0,` / `合计`：间隙 28px = 1.4 倍 → 并入；
   //   · 排在下方的另一行正文：间隙 30–40px ≥ 1.5 倍 → 不并入。
+  //
+  // ⚠️ `refFont` 是调用方传入的**版面主字号**，不是主机的 `line.fontSize`：
+  // 后者会被跨行大括号/分式撑高（实测 42 → 56），拿它当尺子会把带宽放大、
+  // 把下一行吞掉。完整实测见 `mergeContainedBranches` 里尺子的说明。
   const gapLimit = Math.min(
     refFont * CLUSTER_BRANCH_GAP_RATIO,
     medianGap > 0 ? medianGap * CLUSTER_MAX_GAP_LINES : Infinity,
@@ -2844,7 +2985,7 @@ function median(values: number[]): number {
  */
 const DOMINANT_MIN_SHARE = 0.4;
 
-function dominantFontSize(words: OcrWord[]): number {
+export function dominantFontSize(words: OcrWord[]): number {
   const counts = new Map<number, number>();
   let total = 0;
   for (const word of words) {

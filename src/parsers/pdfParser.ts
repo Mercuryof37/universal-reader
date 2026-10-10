@@ -613,6 +613,43 @@ export async function ocrParsePdf(
           `第 ${pageNum} 页：版面分析${layout ? `得到 ${layout.regions.length} 个区域` : '不可用，回退几何启发式'}`,
         );
 
+        /**
+         * 版面包带式公式恢复（渐进增强，纯本地）。
+         *
+         * ═══════════════════════════════════════════════════════════
+         * 为什么放在这里（版面分析之后、块组装之前）
+         * ═══════════════════════════════════════════════════════════
+         *
+         * 它要解决的是「有词覆盖、但词是低置信垃圾」的那类公式错读
+         * （`Z= 当X>Y=10, 当X>Y`、`fz(e)= 0`）—— 与识别内部的
+         * 「漏识别区域本地重试」互补：那条路只看得见**没有词覆盖**的
+         * 区域，看不到被垃圾词盖住的。
+         *
+         * 三条硬约束：
+         *  1. **必须在版面分析之后**：候选就是它的公式标签区域；
+         *  2. **必须在块组装之前**：改的是词表，块从词表来；
+         *  3. **失败必须无痕**：返回 null 时词表**逐字节不动**，
+         *     这一页照常出结果（纯本地、绝不联网，与「本地重试」同上）。
+         */
+        if (layout?.regions?.length && ocrResult.words.length) {
+          try {
+            const recovered = await ocrEngine.recoverFormulaRegions(
+              pageCanvas,
+              layout.regions,
+              ocrResult.words,
+              pageNum,
+            );
+            if (recovered) {
+              ocrResult.words = recovered;
+            }
+          } catch (err) {
+            console.warn(
+              `[ocrParsePdf] 第 ${pageNum} 页公式区域恢复失败（识别结果不受影响）：`,
+              err,
+            );
+          }
+        }
+
         const blocks = ocrResultToBlocks(
           ocrResult,
           pageCanvas.height,

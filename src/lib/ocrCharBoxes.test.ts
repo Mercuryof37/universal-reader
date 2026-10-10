@@ -882,6 +882,17 @@ describe('对账与挂载：拿不到字符框时行为必须与改动前一致'
     // 比期望多一个 `²`、其余逐个吻合；旧规则因此丢掉了整行。
     const r = reconcileWithWordText(charsOf('ABCD'), measOf(4), 'ABCD', 'ABC');
     expect(r?.chars.map((c) => c.char).join('')).toBe('ABC');
+    // ⭐ 多出的 `D` **不再只是跳过**：连同字符框与墨迹测量一起以
+    // `insertions` 交出去（下标 3 = `C` 之后；补不补由调用方的闸门决定）
+    expect(r?.insertions).toHaveLength(1);
+    expect(r!.insertions![0]).toMatchObject({
+      char: 'D',
+      atIndex: 3,
+      x0: 30,
+      x1: 40,
+      measurement: { y0: 0, y1: 10, h: 10 },
+      confidence: null,
+    });
   });
 
   it('识别**漏掉**一个目标字符 → 放行，缺位占空位（有界对齐的放行侧）', () => {
@@ -1036,6 +1047,92 @@ describe('对账与挂载：拿不到字符框时行为必须与改动前一致'
     expect(attached!.chars[0]!.y0).toBeCloseTo(22, 6);
     // 1/0.5 = 2 倍放大回原坐标：宽度也要跟着还原（识别里 A 的宽是 10）
     expect(attached!.chars[0]!.x1 - attached!.chars[0]!.x0).toBeCloseTo(20, 6);
+  });
+
+  /** 让识别器返回固定的「字符 + 文本」—— 推理细节与本组用例无关 */
+  const stubRecognizer = (text: string, measurements: Array<InkMeasurement | null>) => {
+    return async () => ({
+      chars: [...text].map((char, i) => ({
+        char,
+        x0: 4 + i * 20,
+        y0: 6,
+        x1: 4 + i * 20 + 16,
+        y1: 40,
+      })) as OcrChar[],
+      measurements,
+      text,
+      confidence: 0.9,
+      tensorWidth: 64,
+      sequenceLength: 8,
+      downsample: 8,
+    });
+  };
+
+  it('⭐ 识别多出的 Unicode 上标**补回 `word.text`** —— 第 1 词 `p²` 的最小复现', async () => {
+    const canvas = createCanvas(200, 60);
+    const word = makeWord('p', { bbox: { x0: 20, y0: 10, x1: 80, y1: 50 } });
+    const inserts: string[] = [];
+
+    const n = await attachCharBoxes([word], stubRecognizer('p²', measOf(2)), {
+      canvas,
+      createCanvas,
+      onInsert: (_w, ins) => inserts.push(`${ins.char}@${ins.atIndex}`),
+    });
+
+    expect(n).toBe(1);
+    // 文本长了、坐标数组也长了 —— 两边必须**同步**长：
+    // 只改一边，`emitWordWithCharScripts` 按下标切出来的就是别的字
+    expect(word.text).toBe('p²');
+    const attached = getAttachedChars(word)!;
+    expect(attached.chars.map((c) => c.char).join('')).toBe('p²');
+    expect(attached.measurements).toHaveLength(2);
+    // 插进来的 `²` 带着自己的墨迹测量（不是占位 null）
+    expect(attached.measurements[1]).not.toBeNull();
+    expect(inserts).toEqual(['²@1']);
+  });
+
+  it('多出的是普通 ASCII 字符 → 不补（`x`/`1` 有真实语义，猜错就是往正文里塞错字）', async () => {
+    const canvas = createCanvas(200, 60);
+    const word = makeWord('p', { bbox: { x0: 20, y0: 10, x1: 80, y1: 50 } });
+
+    const n = await attachCharBoxes([word], stubRecognizer('px', measOf(2)), {
+      canvas,
+      createCanvas,
+    });
+
+    expect(n).toBe(1);
+    expect(word.text).toBe('p');
+    expect(getAttachedChars(word)!.chars).toHaveLength(1);
+  });
+
+  it('多出的字符**没量到墨迹** → 不补（可能是识别器凭空加的，补了就是伪造内容）', async () => {
+    const canvas = createCanvas(200, 60);
+    const word = makeWord('p', { bbox: { x0: 20, y0: 10, x1: 80, y1: 50 } });
+    const measurements: Array<InkMeasurement | null> = [{ y0: 0, y1: 10, h: 10 }, null];
+
+    const n = await attachCharBoxes([word], stubRecognizer('p²', measurements), {
+      canvas,
+      createCanvas,
+    });
+
+    expect(n).toBe(1);
+    expect(word.text).toBe('p');
+    expect(getAttachedChars(word)!.chars).toHaveLength(1);
+  });
+
+  it('多出的 Unicode 上标超过上限（2 个）→ 一条都不补（结构性分歧，宁可少补）', async () => {
+    const canvas = createCanvas(240, 60);
+    const word = makeWord('abcdefghijkl', { bbox: { x0: 10, y0: 10, x1: 210, y1: 50 } });
+    const text = 'abc¹²³defghijkl';
+
+    const n = await attachCharBoxes([word], stubRecognizer(text, measOf(text.length)), {
+      canvas,
+      createCanvas,
+    });
+
+    expect(n).toBe(1);
+    expect(word.text).toBe('abcdefghijkl');
+    expect(getAttachedChars(word)!.chars).toHaveLength(12);
   });
 });
 /**
@@ -1247,6 +1344,22 @@ describe('真实回归：序列对齐必须救回含指数的第 1 词', () => {
     for (let i = 1; i < xs.length; i++) {
       expect(xs[i], `第 ${i} 个字符的横坐标必须递增`).toBeGreaterThan(xs[i - 1]!);
     }
+
+    /**
+     * ⭐ 多出的 `²` **不再被丢弃** —— 位置、几何、测量都交出去。
+     *
+     * 这是「p 的平方」修复的源头：`attachCharBoxes` 拿到这条记录后
+     * 把它补回 `word.text`（`= p² (1 − p )…`）、同时插进坐标数组，
+     * 最终与识别出的 `x+y−2` 一样渲染成 `$^{²}$`。
+     */
+    expect(r!.insertions).toHaveLength(1);
+    const ins = r!.insertions![0]!;
+    expect(ins.char).toBe('²');
+    // 落位：紧跟在期望文本里那个 `p` 之后（空格之前）—— 与图上的排版一致
+    expect(ins.atIndex).toBe(expected.indexOf('= p ') + 3);
+    // 几何取识别一侧的字符框（mkChars 的合成值：第 i 个字符 x0 = i×10）
+    expect(ins.x0).toBe(recognized.indexOf('²') * 10);
+    expect(ins.measurement).toEqual({ y0: 0, y1: 10, h: 10 });
   });
 
   it('第 20 词：Unicode 下标 `n₂` 与普通 `n2` 必须视为同一字符', () => {
