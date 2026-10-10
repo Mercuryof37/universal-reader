@@ -15,10 +15,13 @@ import { ocrResultToBlocks } from '@/lib/ocrPostProcess';
  * 第 1 页（画布 1667×2223）**识别结果的逐字复制** —— 文本、置信度、
  * 字号、词框坐标一个没改（来自浏览器 E2E 抓取的 e2e-dump）。
  *
- * 这一页同时包含三处要重组的分段函数（20 题的 f_X / f_Y、21 题的 Z、
- * 28 题的 f_z）和一批**必须被排除**的近似物：
+ * 这一页同时包含四处要重组的分段函数（20 题的 f_X / f_Y、21 题的 Z、
+ * 28 题的 f_z，以及 24 题「大括号被误读成 `≥`」的替身构造）和一批
+ * **必须被排除**的近似物：
  *  · 第 17 题的长句也含 `{`（`P {X = x …}`）但框高 43 < 36×1.35 → 拒；
- *  · 第 24 题的公式词框高 56，但大括号被认成了 `≥`（无 `{`）→ 拒；
+ *  · 第 24 题公式词上方的那段假文本（`.议随机变量(A，1)的概率出度为`）
+ *    现在由识别层的裁边碎片判据在源头拦掉；这里保留它作为**邻居噪声
+ *    的健壮性用例** —— 它既不能成为锚点，也不能被并进分支；
  *  · 同页散文（`其中λ>0，…`、`验证随机变量 Z = …`）在锚点邻近，
  *    但长度/汉字连串判据把它们挡在分支之外 —— 不能把正文并进公式。
  *
@@ -59,8 +62,10 @@ const W = [
   w('(1） 求 条件 概率 密度 f x|Y(x |y).', 89, 43, [228, 720, 709, 763]),
   w('(2) 求 Z 的分布律和分布函数.', 94, 37, [231, 775, 681, 812]),
   w('24. 设随机变量(X,Y)的概率密度为', 93, 43, [211, 931, 756, 974]),
+  // 识别层已用「裁边碎片」判据在源头拦掉这类假文本，这里保留作邻居噪声用例
   w('.议随机变量(A，1)的概率出度为', 64, 38, [247, 955, 771, 993]),
-  w('f(x,y) = ≥(x +y)e−(x+x), x >0,y > 0', 90, 60, [284, 1008, 964, 1064]), // 大括号被认成 ≥（本版不处理）
+  // 大括号上钩被认成 `≥` —— 关系符紧跟 `=` 语法上不成立，按构造替身处理
+  w('f(x,y) = ≥(x +y)e−(x+x), x >0,y > 0', 90, 60, [284, 1008, 964, 1064]),
   w('0，', 99, 36, [527, 1076, 658, 1108]),
   w('其他', 99, 36, [777, 1076, 937, 1108]),
   w('(1)问 X 和 Y 是否相互独立？', 88, 36, [218, 1122, 649, 1158]),
@@ -97,14 +102,16 @@ const realLines = (): PiecewiseLineLike[] => [
   { text: '', words: [W[24]!, W[25]!] },
 ];
 
-describe('planPiecewise：真实页面的三处分段函数', () => {
+describe('planPiecewise：真实页面的四处分段函数', () => {
   const plans = planPiecewise(realLines(), REF_FONT);
 
-  it('三处锚点各产出一个计划（f_X/f_Y 合并词算两个构造）', () => {
-    expect(plans.map((p) => p.anchor)).toEqual([W[6], W[9], W[21]]);
+  it('四处锚点各产出一个计划（f_X/f_Y 合并词算两个构造），顺序与页面一致', () => {
+    expect(plans.map((p) => p.anchor)).toEqual([W[6], W[9], W[14], W[21]]);
     expect(plans[0]?.claimed).toEqual([W[4], W[5]]);
     expect(plans[1]?.claimed).toEqual([W[8]]);
-    expect(plans[2]?.claimed).toEqual([W[22]]);
+    // 24 题：下分支是 `0，` + `其他` 两个词，并成一份分支后整行摘走
+    expect(plans[2]?.claimed).toEqual([W[15], W[16]]);
+    expect(plans[3]?.claimed).toEqual([W[22]]);
   });
 
   it('f_X / f_Y：两个构造并排，分支在上、锚点内下分支在下', () => {
@@ -122,8 +129,15 @@ describe('planPiecewise：真实页面的三处分段函数', () => {
     );
   });
 
-  it('f_z：上分支在锚点内、下分支 `0， 其他` 在锚点下方', () => {
+  it('24 题：`≥` 是误读的大括号，按构造替身重组；`0，` 与 `其他` 并成下分支', () => {
+    // `≥` 被正则吃掉（不进入行内容），cases 环境显示真正的大括号
     expect(plans[2]?.latex).toBe(
+      'f(x,y) =\\begin{cases} (x +y)e-(x+x), x >0,y > 0 \\\\ 0， 其他 \\end{cases}',
+    );
+  });
+
+  it('f_z：上分支在锚点内、下分支 `0， 其他` 在锚点下方', () => {
+    expect(plans[3]?.latex).toBe(
       'fz(z) =\\begin{cases} e^{2}/2s2, x\\ge 0 \\\\ 0， 其他 \\end{cases}',
     );
   });
@@ -141,17 +155,15 @@ describe('planPiecewise：真实页面的三处分段函数', () => {
     }
   });
 
-  it('同页散文、含 `{` 的长句、无 `{` 的公式词都不是锚点', () => {
+  it('同页散文、含 `{` 的长句、邻居噪声都不是锚点，也不被占用', () => {
     const anchors = new Set(plans.map((p) => p.anchor));
     // 17 题长句含 `{` 但框高 43 < 48.6
     expect(anchors.has(W[1]!)).toBe(false);
-    // 24 题公式词框高 56，但大括号被认成了 `≥`
-    expect(anchors.has(W[14]!)).toBe(false);
-    // `P).` 框高 58，不含 `{`
+    // `P).` 框高 58，不含构造头
     expect(anchors.has(W[25]!)).toBe(false);
-    // 散文行一个都不是锚点、也一个都没被占用
+    // 散文行、邻居噪声（假文本）一个都不是锚点、也一个都没被占用
     const claimed = new Set(plans.flatMap((p) => p.claimed));
-    for (const prose of [W[3]!, W[7]!, W[10]!, W[20]!, W[23]!]) {
+    for (const prose of [W[3]!, W[7]!, W[10]!, W[12]!, W[13]!, W[17]!, W[20]!, W[23]!]) {
       expect(anchors.has(prose)).toBe(false);
       expect(claimed.has(prose)).toBe(false);
     }
@@ -208,6 +220,78 @@ describe('planPiecewise：门槛的边界（宁可不重组，也不硬拼）', 
   });
 });
 
+/**
+ * 构造替身（大括号误读成关系符）的边界。
+ *
+ * 24 题实测的两种读数（run61）：主读数 `f(x,y) = ≥(x +y)…`、备读数
+ * `f(x,y) = ∑(x +y)…`。只收关系符替身 —— `∑`/`∏` 语法上可以紧跟 `=`，
+ * 收它们会把级数误判成分段函数（备读数就是活例）。
+ */
+describe('planPiecewise：构造替身的边界（只收语法上不能紧跟 `=` 的关系符）', () => {
+  it('备读数 `f(x,y) = ∑…` 不重组（级数可以紧跟 `=`，不能当替身）', () => {
+    const anchor = w('f(x,y) = ∑(x +y)e−(x+y), x > 0,y> 0', 90, 60, [284, 1008, 964, 1064]);
+    const b1 = w('0，', 99, 36, [527, 1076, 658, 1108]);
+    const b2 = w('其他', 99, 36, [777, 1076, 937, 1108]);
+    expect(
+      planPiecewise(
+        [
+          { text: '', words: [anchor] },
+          { text: '', words: [b1, b2] },
+        ],
+        REF_FONT,
+      ),
+    ).toEqual([]);
+  });
+
+  it('「先关系符后等号」（`x >= 0`）不会匹配成构造头', () => {
+    const anchor = w('x >= 0, y <= 1', 90, 56, [297, 503, 700, 555]);
+    const below = w('0, x ≤ 0', 90, 28, [400, 510, 600, 540]);
+    expect(
+      planPiecewise(
+        [
+          { text: '', words: [anchor] },
+          { text: '', words: [below] },
+        ],
+        REF_FONT,
+      ),
+    ).toEqual([]);
+  });
+
+  it('`{` 与替身混用 → 整个拒绝（计数判据不允许拼接）', () => {
+    const anchor = w('fx(x) = { 0, x ≤ 0, fy(y) = ≥ 1, y ≤ 1', 90, 60, [297, 503, 1085, 555]);
+    const below = w('2, y>0', 90, 28, [400, 510, 600, 540]);
+    expect(
+      planPiecewise(
+        [
+          { text: '', words: [anchor] },
+          { text: '', words: [below] },
+        ],
+        REF_FONT,
+      ),
+    ).toEqual([]);
+  });
+
+  it('两个构造并排、分支同行且都单独成立 → 逐词处理（不因并起来短就合并）', () => {
+    const anchor = w('fx(x) = { 0 fy(y) = { 0', 90, 56, [297, 503, 1085, 555]);
+    const b1 = w('1,x>0', 90, 28, [400, 479, 500, 503]);
+    const b2 = w('2,y>0', 90, 28, [900, 479, 1000, 503]);
+    const plans = planPiecewise(
+      [
+        { text: '', words: [anchor] },
+        { text: '', words: [b1] },
+        { text: '', words: [b2] },
+      ],
+      REF_FONT,
+    );
+    expect(plans).toHaveLength(1);
+    expect(plans[0]?.claimed).toEqual([b1, b2]);
+    expect(plans[0]?.latex).toBe(
+      'fx(x) =\\begin{cases} 1,x>0 \\\\ 0 \\end{cases}' +
+        ' \\qquad fy(y) =\\begin{cases} 2,y>0 \\\\ 0 \\end{cases}',
+    );
+  });
+});
+
 describe('ocrResultToBlocks：分段函数落到独立公式块', () => {
   const blocks = ocrResultToBlocks({ pageNum: 1, words: [...W], avgConfidence: 92 }, 2223);
   const mathBlocks = blocks.filter((b) => b.type === 'math');
@@ -216,12 +300,15 @@ describe('ocrResultToBlocks：分段函数落到独立公式块', () => {
     .map((b) => b.content)
     .join('\n');
 
-  it('产出三个 math 块（20 题、21 题、28 题各一），顺序与页面一致', () => {
-    expect(mathBlocks).toHaveLength(3);
+  it('产出四个 math 块（20 题、21 题、24 题、28 题各一），顺序与页面一致', () => {
+    expect(mathBlocks).toHaveLength(4);
     expect(mathBlocks[0]?.content).toContain('fx(x) =\\begin{cases}');
     expect(mathBlocks[0]?.content).toContain('fx(y) =\\begin{cases}');
     expect(mathBlocks[1]?.content).toContain('Z =\\begin{cases}');
-    expect(mathBlocks[2]?.content).toContain('fz(z) =\\begin{cases}');
+    expect(mathBlocks[2]?.content).toBe(
+      'f(x,y) =\\begin{cases} (x +y)e-(x+x), x >0,y > 0 \\\\ 0， 其他 \\end{cases}',
+    );
+    expect(mathBlocks[3]?.content).toContain('fz(z) =\\begin{cases}');
 
     const idx20 = blocks.findIndex((b) => b.content.includes('20. 设 X和Y是相互独立的随机变量'));
     const idxProse = blocks.findIndex((b) => b.content.includes('其中λ>0，μ>0是常数'));
@@ -229,7 +316,7 @@ describe('ocrResultToBlocks：分段函数落到独立公式块', () => {
     expect(idx20).toBeGreaterThanOrEqual(0);
     expect(idx20).toBeLessThan(blocks.indexOf(mathBlocks[0]!));
     expect(blocks.indexOf(mathBlocks[0]!)).toBeLessThan(idxProse);
-    expect(idxFz).toBeLessThan(blocks.indexOf(mathBlocks[2]!));
+    expect(idxFz).toBeLessThan(blocks.indexOf(mathBlocks[3]!));
   });
 
   it('分支碎片不再以段落形式出现（防重复显示）', () => {
@@ -239,14 +326,19 @@ describe('ocrResultToBlocks：分段函数落到独立公式块', () => {
     expect(paragraphText).not.toContain('fx(x) = {');
     expect(paragraphText).not.toContain('Z = {');
     expect(paragraphText).not.toContain('fz(z) = {');
+    // 24 题：`≥…` 整段进了 math 块，不再以原文出现在段落里
+    expect(paragraphText).not.toContain('f(x,y) = ≥');
+    expect(paragraphText).not.toContain('≥(x +y)');
   });
 
   it('散文与其他题目一字不丢；识别极限造成的错字原样保留（不发明内容）', () => {
     expect(paragraphText).toContain('其中λ>0，μ>0是常数.引入随机变量');
     expect(paragraphText).toContain('验证随机变量 Z = √X2 + Y 的概率密度为');
     expect(paragraphText).toContain('我们称 Z 服从参数 为σ(σ > 0) 的瑞利(Rayleigh) 分布.');
-    // 24 题：大括号被认成 `≥`，本版不处理 —— 原文照旧，不许悄悄丢
-    expect(paragraphText).toContain('f(x,y) = ≥');
+    // 24 题：题干照旧留在段落里；`(x+x)` 这类识别极限的原样保留（不发明内容），
+    // 误读的 `≥` 由 cases 大括号取代
+    expect(paragraphText).toContain('24. 设随机变量(X,Y)的概率密度为');
+    expect(mathBlocks[2]?.content).toContain('(x +y)e-(x+x)');
     expect(paragraphText).toContain('P).');
     // 页眉页脚已被滤掉
     expect(paragraphText).not.toContain('概率论与数理统计习题5');

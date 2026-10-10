@@ -291,6 +291,76 @@ describe('admitRetryWords：重复词必须被挡掉（留白会带进邻居正�
   });
 });
 
+/**
+ * 裁边碎片：裁剪边恰好切过一行正文时，半截笔画会被读成一段假文本。
+ *
+ * run61 实测：③ 的重试裁剪顶边（y=955）切过页眉行 [211,931,756,974] 的
+ * 下缘，识别器把残余笔画读成 `.议随机变量(A，1)的概率出度为`。假行与
+ * 原词的重叠占比只有 0.486 —— 差 0.014 就能被 0.5 的重复阈值挡掉，
+ * 于是垃圾词混进了正文。判据必须换成几何的：框从裁剪边伸进来、
+ * 且与跨过该边的既有词有 x 交叠。
+ */
+describe('admitRetryWords：裁边碎片（裁剪边切过邻居正文时读出的假行）', () => {
+  /** run61 的裁剪矩形：③ 的重试裁剪 (247,955) 起，524×144，放大 3 倍 */
+  const crop = { x0: 247, y0: 955, x1: 771, y1: 1099 };
+  const frame = { originX: 247, originY: 955, scale: 3 };
+  /** 页眉行：纵向跨过裁剪顶边 y=955，与假行 x 交叠 509px */
+  const header = { bbox: { x0: 211, y0: 931, x1: 756, y1: 974 } };
+
+  it('真实几何：贴顶边的假行与页眉重叠 0.486（不足 0.5）—— 由几何判据丢弃', () => {
+    // 识别器输出整行框 (0,0,1572×114)，映射回原图 = (247,955)-(771,993)
+    const garbage = retryItem('.议随机变量(A，1)的概率出度为', 0, 0, 1572, 114);
+    expect(overlapRatio(header.bbox, { x0: 247, y0: 955, x1: 771, y1: 993 })).toBeLessThan(0.5);
+
+    const admitted = admitRetryWords([garbage], frame, [header], crop);
+
+    expect(admitted).toEqual([]);
+  });
+
+  it('不传 cropRect 时行为与改动前一致（公式恢复路径不启用这条判据）', () => {
+    const garbage = retryItem('.议随机变量(A，1)的概率出度为', 0, 0, 1572, 114);
+    const admitted = admitRetryWords([garbage], frame, [header]);
+
+    expect(admitted).toHaveLength(1);
+    expect(admitted[0]!.text).toBe('.议随机变量(A，1)的概率出度为');
+  });
+
+  it('下边对称：贴底边、且与跨过底边的词有 x 交叠的碎片被丢弃', () => {
+    // 裁剪底边 y=1099 切过下方词 [300,1090,700,1130] 的上缘
+    const below = { bbox: { x0: 300, y0: 1090, x1: 700, y1: 1130 } };
+    // 碎片框贴底边：映射后 y1 = 1099
+    const fragment = retryItem('假行', 159, 144, 1530, 288); // (300,1003)-(810,1099)
+
+    const admitted = admitRetryWords([fragment], frame, [below], crop);
+
+    expect(admitted).toEqual([]);
+  });
+
+  it('救回词在裁剪中部、不贴边 → 保留（页眉跨过顶边也不牵连它）', () => {
+    const rescued = retryItem('f(x,y)', 159, 144, 510, 90); // (300,1003)-(470,1033)
+    const admitted = admitRetryWords([rescued], frame, [header], crop);
+
+    expect(admitted).toHaveLength(1);
+    expect(admitted[0]!.text).toBe('f(x,y)');
+  });
+
+  it('贴边碎片与跨边词的 x 不相交 → 保留（宁可少丢，不误伤分栏内容）', () => {
+    const disjoint = retryItem('右侧一栏', 1590, 0, 300, 114); // (777,955)-(877,993)
+    const admitted = admitRetryWords([disjoint], frame, [header], crop);
+
+    expect(admitted).toHaveLength(1);
+  });
+
+  it('离裁剪边超过容差（1.5px）→ 不算裁边碎片', () => {
+    // 框顶离裁剪边 2px（> 1.5px 容差）；比页眉行矮一截，去重占比 0.395 < 0.5
+    const nearEdge = retryItem('x>0', 459, 6, 300, 129); // (400,957)-(500,1000)
+    const admitted = admitRetryWords([nearEdge], frame, [header], crop);
+
+    expect(admitted).toHaveLength(1);
+    expect(admitted[0]!.text).toBe('x>0');
+  });
+});
+
 describe('admitRetryWords：脏输入', () => {
   it('空白文本被丢弃（识别器偶尔会给出空串）', () => {
     const items = [retryItem('   ', 0, 0, 50, 30), retryItem('', 60, 0, 50, 30)];

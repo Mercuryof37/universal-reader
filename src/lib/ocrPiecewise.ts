@@ -34,17 +34,24 @@
  *
  * ── 判据全部来自实测几何（习题5 第 1 页，画布 1667×2223，参考字号 36）──
  *
- *  ① 锚点（含 `{` 的高词）：框高 ≥ 参考字号 × 1.35
- *     · f_X/f_Y 合并词 h=52（1.44 倍）✓、Z 词 h=52 ✓、f_z 词 h=64（1.78 倍）✓；
- *     · 第 17 题的长句也含 `{`（`P {X = x…}`）但 h=43 → 拒；
- *     · 第 24 题的公式词 h=56，但大括号被认成了 `≥`（**文本里没有 `{`**）→ 拒。
+ *  ① 锚点（构造头）：框高 ≥ 参考字号 × 1.35，文本以「标签 = 构造符」开头
+ *     · 构造符通常是 `{`：f_X/f_Y 合并词 h=52（1.44 倍）✓、Z 词 h=52 ✓、
+ *       f_z 词 h=64（1.78 倍）✓；
+ *     · 构造符也可以是**误读形态**：大括号上钩被认成关系符
+ *       （第 24 题实测 `f(x,y) = ≥(x +y)…`，h=56）—— 关系符语法上不可能
+ *       紧跟 `=`，出现在构造位就只可能是大括号的替身（见 `CONSTRUCT_SRC`）；
+ *     · 第 17 题的长句也含 `{`（`P {X = x…}`）但 h=43 → 拒。
  *
  *  ② 分支行：横向中心落在锚点跨度内，纵向空隙 ≤ 参考字号 × 1.4（=50.4px）
- *     · 实测空隙：上分支 0px、下分支 8px ✓；
+ *     · 实测空隙：上分支 0px、下分支 8px、24 题下分支 12px ✓；
  *     · Z 的上分支与 f_X 锚点的空隙 67px → 只归 Z、不归 f_X；
  *     · f_z 下方的正文行空隙 52px → 拒（正是 1.4 倍这条线）。
  *
  *  ③ 分支得**像公式行**：清洗后 ≤ 12 字符、含数字或数学符号、连续汉字 ≤ 2
+ *     · 默认逐词判定；行里有词**单独当不了分支**时，整行并起来再判：
+ *       24 题的下分支是 `0，` 与 `其他`（相距 119px，`其他` 单独不含数学
+ *       符号），并成 `0， 其他` 才是一份完整分支；并起来也不像公式行就
+ *       退回逐词（20 题并排的两个上分支并起来 18 字 > 12，仍然各自成支）；
  *     · 排除同页的散文（`其中λ>0，μ>0是常数.引入随机变量` 19 字、
  *       `验证随机变量 Z = √X2 + Y 的概率密度为` 更长）。
  *
@@ -70,7 +77,7 @@ export interface PiecewiseLineLike {
 }
 
 export interface PiecewisePlan {
-  /** 含 `{` 的锚点词：它的行将被改写为独立公式块 */
+  /** 含构造头（`{` 或误读成关系符的替身）的锚点词：它的行将被改写为独立公式块 */
   anchor: OcrWord;
   /** 整段 LaTeX（一个锚点里有两个构造时用 `\qquad` 并排） */
   latex: string;
@@ -86,13 +93,21 @@ export const PIECEWISE_BRANCH_MAX_GAP_RATIO = 1.4;
 export const PIECEWISE_BRANCH_MAX_CHARS = 12;
 
 /**
- * 「标签 + 等号 + `{`」的构造形状：`fx(x) = {`、`Z = {`、`fz(z) = {`。
+ * 「标签 + 等号 + 构造符」的形状：`fx(x) = {`、`Z = {`、`fz(z) = {`，
+ * 以及大括号被误读时的替身形态 `f(x,y) = ≥`。
  *
  * 标签只允许「1–4 个字母数字 + 可选的小括号参数」：真实标签是 `fx(x)`、
  * `fy(y)`、`fz(z)`、`Z` 这样的名字，不可能是别的形状。写宽了会把
  * 公式里的任意 `= {` 都当成构造头。
+ *
+ * 替身只收**关系符**（`≥ ≤ > < ≠`）：它们语法上不可能紧跟 `=`，出现在
+ * 「标签 = 构造符」的位置就只可能是大括号的误读（第 24 题实测上钩被认成
+ * `≥`）。`∑` 不在其列 —— `f(x) = ∑…` 是合法的级数写法，收它会把正常
+ * 公式误判成分段函数。匹配顺序是「先 `=` 后关系符」，所以 `a >= b`
+ * 这类「先关系符后等号」的写法不会匹配。
  */
-const CONSTRUCT_SRC = '([A-Za-zα-ωΑ-Ω][A-Za-z0-9α-ωΑ-Ω]{0,3}\\s*(?:\\([^()\\s]{0,6}\\))?\\s*=\\s*)\\{';
+const CONSTRUCT_SRC =
+  '([A-Za-zα-ωΑ-Ω][A-Za-z0-9α-ωΑ-Ω]{0,3}\\s*(?:\\([^()\\s]{0,6}\\))?\\s*=\\s*)(\\{|[≥≤><≠])';
 /** 分支行该有的数学痕迹：数字 / 希腊字母 / 比较符 / 根号 / 角标 */
 const BRANCH_HINT_RE = /[0-9λμσαβγθφ≤≥−√²^_=]/;
 /** 连续 3 个以上汉字按正文看待（真实分支 `0， 其他` 只有 2 个汉字） */
@@ -179,13 +194,20 @@ interface ParsedConstruct {
 function parseConstructs(text: string): ParsedConstruct[] | null {
   const trimmed = text.trim();
   const braces = countChars(trimmed, '{');
-  if (!braces) return null;
 
   const re = new RegExp(CONSTRUCT_SRC, 'g');
   const matches = [...trimmed.matchAll(re)];
-  // 每个 `{` 都必须属于一个「标签 = {」构造，而且不能有东西挡在第一个前面
-  if (matches.length !== braces) return null;
+  if (!matches.length) return null;
+  // 构造不能在文本中间：锚点必须**以构造头开头**（`= {` 出现在词中间
+  // 说明前面还有别的内容，改写成公式会把它们吞掉）
   if ((matches[0]?.index ?? -1) !== 0) return null;
+  if (braces) {
+    // 有真大括号时维持原判据：每个 `{` 恰好属于一个构造，且匹配到的
+    // 构造符全是 `{`。替身匹配混进来意味着有 `{` 没被匹配上（计数相等
+    // 也可能是「一个 `{` + 一个替身」），同样一票否决 —— 不做拼接。
+    if (matches.length !== braces) return null;
+    if (matches.some((m) => m[2] !== '{')) return null;
+  }
 
   const out: ParsedConstruct[] = [];
   for (let i = 0; i < matches.length; i++) {
@@ -201,15 +223,69 @@ function parseConstructs(text: string): ParsedConstruct[] | null {
   return out;
 }
 
-/** 分支词 → 清洗后的文本；不像公式行时返回 `null` */
-function branchTextOf(word: OcrWord): string | null {
+/** 原始文本 → 清洗后的分支文本；不像公式行时返回 `null` */
+function branchTextOfRaw(raw: string): string | null {
   // 另一个锚点（含 `{`）不能当分支 —— 否则两个构造会互相吞并
-  if (word.text.includes('{')) return null;
-  const cleaned = cleanBranchText(word.text);
+  if (raw.includes('{')) return null;
+  const cleaned = cleanBranchText(raw);
   if (!cleaned || cleaned.length > PIECEWISE_BRANCH_MAX_CHARS) return null;
   if (!BRANCH_HINT_RE.test(cleaned)) return null;
   if (PROSE_CJK_RUN_RE.test(cleaned)) return null;
   return cleaned;
+}
+
+/** 分支词 → 清洗后的文本；不像公式行时返回 `null` */
+function branchTextOf(word: OcrWord): string | null {
+  return branchTextOfRaw(word.text);
+}
+
+/**
+ * 同一视觉行的判定：垂直区间重叠 ≥ 较矮者的一半。
+ * 同一行上的词（哪怕横向隔了 119px，如 24 题的 `0，` 与 `其他`）算一行；
+ * 相邻两行的词（高度几乎不重叠）不算。
+ */
+function sameVisualLine(a: OcrWord, b: OcrWord): boolean {
+  const overlap = Math.min(a.bbox.y1, b.bbox.y1) - Math.max(a.bbox.y0, b.bbox.y0);
+  return overlap > 0 && overlap >= Math.min(heightOf(a), heightOf(b)) * 0.5;
+}
+
+/** 一个候选分支：单个词，或同一视觉行上并起来的一串词 */
+interface BranchUnit {
+  words: OcrWord[];
+  text: string;
+}
+
+/**
+ * 候选词 → 分支单元。
+ *
+ * 默认逐词判定（与并入前逐字节一致）；只有**行里有词单独当不了分支**
+ * 时才把整行并起来再判 —— 24 题的 `0，` + `其他`：`其他` 单独不含数学
+ * 符号，并成 `0， 其他` 才是完整分支。并起来的文本若不像公式行，
+ * 仍然退回逐词（20 题并排的两个上分支并起来 18 字 > 12，各自成支）。
+ */
+function branchUnitsOf(words: readonly OcrWord[]): BranchUnit[] {
+  const groups: OcrWord[][] = [];
+  for (const word of [...words].sort((a, b) => centerY(a) - centerY(b))) {
+    const group = groups.find((g) => sameVisualLine(g[0]!, word));
+    if (group) group.push(word);
+    else groups.push([word]);
+  }
+
+  const units: BranchUnit[] = [];
+  for (const group of groups) {
+    const singles = group.map((word) => ({ word, text: branchTextOf(word) }));
+    if (group.length > 1 && singles.some((s) => s.text === null)) {
+      const joined = branchTextOfRaw(group.map((w) => w.text).join(' '));
+      if (joined !== null) {
+        units.push({ words: group, text: joined });
+        continue;
+      }
+    }
+    for (const s of singles) {
+      if (s.text !== null) units.push({ words: [s.word], text: s.text });
+    }
+  }
+  return units;
 }
 
 /**
@@ -233,15 +309,13 @@ export function planPiecewise(
 
   for (const anchor of allWords) {
     if (claimed.has(anchor)) continue;
-    if (!anchor.text.includes('{')) continue;
     if (heightOf(anchor) < refFont * PIECEWISE_ANCHOR_MIN_HEIGHT_RATIO) continue;
 
     const constructs = parseConstructs(anchor.text);
     if (!constructs) continue;
 
-    const above: OcrWord[] = [];
-    const below: OcrWord[] = [];
-    const branchTexts = new Map<OcrWord, string>();
+    const aboveWords: OcrWord[] = [];
+    const belowWords: OcrWord[] = [];
     for (const word of allWords) {
       if (word === anchor || claimed.has(word)) continue;
       const cx = centerX(word);
@@ -249,11 +323,13 @@ export function planPiecewise(
       const isAbove = centerY(word) < centerY(anchor);
       const gap = isAbove ? anchor.bbox.y0 - word.bbox.y1 : word.bbox.y0 - anchor.bbox.y1;
       if (gap < -2 || gap > refFont * PIECEWISE_BRANCH_MAX_GAP_RATIO) continue;
-      const text = branchTextOf(word);
-      if (text === null) continue;
-      branchTexts.set(word, text);
-      (isAbove ? above : below).push(word);
+      (isAbove ? aboveWords : belowWords).push(word);
     }
+
+    // 同一视觉行上的候选词先并成一个分支单元（24 题的 `0，` + `其他`），
+    // 并起来不像公式行时 `branchUnitsOf` 内部退回逐词（20 题的两个上分支）
+    const above = branchUnitsOf(aboveWords);
+    const below = branchUnitsOf(belowWords);
 
     const n = constructs.length;
     // 每个构造恰好两行：锚点自带一行 + 恰好一侧的一行分支
@@ -264,36 +340,38 @@ export function planPiecewise(
     // 分支与构造一一对应：按横向位置的比例分桶，桶里必须恰好一个
     const side = above.length ? above : below;
     const width = anchor.bbox.x1 - anchor.bbox.x0;
-    const assignment = new Map<number, OcrWord>();
+    const assignment = new Map<number, BranchUnit>();
     let paired = width > 0;
-    for (const word of side) {
-      const ratio = (centerX(word) - anchor.bbox.x0) / width;
+    for (const unit of side) {
+      const unitX0 = Math.min(...unit.words.map((w) => w.bbox.x0));
+      const unitX1 = Math.max(...unit.words.map((w) => w.bbox.x1));
+      const ratio = ((unitX0 + unitX1) / 2 - anchor.bbox.x0) / width;
       const bucket = Math.min(n - 1, Math.max(0, Math.floor(ratio * n)));
       if (assignment.has(bucket)) {
         paired = false;
         break;
       }
-      assignment.set(bucket, word);
+      assignment.set(bucket, unit);
     }
     if (!paired || assignment.size !== n) continue;
 
     // 锚点所在行除了锚点与已归属的分支不能有别的词 —— 否则整行改写会吞掉它们
     const anchorLine = lines.find((line) => line.words.includes(anchor));
     if (!anchorLine) continue;
-    const claimedHere = new Set(assignment.values());
+    const claimedWords = [...assignment.values()].flatMap((unit) => unit.words);
+    const claimedHere = new Set(claimedWords);
     if (anchorLine.words.some((word) => word !== anchor && !claimedHere.has(word))) continue;
 
     const constructTex: string[] = [];
     let rowsOk = true;
     for (let k = 0; k < n; k++) {
       const construct = constructs[k];
-      const word = assignment.get(k);
-      const branch = word ? branchTexts.get(word) : undefined;
-      if (!construct || !branch) {
+      const unit = assignment.get(k);
+      if (!construct || !unit) {
         rowsOk = false;
         break;
       }
-      const rows = above.length ? [branch, construct.after] : [construct.after, branch];
+      const rows = above.length ? [unit.text, construct.after] : [construct.after, unit.text];
       constructTex.push(
         `${toLatex(construct.label)}\\begin{cases} ${toLatex(rows[0] ?? '')} \\\\ ${toLatex(rows[1] ?? '')} \\end{cases}`,
       );
@@ -308,8 +386,8 @@ export function planPiecewise(
       continue;
     }
 
-    plans.push({ anchor, latex, claimed: [...assignment.values()] });
-    for (const word of assignment.values()) claimed.add(word);
+    plans.push({ anchor, latex, claimed: claimedWords });
+    for (const word of claimedWords) claimed.add(word);
   }
 
   return plans;

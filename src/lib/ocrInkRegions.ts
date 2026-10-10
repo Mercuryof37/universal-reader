@@ -342,6 +342,47 @@ export function overlapRatio(
 }
 
 /**
+ * 重试词是不是「被裁剪边切断的既有词的残余」。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么重叠去重挡不住这一类
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * `overlapRatio` 判的是「与既有词重叠了多少」—— 它挡的是**整词**
+ * 被带进裁剪的情形。裁剪边恰好切过一行正文时，识别器看到的是
+ * 半截笔画（只有真实词的一半高），读出来的往往是**又长又假的行**
+ * （实测：页眉下缘的残余读成 `.议随机变量(A，1)的概率出度为`），
+ * 其框与原词的重叠占比只有 ~0.49 —— 刚好卡在 0.5 阈值下面。
+ *
+ * 判据改成几何上的：重试词的框**贴着裁剪边**（容差内），
+ * 且存在一个**从该边穿过去**的既有词与它在 x 上有交叠。
+ * 从边上伸进来的片段只可能是邻居的残余，不可能是新内容 ——
+ * 真正落在裁剪里的漏识别内容离裁剪边隔着一圈 padding，
+ * 不会贴着边。
+ *
+ * 上下边对称判定；只有调用方传了 `cropRect` 才会走到这里。
+ */
+function isEdgeStraddleFragment(
+  bbox: { x0: number; y0: number; x1: number; y1: number },
+  crop: { x0: number; y0: number; x1: number; y1: number },
+  existing: readonly { bbox: { x0: number; y0: number; x1: number; y1: number } }[],
+  tolerance = 1.5,
+): boolean {
+  const overlapsX = (e: { bbox: { x0: number; y0: number; x1: number; y1: number } }) =>
+    Math.min(e.bbox.x1, bbox.x1) - Math.max(e.bbox.x0, bbox.x0) > 0;
+  const crosses = (e: { bbox: { x0: number; y0: number; x1: number; y1: number } }, edge: number) =>
+    e.bbox.y0 < edge - tolerance && e.bbox.y1 > edge + tolerance;
+
+  if (bbox.y0 <= crop.y0 + tolerance && existing.some((e) => overlapsX(e) && crosses(e, crop.y0))) {
+    return true;
+  }
+  if (bbox.y1 >= crop.y1 - tolerance && existing.some((e) => overlapsX(e) && crosses(e, crop.y1))) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * 「局部重试」结果的准入：坐标换算回页面坐标系 + 去重。纯函数。
  *
  * ═══════════════════════════════════════════════════════════════
@@ -355,11 +396,17 @@ export function overlapRatio(
  *     不换算就追加，救回的文字会出现在错误的位置 —— 比没有更糟；
  *  2. **邻居文字**：padding 会把旁边的正文一起裁进来、一起被识别出来。
  *     与既有词重叠的一律丢弃，否则重试会把内容**复制一遍**
- *     （重复内容属于「更糟」的那一类错误，见文件顶部对空串丢失的说明）。
+ *     （重复内容属于「更糟」的那一类错误，见文件顶部对空串丢失的说明）；
+ *  3. **裁边碎片**：裁剪边切过一行正文时，半截笔画会被读成假文本，
+ *     重叠占比可能不足 0.5（2 挡不住它）。传 `cropRect` 后按
+ *     `isEdgeStraddleFragment` 的几何判据丢弃。
  *
  * @param items    重试返回的原始结果（坐标在裁剪图上，0-1 置信度）
  * @param frame    裁剪帧：在页面上的原点与放大系数
  * @param existing 已识别出的词（坐标在页面坐标系）
+ * @param cropRect 裁剪矩形（页面坐标系）；只有「局部重试」能提供它，
+ *                 不传时行为与改动前逐字节一致
+ * @param overlapDrop 与既有词的重叠占比达到多少算重复
  */
 export function admitRetryWords(
   items: readonly {
@@ -369,6 +416,7 @@ export function admitRetryWords(
   }[],
   frame: { originX: number; originY: number; scale: number },
   existing: readonly { bbox: { x0: number; y0: number; x1: number; y1: number } }[],
+  cropRect?: { x0: number; y0: number; x1: number; y1: number },
   overlapDrop = 0.5,
 ): OcrWord[] {
   const scale = frame.scale > 0 ? frame.scale : 1;
@@ -390,6 +438,7 @@ export function admitRetryWords(
 
     if (existing.some((w) => overlapRatio(w.bbox, bbox) >= overlapDrop)) continue;
     if (admitted.some((w) => overlapRatio(w.bbox, bbox) >= overlapDrop)) continue;
+    if (cropRect && isEdgeStraddleFragment(bbox, cropRect, existing)) continue;
 
     admitted.push({
       text,

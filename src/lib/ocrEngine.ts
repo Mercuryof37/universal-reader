@@ -1353,6 +1353,10 @@ class OcrEngine {
           // 裁剪的留白会把邻居正文也带进来，重复词是**比缺失更糟**的一类错误
           // （同一句话里出现两遍，还可能是错位的）
           [...existing, ...recovered],
+          // 裁剪矩形也在页面坐标系里，传给准入用于「裁边碎片」判定：
+          // 边切过的半截笔画会被读成假行（实测 `.议随机变量(A，1)的概率出度为`），
+          // 它与原词的重叠占比可能不足 0.5，光靠去重挡不住
+          { x0: plan.px, y0: plan.py, x1: plan.px + plan.pw, y1: plan.py + plan.ph },
         );
         if (!admitted.length) continue;
 
