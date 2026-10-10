@@ -2336,10 +2336,26 @@ describe('真实文档回归：大括号撑高的行不得按虚高字号吸收�
   });
 
   it('该分支行仍按「构件」被上一行接纳（防「一刀切禁止合并」）', () => {
-    const structure = branchStructureOf(words);
+    // 注：这一行后来还有第二重归属 —— `Z = {…}` 锚点的分段函数重组
+    // （`lib/ocrPiecewise.ts`）会把它并进公式块。所以这里先把 Z 锚点词
+    // （词 3）从页面上拿掉，单独看成行阶段本身：合并规则没有变，
+    // 变的只是「并完之后它去了哪里」（归公式的用例在下一个）。
+    const structure = branchStructureOf(words.filter((_, i) => i !== 3));
 
     // 距离 13px 的邻居照常合并 —— 这是行内构件，不是隔了行的正文
     expect(branchLineWith(structure, 2)?.wordIndices).toEqual([1, 2]);
+  });
+
+  it('Z 锚点在时：该分支行被并入分段函数公式，不再独立成行', () => {
+    const structure = branchStructureOf(words);
+
+    // 词 2 已经作为 Z 的上分支进了公式块（不再出现在任何行里）
+    expect(branchLineWith(structure, 2)).toBeUndefined();
+    const zBlock = structure.blocks.find((b) => b.type === 'math');
+    expect(zBlock?.content).toContain('Z =\\begin{cases}');
+    expect(zBlock?.content).toContain('1，当 X\\le Y');
+    // 公式上方的散文仍独立成段（不并进公式）
+    expect(structure.blocks.find((b) => b.content.includes('其中λ>0'))).toBeDefined();
   });
 
   it('同宽的大括号两行互为并列行，谁也不并谁', () => {

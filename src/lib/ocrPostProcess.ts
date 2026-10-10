@@ -31,6 +31,7 @@ import {
   type InkEvidenceBox,
 } from '@/lib/ocrCharBoxes';
 import { getTesseractEvidence } from '@/lib/ocrTesseractScripts';
+import { planPiecewise } from '@/lib/ocrPiecewise';
 
 interface OcrLine {
   words: OcrWord[];
@@ -57,6 +58,15 @@ interface OcrLine {
    * 有标记才能把判断依据一并说清楚（见 `filterHeaderFooter`）。
    */
   isPageFurniture?: boolean;
+  /**
+   * 本行已被重组为一段独立公式（跨行大括号分段函数，见 `lib/ocrPiecewise.ts`）。
+   *
+   * 段落循环见到它就收束当前段落、把这段 LaTeX 作为 `type:'math'` 块产出 ——
+   * `BlockRow.tsx` 的显示级 KaTeX 会把它渲染成带跨行大括号的分段函数。
+   * `text` 保持原样不动：结构导出（`onStructure`）要如实反映原始行，
+   * 出问题时才能对照「原始识别成了什么」。
+   */
+  piecewiseLatex?: string;
 }
 
 const SAME_LINE_TOLERANCE = 5;
@@ -417,6 +427,71 @@ function looksLikeHeading(text: string): boolean {
 }
 
 /**
+ * 分段函数（跨行大括号）的版面重组落地。
+ *
+ * 计划由 `lib/ocrPiecewise.ts` 的 `planPiecewise()` 给出（纯函数，判据与
+ * 实测依据都在那个文件里）；这里只做三件事：
+ *  1. 被并入公式的分支词从各自的行里摘掉，行文本按**与成行时同一套拼装**
+ *     重新生成（`assembleLineText` + 同一张字符高度表），剩余词的字号与
+ *     置信度按原口径（均值）重算 —— 摘词不改变别的任何东西；
+ *  2. 摘空的行整行去掉（它的内容已经在公式块里，留着会产生重复）；
+ *  3. 锚点行打上 `piecewiseLatex` 标记，段落循环见标记即把这一行作为
+ *     **独立公式块**产出（公式绝不并进散文段落）。
+ *
+ * 没有任何可信构造时**原样返回 `lines`** —— 这条不变量由
+ * `planPiecewise` 的全或无产出保证（真实页面上不满足判据时，
+ * 输出与接入前逐字节相同）。
+ */
+function applyPiecewiseRecovery(lines: OcrLine[], allWords: OcrWord[]): OcrLine[] {
+  const plans = planPiecewise(lines, dominantFontSize(allWords));
+  if (!plans.length) return lines;
+
+  console.info(
+    `[ocrPostProcess] 跨行大括号重组：${plans.length} 处分段函数已改为独立公式块（KaTeX cases）`,
+  );
+
+  const anchorLatex = new Map<OcrWord, string>();
+  const claimed = new Set<OcrWord>();
+  for (const plan of plans) {
+    anchorLatex.set(plan.anchor, plan.latex);
+    for (const word of plan.claimed) claimed.add(word);
+  }
+
+  const sizeTable = buildCharSizeTable(allWords) ?? undefined;
+  const out: OcrLine[] = [];
+  for (const line of lines) {
+    const remaining = line.words.filter((word) => !claimed.has(word));
+    let next: OcrLine;
+    if (remaining.length === line.words.length) {
+      next = line;
+    } else if (!remaining.length) {
+      continue;
+    } else {
+      const assembled = assembleLineText(remaining, new Map(), allWords, sizeTable);
+      next = {
+        ...line,
+        words: remaining,
+        text: assembled.text,
+        hasScripts: assembled.scriptCount > 0,
+        fontSize: remaining.reduce((sum, word) => sum + word.fontSize, 0) / remaining.length,
+        avgConfidence:
+          remaining.reduce((sum, word) => sum + word.confidence, 0) / remaining.length,
+      };
+    }
+
+    for (const word of next.words) {
+      const latex = anchorLatex.get(word);
+      if (latex !== undefined) {
+        next = { ...next, piecewiseLatex: latex };
+        break;
+      }
+    }
+    out.push(next);
+  }
+  return out;
+}
+
+/**
  * 识别结果转内容块。
  *
  * @param onStructure 可选的「导出识别结构」回调（见 `lib/ocrStructure.ts`）。
@@ -470,7 +545,12 @@ export function ocrResultToBlocks(
   // ⚠️ 这一行是**可选**的：`layoutRegions` 为空（模型没取到 / 推理失败 /
   // 用户设了 VITE_OCR_LAYOUT=0）时 `applyLayoutToLines` 原样返回 `lines`，
   // 下面的每一步都与接入前逐字节相同 —— 版面分析绝不参与「识别是否成功」。
-  const lines = applyLayoutToLines(heuristicLines, layoutRegions, pageHeight);
+  // 分段函数（跨行大括号）的版面重组：必须在成行与版面重排**之后**做，
+  // 因为要判的正是「这几段最终被排成了什么」；没有可信构造时原样返回。
+  const lines = applyPiecewiseRecovery(
+    applyLayoutToLines(heuristicLines, layoutRegions, pageHeight),
+    result.words,
+  );
 
   const gaps: number[] = [];
   for (let i = 1; i < lines.length; i++) {
@@ -505,7 +585,59 @@ export function ocrResultToBlocks(
   /** 上一行的原始行：回卷续行判据要看它的右缘与行尾标点 */
   let prevLine: OcrLine | null = null;
 
+  /** 收束当前段落缓冲（换段分支与串尾共用同一份判据） */
+  const flushParagraph = (): void => {
+    if (!currentText.trim()) return;
+    const avgConf = currentConfCount > 0 ? currentConfSum / currentConfCount : 0;
+    // ⚠️ 这里用 currentFirstText（**本块第一行**）而不是 currentText：
+    // 标题是**单行**的东西，而拼到现在的整段文本可能已经把后面几行
+    // 并了进来。拿整段去判就会两头都错。
+    const isHeading =
+      currentFontSize > medianFontSize * HEADING_FONT_RATIO &&
+      currentFirstText.trim().length <= HEADING_MAX_CHARS &&
+      looksLikeHeading(currentFirstText);
+
+    blocks.push({
+      type: isHeading ? 'heading' : 'paragraph',
+      content: currentText.trim(),
+      translations: {},
+      metadata: {
+        pageNumber: result.pageNum,
+        ocrConfidence: Math.round(avgConf),
+        // 行内公式标记交给渲染层：`BlockRow.tsx` 会据此把 `$...$`
+        // 交给 KaTeX（与 Markdown 链路 `remark-math` 的标记语义一致）
+        ...(currentScripts > 0 ? { hasInlineMath: true } : {}),
+        ...(isHeading ? { level: 2 } : {}),
+      },
+    });
+  };
+
   for (const line of lines) {
+    /**
+     * 跨行大括号分段函数：这一行已经被重组为一段 LaTeX。
+     * 公式**绝不并进散文段落** —— 先收束上面的段落，再作为独立块产出。
+     */
+    if (line.piecewiseLatex !== undefined) {
+      flushParagraph();
+      blocks.push({
+        type: 'math',
+        content: line.piecewiseLatex,
+        translations: {},
+        metadata: {
+          pageNumber: result.pageNum,
+          ocrConfidence: Math.round(line.avgConfidence),
+        },
+      });
+      currentText = '';
+      currentFirstText = '';
+      currentConfSum = 0;
+      currentConfCount = 0;
+      currentScripts = 0;
+      prevY = line.y;
+      prevLine = line;
+      continue;
+    }
+
     const gap = prevY === null ? 0 : Math.abs(prevY - line.y);
     // 段间距阈值：取「中位行距的 1.2 倍」与「字号的 1.8 倍」中**较小**的那个。
     //
@@ -608,30 +740,7 @@ export function ocrResultToBlocks(
       (endsSentence && gap > line.fontSize * 0.95);
 
     if (isNewParagraph) {
-      if (currentText.trim()) {
-        const avgConf = currentConfCount > 0 ? currentConfSum / currentConfCount : 0;
-        // ⚠️ 这里用 currentFirstText（**本块第一行**）而不是 currentText：
-        // 标题是**单行**的东西，而拼到现在的整段文本可能已经把后面几行
-        // 并了进来。拿整段去判就会两头都错。
-        const isHeading =
-          currentFontSize > medianFontSize * HEADING_FONT_RATIO &&
-          currentFirstText.trim().length <= HEADING_MAX_CHARS &&
-          looksLikeHeading(currentFirstText);
-
-        blocks.push({
-          type: isHeading ? 'heading' : 'paragraph',
-          content: currentText.trim(),
-          translations: {},
-          metadata: {
-            pageNumber: result.pageNum,
-            ocrConfidence: Math.round(avgConf),
-            // 行内公式标记交给渲染层：`BlockRow.tsx` 会据此把 `$...$`
-            // 交给 KaTeX（与 Markdown 链路 `remark-math` 的标记语义一致）
-            ...(currentScripts > 0 ? { hasInlineMath: true } : {}),
-            ...(isHeading ? { level: 2 } : {}),
-          },
-        });
-      }
+      flushParagraph();
       currentText = line.text;
       currentFirstText = line.text;
       currentConfSum = line.avgConfidence * line.words.length;
@@ -654,25 +763,7 @@ export function ocrResultToBlocks(
     prevLine = line;
   }
 
-  if (currentText.trim()) {
-    const avgConf = currentConfCount > 0 ? currentConfSum / currentConfCount : 0;
-    const isHeading =
-      currentFontSize > medianFontSize * HEADING_FONT_RATIO &&
-      currentFirstText.trim().length <= HEADING_MAX_CHARS &&
-      looksLikeHeading(currentFirstText);
-
-    blocks.push({
-      type: isHeading ? 'heading' : 'paragraph',
-      content: currentText.trim(),
-      translations: {},
-      metadata: {
-        pageNumber: result.pageNum,
-        ocrConfidence: Math.round(avgConf),
-        ...(currentScripts > 0 ? { hasInlineMath: true } : {}),
-        ...(isHeading ? { level: 2 } : {}),
-      },
-    });
-  }
+  flushParagraph();
 
   // ── 导出识别结构（只在调用方要的时候才构造）────────────────────
   //
