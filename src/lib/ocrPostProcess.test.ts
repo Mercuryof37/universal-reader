@@ -1790,6 +1790,260 @@ describe('真实第 1 词（整条链路）：真实的那些误判一个都不�
 
 
 // ═══════════════════════════════════════════════════════════════
+// 倾斜行：行基线拟合（书脊弯曲 / 扫描歪）不得把同一行切碎
+// ═══════════════════════════════════════════════════════════════
+//
+// 阈值取证与机制说明见 `ocrPostProcess.ts` 里 `mergeTiltedLineFragments` /
+// `lineBaseline` / `buildWordSlopes` 的文档。CSAPP（书脊弯曲扫描）取样
+// 20 页的实测：页级斜率中位数 0.0000 – 0.0154，18% 的行（98/542）中心 y
+// 漂移超过 5px 的分桶容差（应用画布尺度下 55.5%，见 `BASELINE_MIN_DRIFT_RATIO`
+// 的文档）—— 不修的话，一条视觉上完整的行会被切成几段，
+// 角标与基字一旦分属两段，上下标判定整条失效，输出退回平铺文本。
+//
+// 下面四组几何各自锁死一个机制（都做过反事实验证：把对应机制临时停用，
+// 对应用例确实失败）：
+//  1. 一条倾斜行（含 `e^{-(x+y)}`）在 0 – 0.025 的斜率下都必须仍是
+//     **一条行**、指数仍绑得上 —— 把基线闸门换成「永不拟合」
+//     （`BASELINE_MIN_DRIFT_RATIO = Infinity`）后，0.008 / 0.015 / 0.025
+//     分别散成 2 / 2 / 3 段（首段词数 18 / 9 / 6）；
+//  2. 台阶状的两条平行行（两栏版面的常见几何）**不得**被「拼起来是一条
+//     直线」焊成一行 —— 中位残差挡不住它们（实测只 4.6px），挡住它们的
+//     是判据 2b `offBaselineWords`；把它停用后两条行在平直与倾斜页面上
+//     都焊成一行（输出 `甲甲甲乙乙乙丙丙丙子子子丑丑丑寅寅寅`）。它同时
+//     锁住「每一条倾斜行自己要拼回来」：闸门永不拟合时，倾斜的每行
+//     各裂成 2 段（共 4 条）；
+//  3. 长基字词右端的上标：原始错位 3.5px 在 5px 门槛以下，扣掉 m·Δx
+//     后才越线 —— 把 `findScriptAnchors` 里的 deskew 项清零（或让闸门
+//     永不拟合），这个上标立刻退回成独立词 `$2$`；
+//  4. 应用画布尺度（字号 105 / 行宽 3584 / |m| = 0.003）的整行几何 ——
+//     这是对「固定斜率闸门 0.005」那个单位错误的回归守卫，
+//     详见该用例自身的说明。
+
+describe('倾斜行：行基线拟合（书脊弯曲 / 扫描歪）', () => {
+  type TiltLine = { text: string; wordIndices: number[]; hasScripts: boolean };
+
+  function tiltPageOf(
+    words: Parameters<typeof pageResult>[0]['words'],
+    canvasHeight: number,
+  ): { contents: string[]; lines: TiltLine[] } {
+    let structure: { lines: TiltLine[] } | undefined;
+    const blocks = ocrResultToBlocks(pageResult({ words }), canvasHeight, (s) => {
+      structure = s as unknown as { lines: TiltLine[] };
+    });
+    return { contents: blocks.map((b) => b.content), lines: structure?.lines ?? [] };
+  }
+
+  const slopeCases = [0, 0.008, 0.015, 0.025];
+
+  /**
+   * 20 词的行：`已知 函数 e^{-(x+y)} 的 概率密度为 f(x)，求其分布律，并写出过程`。
+   *
+   * 词框先按平直行给（与「更小且更高的词被判为上标」的用例同源），
+   * 再按下标在行内的横向位置整体加 `slope·cx` —— 这就是倾斜扫描
+   * 落到词级坐标上的样子：一行的 y 是 x 的线性函数。
+   */
+  function tiltRow(slope: number) {
+    const parts: [string, number, number, number, number][] = [
+      ['已知', 40, 40, 20, 0],
+      ['函数', 90, 40, 20, 0],
+      ['e', 140, 12, 20, 0],
+      ['-(x+y)', 154, 60, 13, -18],
+      ['的', 226, 20, 20, 0],
+      ['概率', 256, 40, 20, 0],
+      ['密度', 306, 40, 20, 0],
+      ['为', 356, 20, 20, 0],
+      ['f', 386, 12, 20, 0],
+      ['(x)', 400, 40, 20, 0],
+      ['，求', 450, 40, 20, 0],
+      ['其', 500, 20, 20, 0],
+      ['分布', 530, 40, 20, 0],
+      ['律', 580, 20, 20, 0],
+      ['，', 610, 20, 20, 0],
+      ['并', 640, 20, 20, 0],
+      ['写', 670, 20, 20, 0],
+      ['出', 700, 20, 20, 0],
+      ['过', 730, 20, 20, 0],
+      ['程', 760, 20, 20, 0],
+    ];
+    const x0 = parts[0]![1];
+    return parts.map(([text, x, width, h, dy]) => {
+      const cx = x + width / 2 - x0;
+      return w(text, x, Math.round(88 + dy + slope * cx), h, width);
+    });
+  }
+
+  it('20 词的行在 0 – 0.025 的任何斜率下都是一条行，指数仍绑在 e 上', () => {
+    const summary = slopeCases.map((slope) => {
+      const { contents, lines } = tiltPageOf(tiltRow(slope), 600);
+      return {
+        slope,
+        contents,
+        lineCount: lines.length,
+        wordCount: lines[0]?.wordIndices.length ?? 0,
+        hasScripts: lines[0]?.hasScripts ?? false,
+      };
+    });
+
+    expect(summary).toEqual(
+      slopeCases.map((slope) => ({
+        slope,
+        contents: ['已知函数e$^{-(x+y)}$的概率密度为f (x)，求其分布律，并写出过程'],
+        lineCount: 1,
+        wordCount: 20,
+        hasScripts: true,
+      })),
+    );
+  });
+
+  /**
+   * 台阶状的两条平行行：每行 3 个 150px 宽的词（词距 6px），右侧一行的
+   * 起点（x 522）恰好接在左侧一行（x1 502）之后、纵向错开 38px。
+   * 这是两栏版面 / 表格单元的自然几何：判据 1「水平首尾相接」放行，
+   * 拼起来的中位残差也过闸（角标以外的词各占一半、错位抵消）——
+   * 唯一的拦截者是判据 2b。
+   */
+  function staircase(slope: number) {
+    const rows: [string[], number, number][] = [
+      [['甲甲甲', '乙乙乙', '丙丙丙'], 100, 40],
+      [['子子子', '丑丑丑', '寅寅寅'], 138, 522],
+    ];
+    const out: ReturnType<typeof w>[] = [];
+    for (const [texts, baseY, x0] of rows) {
+      texts.forEach((text, k) => {
+        const x = x0 + k * 156;
+        const cx = x + 75;
+        out.push(w(text, x, Math.round(baseY + slope * cx), 20, 150));
+      });
+    }
+    return out;
+  }
+
+  it('台阶状的两条平行行（平直与倾斜）都不得被焊成一行', () => {
+    const summary = [0, 0.03].map((slope) => {
+      const { contents, lines } = tiltPageOf(staircase(slope), 600);
+      return { slope, contents, lineCount: lines.length };
+    });
+
+    expect(summary).toEqual([
+      { slope: 0, contents: ['甲甲甲乙乙乙丙丙丙', '子子子丑丑丑寅寅寅'], lineCount: 2 },
+      { slope: 0.03, contents: ['甲甲甲乙乙乙丙丙丙', '子子子丑丑丑寅寅寅'], lineCount: 2 },
+    ]);
+  });
+
+  /**
+   * 长基字词右端的上标。几何全部按「不 deskew 就不成立」反推：
+   *  · 基字（660px 宽的公式词）所在的平桶里有 3 个正文大小的词
+   *    （`设` / `随机` / 公式词），`lineBaseline` 才拟合得出 m ≈ 0.0113；
+   *  · 脚本相对基字的**原始**错位 3.5px < 5px（0.25 倍字号）——
+   *    只做原始比较判不出上标；
+   *  · 扣掉 m·Δx（Δx = 341px，倾斜分量 3.85px）后 7.4px，越过门槛；
+   *  · 脚本离右侧 `，求` 的间隙 7px > 11×0.6 = 6.6px（挡出候选），
+   *    离基字 5px ≤ 6.6px —— 唯一的绑定对象就是基字。
+   */
+  function longBaseRow(slope: number) {
+    const put = (text: string, x: number, width: number, h: number, dy: number) => {
+      const cx = x + width / 2;
+      return w(text, x, Math.round(100 + slope * cx - dy - h / 2), h, width);
+    };
+    return [
+      put('设', 150, 50, 20, 0),
+      put('随机', 206, 60, 20, 0),
+      put('p (1 − p )x+y−2 ,0 < p < 1', 272, 660, 20, 0),
+      put('2', 937, 11, 11, 7),
+      put('，求', 955, 40, 20, 0),
+      put('分布律', 1001, 80, 20, 0),
+    ];
+  }
+
+  it('长基字词右端的上标：平直与倾斜都要绑上（倾斜时靠基线 deskew 才绑得上）', () => {
+    const summary = [0, 0.0115].map((slope) => {
+      const { contents, lines } = tiltPageOf(longBaseRow(slope), 400);
+      return { slope, contents, hasScripts: lines[0]?.hasScripts ?? false };
+    });
+
+    expect(summary).toEqual([
+      {
+        slope: 0,
+        contents: ['设随机p (1 − p )x+y−2 ,0 < p < 1$^{2}$，求分布律'],
+        hasScripts: true,
+      },
+      {
+        slope: 0.0115,
+        contents: ['设随机p (1 − p )x+y−2 ,0 < p < 1$^{2}$，求分布律'],
+        hasScripts: true,
+      },
+    ]);
+  });
+
+  /**
+   * 应用画布尺度的倾斜行（真实 CSAPP 场景）。
+   *
+   * 前三组几何都是「探测图尺度」（字号 20、行宽 ~750）：在那里固定
+   * 斜率闸门 0.005 与实测吻合，因此抓不出它的**单位错误**。应用实际
+   * 把页面渲染成字号 ~105px、行宽 ~3600px 的画布 —— CSAPP 的
+   * 1490×1944pt 页面在 200 DPI 下先到 2.7778 倍，再被 20MP 上限压到
+   * 2.6272 倍（3915×5108）。同一句「漂移刚越过分桶容差」在应用画布上
+   * 只有 |m| ≈ 5/3624 ≈ 0.0014，固定闸门 0.005 高出 3.6 倍。
+   * 实测（`tilt-appscale.mjs`，同一份 20 页 542 行换算到应用尺度）：
+   * 55.5% 的行漂移超过 5px，其中 20.7%（112 行）被 0.005 挡回原路径 ——
+   * 也就是说闸门恰好把「该拟合的行」挡在门外。
+   *
+   * 本用例的几何就取自那份实测：|m| = 0.003、行宽 3584 → 漂移 10.75px，
+   * 两倍于分桶容差 —— 肉眼可见歪、平桶装不下，正是拟合基线的用例。
+   * 反事实：把闸门换回固定 0.005（临时加 `|m| < 0.005 → null`），
+   * 这条行立刻裂成 2 段（`lineCount` 2、首段 `wordCount` 10），
+   * 输出也被拆成两条 —— 正是被实测抓到的故障形态。
+   */
+  function appScaleRow(slope: number) {
+    const put = (text: string, x: number, width: number, h: number, dy: number) => {
+      const cx = x + width / 2;
+      return w(text, x, Math.round(600 + slope * cx - dy - h / 2), h, width);
+    };
+    return [
+      put('已知', 40, 210, 105, 0),
+      put('函数', 285, 210, 105, 0),
+      put('e', 530, 63, 105, 0),
+      // 指数紧贴基字（间隙 8px ≤ 0.6 × 68 = 40.8）：绑定对象唯一
+      put('-(x+y)', 601, 300, 68, 50),
+      put('的', 936, 105, 105, 0),
+      put('概率', 1076, 210, 105, 0),
+      put('密度', 1321, 210, 105, 0),
+      put('为', 1566, 105, 105, 0),
+      put('f', 1706, 63, 105, 0),
+      put('(x)', 1804, 210, 105, 0),
+      put('，求', 2049, 210, 105, 0),
+      put('其', 2294, 105, 105, 0),
+      put('分布', 2434, 210, 105, 0),
+      put('律', 2679, 105, 105, 0),
+      put('，', 2819, 105, 105, 0),
+      put('并', 2959, 105, 105, 0),
+      put('写', 3099, 105, 105, 0),
+      put('出', 3239, 105, 105, 0),
+      put('过', 3379, 105, 105, 0),
+      put('程', 3519, 105, 105, 0),
+    ];
+  }
+
+  it('应用画布尺度（字号 105 / 行宽 3584 / |m| = 0.003）的倾斜行必须拼回一条行', () => {
+    // 画布高取应用真实值 5108：行的 y ≈ 549–663，远离 5% 的页眉页脚带
+    const { contents, lines } = tiltPageOf(appScaleRow(0.003), 5108);
+
+    expect({
+      contents,
+      lineCount: lines.length,
+      wordCount: lines[0]?.wordIndices.length ?? 0,
+      hasScripts: lines[0]?.hasScripts ?? false,
+    }).toEqual({
+      contents: ['已知函数e$^{-(x+y)}$的概率密度为f (x)，求其分布律，并写出过程'],
+      lineCount: 1,
+      wordCount: 20,
+      hasScripts: true,
+    });
+  });
+});
+
+
+// ═══════════════════════════════════════════════════════════════
 // 页眉页脚：裁剪而不是整行删（同一行里混着正文词）
 // ═══════════════════════════════════════════════════════════════
 

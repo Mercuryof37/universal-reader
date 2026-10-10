@@ -876,22 +876,35 @@ describe('对账与挂载：拿不到字符框时行为必须与改动前一致'
   });
 
   it('识别**多出**字符 → 放行（跳过多余的，目标每个字符仍然都有框）', () => {
-    // ⚠️ 这条此前是「字符数不一致 → null」。规则已按实测改成**不对称**的：
-    // 多识别只影响被跳过的那一个字符，漏识别才会让它后面全部错位。
+    // ⚠️ 这条此前是「字符数不一致 → null」。规则已按实测放宽：
+    // 多识别只影响被跳过的那个字符，目标里每个字符仍然都有框。
     // 实测依据：含指数的第 1 词被识别成 `…=p²(1−p)x+y−2…`，
     // 比期望多一个 `²`、其余逐个吻合；旧规则因此丢掉了整行。
     const r = reconcileWithWordText(charsOf('ABCD'), measOf(4), 'ABCD', 'ABC');
     expect(r?.chars.map((c) => c.char).join('')).toBe('ABC');
   });
 
-  it('识别**漏掉**目标字符 → null（从那一点起对应关系已不可靠）', () => {
-    // 反向防线：实测 `μ>0` 被读成 `μ0`（漏了 `>`），必须继续拒绝。
-    // 放行会让字符框对到别的字上 —— 错位的框比没有框更糟。
-    expect(reconcileWithWordText(charsOf('ABD'), measOf(3), 'ABD', 'ABCD')).toBeNull();
+  it('识别**漏掉**一个目标字符 → 放行，缺位占空位（有界对齐的放行侧）', () => {
+    // 旧规则「漏一个就整条拒绝」把 `μ>0`→`μ0` 这类真词一并挡掉了。
+    // 现在漏点由对齐就地吸收：缺掉的字符占空位（无测量值、无置信度），
+    // 缺口两侧的对应关系不漂移 —— `D` 的框仍然是识别里第三个字的框。
+    const r = reconcileWithWordText(charsOf('ABD'), measOf(3), 'ABD', 'ABCD');
+    expect(r).not.toBeNull();
+    expect(r!.chars.map((c) => c.char).join('')).toBe('ABCD');
+    expect(r!.measurements[2]).toBeNull();
+    expect(r!.measurements[3]).toEqual({ y0: 0, y1: 10, h: 10 });
+    expect(r!.chars[3]!.x0).toBe(20);
   });
 
-  it('逐字符内容不一致 → null（不能用错的坐标去判上下标）', () => {
-    expect(reconcileWithWordText(charsOf('ABD'), measOf(3), 'ABD', 'ABC')).toBeNull();
+  it('长度相同但认错一个字 → 放行（一一对应，框的位置仍然可信）', () => {
+    // 与「多出/漏掉」不同，这里每个位置都有框，只是有一个字符的两次
+    // 识别结果不一致（`C` / `D`）—— 框的位置与尺寸本身仍然可用。
+    const r = reconcileWithWordText(charsOf('ABD'), measOf(3), 'ABD', 'ABC');
+    expect(r).not.toBeNull();
+    expect(r!.chars.map((c) => c.char).join('')).toBe('ABC');
+    expect(r!.chars[2]!.x0).toBe(20);
+    // 但上限是硬的：3 个字符里错 2 个（matches 1 < 3 − 1）→ 拒绝
+    expect(reconcileWithWordText(charsOf('AXY'), measOf(3), 'AXY', 'ABC')).toBeNull();
   });
 
   it('只在空白上分歧时可以放行（库那边有 injectGapSpaces，两次识别的空格本来就可能不同）', () => {
@@ -1181,9 +1194,16 @@ describe('真实回归：对账必须容忍格式差异', () => {
     expect(reconcile('O，', '0，')).toBeNull();
   });
 
-  it('⚠️ 漏掉一个运算符也必须继续拒绝 —— 实测第 4 词（`μ>0` 少了 `>`）', () => {
-    // 期望 19 字符、得到 18 —— 少的是 `>`，不是格式问题
-    expect(reconcile('其中λ>0，μ0是常数.引入随机变量', '其中λ>0，μ>0是常数.引入随机变量')).toBeNull();
+  it('⭐ 实测第 4 词：`μ>0` 漏了 `>`（19 字符对 18）→ 有界对齐放行，缺位占空位', () => {
+    // 这条此前是「继续拒绝」。有界对齐能明确判出漏的是哪一个字符
+    // （`μ0` 里的 `0` 配给目标的 `0`，其余逐个吻合），于是改为放行 ——
+    // 详细依据见 `reconcileWithWordText` 的「有界序列对齐」一节。
+    const r = reconcile('其中λ>0，μ0是常数.引入随机变量', '其中λ>0，μ>0是常数.引入随机变量');
+    expect(r).not.toBeNull();
+    // 漏掉的是第二个 `>`（下标 7）：它占空位，前一个 `>` 的框不受影响
+    expect(r!.measurements[7]).toBeNull();
+    expect(r!.measurements[3]).not.toBeNull();
+    expect(r!.chars.map((c) => c.char).join('')).toBe('其中λ>0，μ>0是常数.引入随机变量');
   });
 
   it('归一化不能把完全不相干的文本放过', () => {
@@ -1239,17 +1259,25 @@ describe('真实回归：序列对齐必须救回含指数的第 1 词', () => {
     expect(r, '`n₂`(U+2082) 与 `n2` 是同一张图的两次识别结果，不该因此丢弃').not.toBeNull();
   });
 
-  it('⚠️ 反向：实测那些**真的漏字/认错字**的必须继续拒绝', () => {
-    // 漏掉 `>`（实测第 4 词）
-    expect(reconcileReal('其中λ>0，μ0是常数.引入随机变量', '其中λ>0，μ>0是常数.引入随机变量')).toBeNull();
-    // 漏掉开头的 `=`（实测第 6 词）
-    expect(reconcileReal('10, 当X>Y', '=10, 当X>Y')).toBeNull();
-    // `）` 被认成 `1`（实测第 10 词）
+  it('⭐ 放行侧（同一次实测的另一条告警）：漏掉开头的 `=` 也能放行', () => {
+    // 8 字符里漏 1 个，且漏点在**开头** —— 对齐把缺位就地吸收，
+    // 后面 `10, 当X>Y` 八个字符的框全部保住（旧规则整条丢掉）。
+    const r = reconcileReal('10, 当X>Y', '=10, 当X>Y');
+    expect(r).not.toBeNull();
+    expect(r!.chars.map((c) => c.char).join('')).toBe('=10, 当X>Y');
+    expect(r!.measurements[0]).toBeNull();
+    expect(r!.measurements[1]).not.toBeNull();
+  });
+
+  it('⚠️ 反向：目标侧错得超过上限的必须继续拒绝', () => {
+    // `）` 被认成 `1`（实测第 10 词，1 字符）
     expect(reconcileReal('1', '）')).toBeNull();
-    // `0` 被认成 `O`（实测第 11 词）
+    // `0` 被认成 `O`（实测第 11 词，2 字符里错 1 —— 短词一个都不许错）
     expect(reconcileReal('O，', '0，')).toBeNull();
-    // 整段认错（实测第 5 词）
+    // 整段认错（实测第 5 词，6 字符里只对上 1 个）
     expect(reconcileReal('2-, Mx', 'Z= 当X>Y')).toBeNull();
+    // `fz(e)= 0` 被认成 `20)=0`（实测：目标侧错 4 个，远超上限）
+    expect(reconcileReal('20)=0', 'fz(e)= 0')).toBeNull();
   });
 });
 

@@ -121,6 +121,18 @@ export interface OcrStructure {
     /** 与基字中心距离上限（正文字高倍数），上标/下标分开 */
     scriptSuperBand: number;
     scriptSubBand: number;
+    /** 平桶容差（px）：中心 y 相差不超过它的词算同一行 */
+    sameLineTolerance: number;
+    /**
+     * 行基线拟合：拟合线在样本跨距上的总漂移（|slope| × 行宽）
+     * 必须超过分桶容差的这个倍数，否则当平直行处理（判据不动）。
+     * 行宽归一 → 对画布缩放不敏感。
+     */
+    baselineMinDriftRatio: number;
+    /** 行基线拟合：残差上限（正文字高倍数） */
+    baselineMaxResidualRatio: number;
+    /** 倾斜行碎片合并：两段水平间隙上限（正文字高倍数） */
+    tiltJoinGapRatio: number;
   };
   /** 所有词 */
   words: OcrStructureWord[];
@@ -421,6 +433,10 @@ const DEFAULT_THRESHOLDS: OcrStructure['thresholds'] = {
   scriptFragmentGap: 0.6,
   scriptSuperBand: 1.5,
   scriptSubBand: 1.2,
+  sameLineTolerance: 5,
+  baselineMinDriftRatio: 1,
+  baselineMaxResidualRatio: 0.35,
+  tiltJoinGapRatio: 1.5,
 };
 
 function thresholdsOf(over?: Partial<OcrStructure['thresholds']>): OcrStructure['thresholds'] {

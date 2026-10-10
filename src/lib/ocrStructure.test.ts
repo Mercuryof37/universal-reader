@@ -165,6 +165,10 @@ describe('识别结构导出：字段与行引用', () => {
       scriptFragmentGap: 0.6,
       scriptSuperBand: 1.5,
       scriptSubBand: 1.2,
+      sameLineTolerance: 5,
+      baselineMinDriftRatio: 1,
+      baselineMaxResidualRatio: 0.35,
+      tiltJoinGapRatio: 1.5,
     });
   });
 

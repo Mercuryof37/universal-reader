@@ -2547,6 +2547,74 @@ function trimCharRange(
   };
 }
 
+/** `alignSequences` 的结果：计数 + 目标序列每一位配到的识别序列下标 */
+interface SequenceAlignment {
+  /** 目标序列第 i 位配到的识别序列下标；没配到（漏掉）的位置为 -1 */
+  map: number[];
+  /** 逐字符相等的配对数（删除/替换的位置不计入） */
+  matches: number;
+  /** 识别多出来、没配到目标的字符数 */
+  ins: number;
+}
+
+/**
+ * 两条归一化字符序列的**有界编辑距离对齐**（删除/替换/插入各计 1 代价）。
+ *
+ * 与「贪心找下一个相同字符」的关键区别在**缺口**：贪心遇到漏字只能整条
+ * 放弃，而对齐会让缺口就地吸收错位 —— 缺口前、缺口后的配对仍然单调
+ * （第 i 位只配第 j 位、i 与 j 同步递增），这正是 `reconcileWithWordText`
+ * 敢放行「漏掉/认错个别字符」的依据所在。
+ *
+ * 回溯优先走对角线（配对），平局时再依次考虑删除/插入：同样的代价下
+ * 配对给出的坐标更多，而缺口位在下游本来就会被跳过（测量值为 null）。
+ * 两条序列都很短（一个词），O(n·m) 的完整表格足够了。
+ */
+function alignSequences(targetSeq: string[], recSeq: string[]): SequenceAlignment {
+  const n = targetSeq.length;
+  const m = recSeq.length;
+  /** dp[i][j]：目标前 i 位与识别前 j 位对齐的最小代价 */
+  const dp: number[][] = Array.from({ length: n + 1 }, () =>
+    new Array<number>(m + 1).fill(0),
+  );
+  for (let i = 1; i <= n; i++) dp[i][0] = i;
+  for (let j = 1; j <= m; j++) dp[0][j] = j;
+  for (let i = 1; i <= n; i++) {
+    for (let j = 1; j <= m; j++) {
+      const diag = dp[i - 1][j - 1] + (targetSeq[i - 1] === recSeq[j - 1] ? 0 : 1);
+      const del = dp[i - 1][j] + 1;
+      const ins = dp[i][j - 1] + 1;
+      dp[i][j] = Math.min(diag, del, ins);
+    }
+  }
+
+  const map = new Array<number>(n).fill(-1);
+  let i = n;
+  let j = m;
+  let matches = 0;
+  let ins = 0;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0) {
+      const equal = targetSeq[i - 1] === recSeq[j - 1];
+      if (dp[i][j] === dp[i - 1][j - 1] + (equal ? 0 : 1)) {
+        if (equal) {
+          matches++;
+          map[i - 1] = j - 1;
+        }
+        i--;
+        j--;
+        continue;
+      }
+    }
+    if (i > 0 && dp[i][j] === dp[i - 1][j] + 1) {
+      i--;
+      continue;
+    }
+    ins++;
+    j--;
+  }
+  return { map, matches, ins };
+}
+
 /**
  * 把「本模块识别出的字符」与「词文本」对齐。
  *
@@ -2562,8 +2630,10 @@ function trimCharRange(
  *
  * 分歧本身不可怕，可怕的是**字符数不一致时框会整体错位**：
  * 本来判 `x` 是上标，错位之后判到 `y` 头上，输出就成了错的公式。
- * 所以这里严格对账：**字符序列不一致就放弃这个词的字符框**（返回 null），
- * 退回原来的词级判据。少一点覆盖，绝不产出错的坐标。
+ * 所以这里用**有界序列对齐**对账（见函数内「有界序列对齐」一节）：
+ * 漏掉/认错个别字符仍可放行 —— 对齐把错位吸收在缺口处，缺口两侧的
+ * 对应关系不会漂移；错得太多则整条放弃（返回 null），退回词级判据。
+ * 少一点覆盖，绝不产出错的坐标。
  */
 export function reconcileWithWordText(
   chars: OcrChar[],
@@ -2656,7 +2726,7 @@ export function reconcileWithWordText(
 
   /**
    * ═══════════════════════════════════════════════════════════════
-   * 序列对齐：允许识别结果**多出**字符，不允许它**漏掉**字符
+   * 有界序列对齐：漏掉 / 认错个别字符可以放行，多认的字符有上限
    * ═══════════════════════════════════════════════════════════════
    *
    * 此前要求两边（归一化后）**完全相同**，于是含指数的第 1 词被丢掉：
@@ -2666,99 +2736,136 @@ export function reconcileWithWordText(
    *
    * 其余逐个吻合 —— 多出来的那个跳过即可，**期望里每个字符仍然都有框**。
    *
-   * 反过来不行：期望里有、识别里没有（实测 `μ>0` 被读成 `μ0`，漏了 `>`），
-   * 说明从漏掉那一点起对应关系已经不可靠，必须整条拒绝 ——
-   * 这正是原来那道闸要防的事（错位的框比没有框更糟）。
+   * 但「只许多、不许少」也丢掉过真词，原始记录就在同一次浏览器实测的
+   * 告警里（下面两条都该放行）：
    *
-   * 所以规则是**不对称**的，而这个不对称有依据：
-   * **多识别**只影响被跳过的那一个字符，**漏识别**会让它后面全部错位。
+   *   期望 `其中λ>0，μ>0是常数.引入随机变量`（19 字符）
+   *   得到 `其中λ>0，μ0是常数.引入随机变量`  （18 字符，漏了 `>`）
+   *
+   *   期望 `=10, 当X>Y`（9 字符）
+   *   得到 `10, 当X>Y`  （8 字符，漏了开头的 `=`）
+   *
+   * 漏掉的是哪一个字符**并不难判断**：`μ0` 里的 `0` 就该配给目标的
+   * 那个 `0`，缺掉的 `>` 占一个空位即可。原规则怕的是「从漏点起
+   * 整体错位」，而编辑距离对齐从构造上就不错位 —— 配对是单调的，
+   * 错位被吸收在缺口本身。
+   *
+   * 所以规则是**有界**的：删除/替换/插入各计 1 代价，目标侧的偏差
+   * （漏掉 + 认错）有上限，多认的字符沿用原上限。
+   *
+   * 界限取 `maxErrors = min(2, floor(目标长度 / 3))`，两端的实测依据：
+   *
+   *  · 放行侧：`μ>0`→`μ0`（19 字符里错 1）、`=10,`→`10,`（8 字符里错 1）；
+   *  · 拒绝侧：`）`→`1`（1 字符）、`0，`→`O，`（2 字符里错 1，已到
+   *    「一个都不许错」的短词）、`Z= 当X>Y`→`2-, Mx`、`fz(e)= 0`→`20)=0`
+   *    （目标侧错得远多于 2）。
+   *
+   * 这与「`matches >= max(2, 长度 − 2)`」只在 4–5 字符的词上有出入
+   * （那里只许错 1 个）：4 个字符错 2 个已经是 50%，那个长度上不该算
+   * 对齐可信 —— 宁可退回词级判据。
    */
-  const targetChars = [...target].filter((ch) => ch.trim());
-  if (!targetChars.length) return null;
+  const targetChars = [...target];
+  const targetSeq: string[] = [];
+  for (const ch of targetChars) {
+    if (ch.trim()) targetSeq.push(canonical(ch));
+  }
+  if (!targetSeq.length) return null;
+
+  /** 识别一侧的归一化序列；`recSeqSrc` 记它每一位在 `trimmed.chars` 里的下标 */
+  const recSeq: string[] = [];
+  const recSeqSrc: number[] = [];
+  for (let i = 0; i < trimmed.chars.length; i++) {
+    const c = trimmed.chars[i];
+    if (!c || !c.char.trim()) continue;
+    recSeq.push(canonical(c.char));
+    recSeqSrc.push(i);
+  }
 
   /**
-   * 整串识别结果也要能容下 target（与逐字符对齐互为印证）。
+   * 多认的字符不能太多：不设上限时，一段胡乱识别的结果也可能「碰巧」
+   * 把目标当子序列匹配上，那种对齐给出的坐标是错的。上限取「目标长度的
+   * 四分之一，且至少允许 2 个」—— 实测第 1 词只多出 1 个字符，离上限很远。
+   */
+  const maxSkip = Math.max(2, Math.ceil(targetSeq.length * 0.25));
+  const maxErrors = Math.min(2, Math.floor(targetSeq.length / 3));
+  const accepts = (al: SequenceAlignment): boolean =>
+    al.matches >= targetSeq.length - maxErrors && al.ins <= maxSkip;
+
+  const aligned = alignSequences(targetSeq, recSeq);
+  if (!accepts(aligned)) return null;
+
+  /**
+   * 整串识别结果也要能同样对齐（与逐字符对齐互为印证）。
    *
    * 两者本该一致，但它们的来源不同：`recognizedText` 是识别器给的整串，
-   * `trimmed.chars` 是逐字符框拼出来的。若只有一边对得上，说明中间某处
-   * 出了问题，此时拒绝比给出坐标安全。
+   * `trimmed.chars` 是逐字符框拼出来的（拿不到墨迹范围的字符会缺位）。
+   * 若只有一边对得上，说明中间某处出了问题，此时拒绝比给出坐标安全。
    */
-  const recCanon = canonical(recognizedText);
-  const tgtCanon = canonical(target);
-  let matched = 0;
-  for (const ch of recCanon) {
-    if (matched < tgtCanon.length && ch === tgtCanon[matched]) matched++;
-  }
-  if (matched !== tgtCanon.length) return null;
+  const textAligned = alignSequences(targetSeq, [...canonical(recognizedText)]);
+  if (!accepts(textAligned)) return null;
+
+  const map = aligned.map;
 
   const keptChars: OcrChar[] = [];
   const keptMeasure: Array<InkMeasurement | null> = [];
   const keptConfidence: number[] = [];
-  let cursor = 0;
-  let skipped = 0;
+  let seqIndex = 0;
 
   /**
-   * ⚠️ 输出必须与 **`target` 逐位对齐**，包括空白位置。
+   * ⚠️ 输出必须与 **`target` 逐位对齐**，包括空白位置与识别漏掉的位置。
    *
    * 这一点是契约，不是实现细节：`emitWordWithCharScripts` 是按**下标**在
    * `word.text` 上切片的，字符数组一旦与原文错位，切出来的就是别的字。
    *
-   * 所以空白位与「识别漏掉」的位置都要占一个位置，只是**测量值为 null**
-   * （`classifyCharsByGeometry` 本来就会跳过 null —— 没有墨迹就没有几何可言）。
-   * 两条路径（精确匹配 / 序列对齐）由此得到**同一个**契约。
+   * 所以缺框的位置都要占一个位置，只是**测量值为 null**
+   * （`classifyCharsByGeometry` 本来就会跳过 null —— 没有墨迹就没有几何
+   * 可言，而 `isScaledDownLetterOrDigit` / `coveredByEvidence` 对退化框
+   * 也都返回 false，不会拿占位框当证据）。三条路径（精确匹配 / 归一化相等 /
+   * 有界对齐）由此得到**同一个**契约。
    *
    * 置信度同理必须逐位补齐：占位处填 `NaN`（而不是 0），
    * 好让下游一眼看出「这个位置没有置信度」而不是「它的置信度极低」。
    */
   let prevX = 0;
   let prevY = 0;
-  for (const want of [...target]) {
-    if (!want.trim()) {
-      // 空白：占位，无墨迹、无置信度
+  for (const want of targetChars) {
+    /** 缺框（空白位 / 识别漏掉）：占位，无墨迹、无置信度 */
+    const placeholder = (): void => {
       keptChars.push({ char: want, x0: prevX, y0: prevY, x1: prevX, y1: prevY });
       keptMeasure.push(null);
       keptConfidence.push(Number.NaN);
+    };
+
+    if (!want.trim()) {
+      placeholder();
       continue;
     }
 
-    const wantC = canonical(want);
-    let found = -1;
-    for (let j = cursor; j < trimmed.chars.length; j++) {
-      const c = trimmed.chars[j];
-      if (!c || !c.char.trim()) continue;
-      if (canonical(c.char) === wantC) {
-        found = j;
-        break;
-      }
-      skipped++;
+    const recIndex = map[seqIndex++] ?? -1;
+    if (recIndex < 0) {
+      placeholder();
+      continue;
     }
-    if (found < 0) return null;
 
-    const hit = trimmed.chars[found] as OcrChar;
+    const srcIndex = recSeqSrc[recIndex] ?? -1;
+    const hit = srcIndex >= 0 ? trimmed.chars[srcIndex] : undefined;
+    // 映射是按 `recSeqSrc` 造的，理论上到不了这里；真到了就整条放弃，不猜坐标
+    if (!hit) return null;
+
     // 字符身份取**原文**的 `want`（输出以 `word.text` 为准），几何取识别到的
     keptChars.push({ char: want, x0: hit.x0, y0: hit.y0, x1: hit.x1, y1: hit.y1 });
-    keptMeasure.push(trimmed.measurements[found] ?? null);
-    keptConfidence.push(trimmed.confidences?.[found] ?? Number.NaN);
+    keptMeasure.push(trimmed.measurements[srcIndex] ?? null);
+    keptConfidence.push(trimmed.confidences?.[srcIndex] ?? Number.NaN);
     prevX = hit.x1;
     prevY = hit.y0;
-    cursor = found + 1;
   }
 
-  /**
-   * 跳过的字符不能太多。
-   *
-   * 不设上限时，一段胡乱识别的文本也可能「碰巧」把 target 当子序列匹配上，
-   * 那种对齐给出的坐标是错的。上限取「目标长度的四分之一，且至少允许 2 个」：
-   * 实测词 1 只多出 **1** 个字符，离上限很远；胡乱匹配通常要跳过一大半。
-   */
-  const maxSkip = Math.max(2, Math.ceil(targetChars.length * 0.25));
-  if (skipped > maxSkip) return null;
-
-  if (keptChars.length !== [...target].length) return null;
+  if (keptChars.length !== targetChars.length) return null;
   /**
    * 置信度同样只在**每一位都有真实取值**时才交出去。
-   * 这条路径上「识别多出一个字符」是常态（实测词 1 多一个 `²`），
-   * 被跳过的那一位自然没有置信度 —— 若把它当成 0 混进去，
+   * 这条路径上「识别多出一个字符」与「漏掉一个字符」都是常态
+   * （实测词 1 多一个 `²`、第 4 词漏一个 `>`），缺位的那些位置
+   * 自然没有置信度 —— 若把它们当成 0 混进去，
    * 机制 2 的门槛会被整体拉低，反而放行本该拒掉的候选。
    */
   const anyConfidenceKnown = keptConfidence.some((c) => Number.isFinite(c));

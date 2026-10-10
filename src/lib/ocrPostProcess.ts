@@ -139,6 +139,92 @@ const SCRIPT_FRAGMENT_DY = 0.5;
  * 同一个「多长还算片段」的定义不该有两套。
  */
 const SCRIPT_MAX_FRAGMENT_CHARS = 12;
+
+/**
+ * ═══════════════════════════════════════════════════════════════
+ * 行基线拟合（用于倾斜 / 书脊弯曲的扫描页）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 平直页面上「同一行的词，中心 y 相差不超过 `SAME_LINE_TOLERANCE`（5px）」
+ * 是成立的；扫描件一旦倾斜，**视觉上完整的一行**其中心 y 会随 x 漂移，
+ * 于是同一条行在分桶时被切成几段（实测漂移量见 `groupWordsIntoLines`
+ * 里「倾斜行碎片合并」一节的说明）。而 `assembleLineText` 要求
+ * 「基字与它的角标必须在同一行」，一旦分属两段，上下标判定整条失效 ——
+ * 输出退回成平铺文本。
+ *
+ * 所以判据要落在**拟合出来的基线**上：把一行的词框中线拟合成
+ * `y = m·x + c`，角标判定的 Δy 相对这条线量。这与 Tesseract 自己的做法
+ * 同源（`ccmain/superscript.cpp` 里的 `base_line` 就是逐行拟合出来的），
+ * 也是 ABBYY / FineReader 时代的常规做法 —— 纯几何，不依赖识别置信度。
+ *
+ * 全部阈值都取「不确定就不动」的方向：拟合不出可信的线就返回 null，
+ * 调用方一律退回原路径（与引入本机制之前逐字节相同）。
+ */
+/** 少于这么多词的拟合不足信（两三个点能过任何线） */
+const BASELINE_MIN_WORDS = 3;
+/**
+ * 参与斜率的两点最小横向间距（px）。
+ *
+ * 词的纵向位置是**像素量化**的量，两个横向距离过近的点算出的斜率
+ * 全是量化噪声（差 1px / 距离 40px = 0.025，比真实倾斜还大），
+ * 中位数也救不回来。实测页面的行宽在 1200px 上下，
+ * 取 100px 既能把噪声对挡在外面，又留够样本数。
+ */
+const BASELINE_MIN_PAIR_DX = 100;
+/**
+ * 认定「这一行确实倾斜」的门槛：**拟合线自身在行宽上的总漂移**
+ * 必须超过分桶容差 `SAME_LINE_TOLERANCE` 的这么多倍。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么不是「|斜率| ≥ 常数」（一次被实测抓出来的单位错误）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 原先这里是一个固定斜率 `BASELINE_MIN_SLOPE = 0.005`，取值时用的是
+ * **探测图**的行宽（scale 1 渲染，1490×1944，正文行宽 ~1200px）——
+ * 0.005 × 1200 ≈ 6px，刚好越过分桶容差 5px，逻辑自洽。
+ *
+ * 但代码实际运行在**应用画布**上：CSAPP 那页是 1490×1944pt，
+ * `renderScaleFor` 取 200 DPI 并受 20 MP 上限压缩 → 缩放 2.6272，
+ * 画布 3915×5108，正文行宽 ~3624px。同一句「漂移刚过分桶容差」
+ * 在应用画布上是 |m| ≈ 5/3624 ≈ 0.0014 —— 也就是 0.005 这个闸门
+ * **高出了 3.6 倍**：一行漂移 5–18px（肉眼可见歪，平桶已经装不下，
+ * 正是拟合基线要解决的场景）会因为「斜率不够大」而拿不到基线，
+ * 整条行退回分桶行为。
+ *
+ * 用应用尺度的复测脚本（`D:/Deepseek/DSH/.ocrtest/tilt-appscale.mjs`，
+ * 同一份 20 页、同一份报告数据换算到应用画布）确认了后果：
+ *  · 542 条行里 **301 条（55.5%）漂移超过 5px**（旧分桶会切开）；
+ *  · 其中 **112 条（20.7%）过不了 0.005 的闸门**（|m| ∈ 0.0016–0.0048），
+ *    即这 112 条「明明该拟合」的行被闸门挡回旧路径；
+ *  · 因此**被切开的行反而拿不到基线** —— 闸门把主用例挡在门外。
+ *
+ * 改成**行宽归一**（无尺度）：拟合线在样本跨距 `span` 上的总漂移
+ * `|m| × span` 必须 ≥ 容差的 1 倍，即「拟合出的倾斜至少要大到
+ * 平桶装不下」才值得用。同一份数据换算下来，这条判据恰好等价于
+ * 「|m| ≥ 5 / span」：
+ *  · span 3624px（应用画布的整行）→ |m| ≥ 0.0014；
+ *  · span 1200px（探测图的行宽）→ |m| ≥ 0.0042，与旧的 0.005 同量级。
+ * 短行自动受保护 —— 样本只要 3 个词（`BASELINE_MIN_WORDS`），
+ * 三个词凑出来的 span 短，噪声斜率会被行宽归一化的判据挡住
+ * （span 300px 要有 |m| ≥ 0.0167 才算数）。
+ *
+ * 与 2b（`offBaselineWords`）配合下这会安全地放宽合并：真正的
+ * 行间错位（两条视觉行）在 2b 处被拦下（正文词离拟合线超过
+ * 0.35 倍字高即拒绝），而 0.35 倍字高 < 最小行距（约 1.2 倍字高），
+ * 所以「能过 2b 的错位」在几何上装不进两行，不可能是焊接。
+ */
+const BASELINE_MIN_DRIFT_RATIO = 1;
+/** 拟合残差上限（正文字高倍数）：词必须真的落在同一条线上 */
+const BASELINE_MAX_RESIDUAL_RATIO = 0.35;
+/**
+ * 倾斜行碎片合并：两段之间的水平间隙上限（正文字高倍数）。
+ *
+ * 同一条行被切开后，两段在 x 上**首尾相接**（间隙只有一个词距），
+ * 这条把「隔得很远的另一栏」挡在外面；而**互相重叠**的两段
+ * （分数、跨行分支）不在此列 —— 那是 `mergeContainedBranches` 的活。
+ */
+const TILT_JOIN_GAP_RATIO = 1.5;
+
 /** 跨行构件合并：分支被主机包住时允许的外溢比例 */
 const CLUSTER_BRANCH_SLACK = 0.2;
 /** 跨行构件合并：分支宽度最多是主机的这个比例（更宽的就不是「分支」） */
@@ -521,6 +607,10 @@ export function ocrResultToBlocks(
           scriptFragmentGap: SCRIPT_FRAGMENT_GAP,
           scriptSuperBand: SCRIPT_SUPER_BAND,
           scriptSubBand: SCRIPT_SUB_BAND,
+          sameLineTolerance: SAME_LINE_TOLERANCE,
+          baselineMinDriftRatio: BASELINE_MIN_DRIFT_RATIO,
+          baselineMaxResidualRatio: BASELINE_MAX_RESIDUAL_RATIO,
+          tiltJoinGapRatio: TILT_JOIN_GAP_RATIO,
         },
       }),
     );
@@ -908,35 +998,24 @@ function groupWordsIntoLines(words: OcrWord[], pageHeight?: number): OcrLine[] {
   };
 
   const ordered = [...words].sort((a, b) => orderKey(a) - orderKey(b) || a.bbox.x0 - b.bbox.x0);
+  const { groups: buckets, keys: bucketKeys } = bucketByKey(ordered, orderKey, SAME_LINE_TOLERANCE);
 
-  const buckets: OcrWord[][] = [];
-  const bucketKeys: number[] = [];
-
-  for (const word of ordered) {
-    const y = orderKey(word);
-    let matched = -1;
-    for (let i = 0; i < bucketKeys.length; i++) {
-      if (Math.abs((bucketKeys[i] ?? 0) - y) <= SAME_LINE_TOLERANCE) {
-        matched = i;
-        break;
-      }
-    }
-    if (matched >= 0) {
-      buckets[matched]?.push(word);
-    } else {
-      bucketKeys.push(y);
-      buckets.push([word]);
-    }
-  }
+  // ── 第 1.5 层：倾斜行的碎片合并 ───────────────────────────────
+  //
+  // 分桶判据「中心 y 相差 ≤ 5px」只对平直页面成立：扫描件倾斜时
+  // 同一条行会被切成几段，基字与角标分属两段、上下标判定整条失效。
+  // 只有「拼起来真的是一条直线、且平桶装不下」的相邻碎片才会合并，
+  // 平直页面在这里原样返回（逐字节不变，见 `mergeTiltedLineFragments`）。
+  const groups = mergeTiltedLineFragments(buckets, bucketKeys, pageMainFontSize);
 
   // ── 第 2 层：行内词序 → 构件合并 → 组装文本 ───────────────────
-  const rawLines: OcrLine[] = buckets.map((group, i) => ({
+  const rawLines: OcrLine[] = groups.buckets.map((group, i) => ({
     words: orderLineWords(group, words, anchors),
     text: '',
-    y: bucketKeys[i] ?? 0,
+    y: groups.keys[i] ?? 0,
     // 排序键 = 桶中心 y。构件合并会把 y 改成词框上沿，
     // 两类行必须留一个同口径的量才能稳定排序。
-    sortKey: bucketKeys[i] ?? 0,
+    sortKey: groups.keys[i] ?? 0,
     fontSize: group.reduce((sum, w) => sum + w.fontSize, 0) / group.length,
     avgConfidence: group.reduce((sum, w) => sum + w.confidence, 0) / group.length,
   }));
@@ -964,6 +1043,349 @@ function groupWordsIntoLines(words: OcrWord[], pageHeight?: number): OcrLine[] {
     // 合并出来的行 y 是「词框上沿」（见 combineCluster），
     // 两类行混在一起排会让正文先后顺序整体漂移。
     .sort((a, b) => (a.sortKey ?? a.y) - (b.sortKey ?? b.y));
+}
+
+/** 一行词框中线的拟合基线：`y = slope · x + intercept` */
+interface BaselineFit {
+  slope: number;
+  intercept: number;
+  /** 中位绝对残差：词框中线到拟合线的典型距离（px） */
+  residual: number;
+}
+
+/**
+ * 用 **Theil–Sen**（两两斜率取中位数）拟合词框中线所在的直线。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么取「框中线」而不是「框底边」
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 词框是**轴对齐**的，而倾斜的墨迹在框里是斜的：一个倾斜长词的框底
+ * 对应的是词**最低的那一端**，框中心才落在词中线在 `x = 中心` 处的值上。
+ * 实测那个 1379px 宽的公式词，两端倾差就有 20px 量级 —— 拿底边拟合，
+ * 长词会被系统性地往下拽（下拽量还随词的宽窄变化），残差判据随之失真。
+ *
+ * 换成框中线后，这个偏差对任意宽度的词都消失了，而且拟合用的量与
+ * 分桶用的量（`centerY`）成了同一个口径 —— 两个判据这才真的可比。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么不是最小二乘
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 一行的词框中线里混着两类"离群点"：
+ *  · 字高不同的词（`g`、`y`、`p` 探到基线以下，框中线被拉低）；
+ *  · 不属于本行的词（角标、分数的分子分母、混进来的图注）。
+ * 最小二乘会被它们整体拽偏（一个离群的词就能把斜率拉动一大截），
+ * 而中位数对"少数点不在线上"天然免疫 —— 只要不到一半的词偏离，
+ * 拟合线就还是这一行的位置。
+ *
+ * 两点距离小于 `BASELINE_MIN_PAIR_DX` 的组合直接不参与：框是像素量化的
+ * 量，近距离算出的斜率全是量化噪声，会把中位数也带偏。
+ *
+ * 点数不足或全是一对近距离点时返回 `null`（调用方一律退回原路径）。
+ */
+function fitBaseline(words: ReadonlyArray<OcrWord>): BaselineFit | null {
+  const points: { x: number; y: number }[] = [];
+  for (const word of words) {
+    if (!word.text.trim()) continue;
+    points.push({ x: centerX(word), y: centerY(word) });
+  }
+  if (points.length < 2) return null;
+
+  const slopes: number[] = [];
+  for (let i = 0; i < points.length; i++) {
+    const a = points[i]!;
+    for (let j = i + 1; j < points.length; j++) {
+      const b = points[j]!;
+      const dx = b.x - a.x;
+      if (Math.abs(dx) < BASELINE_MIN_PAIR_DX) continue;
+      slopes.push((b.y - a.y) / dx);
+    }
+  }
+  if (!slopes.length) return null;
+
+  const slope = median(slopes);
+  const intercept = median(points.map((p) => p.y - slope * p.x));
+  const residual = median(points.map((p) => Math.abs(p.y - (slope * p.x + intercept))));
+  return { slope, intercept, residual };
+}
+
+/**
+ * 一行的**可信**基线：样本干净、词数够、确实倾斜、且词真的落在一条线上。
+ *
+ * 任何一条不满足都返回 `null`（调用方一律退回原路径）：
+ *  · 样本 —— 只用正文大小的词拟合（角标天生离群，见函数体）；
+ *  · 词数 —— 两三个点能过任何直线；
+ *  · 漂移 —— 拟合线在样本跨距上的总漂移要**超过分桶容差**
+ *    （`BASELINE_MIN_DRIFT_RATIO`，行宽归一无尺度，见该常数的说明）。
+ *    平直页面漂移天生小于容差，这是「平直页面上行为逐字节不变」
+ *    这条不变量的守门人；
+ *  · 残差 —— 拟合的是**一条线**，不是一团点。分数 / 分子分母 / 页眉页脚
+ *    混在一起时残差会大过一个正文字高，此时宁可不用基线。
+ *
+ * ⚠️ 残差是**中位数**：它只保证「不到一半的词离群」，对**少数**正文大小的
+ * 离群词是瞎的（两段一上一下错开的碎片，中位残差可以只剩一半行距的
+ * 一半）。要拼两个碎片时不能只靠这一条，见 `mergeTiltedLineFragments`
+ * 的判据 2b。
+ */
+function lineBaseline(words: ReadonlyArray<OcrWord>, pageMainFontSize: number): BaselineFit | null {
+  if (!(pageMainFontSize > 0)) return null;
+
+  /**
+   * 拟合只用**正文大小**的词：角标天生离群（骑在基字上、中心高出
+   * 0.25 倍字号），把它们放进样本只会把中位数往两边拽 —— 实测一个
+   * 300px 长基字 + 一个上标 + 两个正文词的桶里，成对斜率的中位数
+   * 被那一个上标从 0.017 拽到 0.003，整条行的斜率就此报废。
+   *
+   * 全都是小字的行（脚注块、图注行）不能这么办：那样样本会空掉，
+   * 于是小字样本不足 `BASELINE_MIN_WORDS` 时**退回全部词**，
+   * 行为与不做这层过滤时相同。
+   */
+  const maxScriptHeight = pageMainFontSize * SCRIPT_MAX_FONT_RATIO;
+  const fullSize = words.filter((word) => word.fontSize > maxScriptHeight);
+  const sample = fullSize.length >= BASELINE_MIN_WORDS ? fullSize : words;
+  if (sample.length < BASELINE_MIN_WORDS) return null;
+
+  const fit = fitBaseline(sample);
+  let x0 = Infinity;
+  let x1 = -Infinity;
+  for (const word of sample) {
+    if (word.bbox.x0 < x0) x0 = word.bbox.x0;
+    if (word.bbox.x1 > x1) x1 = word.bbox.x1;
+  }
+  if (!fit) return null;
+  if (Math.abs(fit.slope) * (x1 - x0) < SAME_LINE_TOLERANCE * BASELINE_MIN_DRIFT_RATIO) return null;
+  if (fit.residual > pageMainFontSize * BASELINE_MAX_RESIDUAL_RATIO) return null;
+  return fit;
+}
+
+/**
+ * 拟合线之外有没有**正文大小**的词。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么中位残差之外还要这一条
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * Theil–Sen 的中位残差只保证「不到一半的词离群」。两段**一上一下错开**的
+ * 碎片（两栏版面的左右两行、台阶状排布的两行）拼起来时，中位残差可以
+ * 小到一半行距的一半 —— 实测两条各 3 个词的平行行（错开 38px、字号 20）
+ * 拼起来的中位残差只有 4.6px，**过了** 0.35 倍字号的闸门：拟合出的
+ * 「斜率」其实是错位本身凭空造出来的，拼出来的行是两个视觉行。
+ *
+ * 真正的判据是「离群的必须是角标」：角标本来就骑在基字上、天生离群，
+ * 而**正文大小的词离群就说明这两段拼不成一条线**。小字（≤ 0.9 倍
+ * 参考字号）一律放行，这条与全模块判「什么算角标」的口径一致。
+ */
+function offBaselineWords(
+  words: ReadonlyArray<OcrWord>,
+  fit: BaselineFit,
+  pageMainFontSize: number,
+): boolean {
+  const limit = pageMainFontSize * BASELINE_MAX_RESIDUAL_RATIO;
+  const maxScriptHeight = pageMainFontSize * SCRIPT_MAX_FONT_RATIO;
+  return words.some(
+    (word) =>
+      word.fontSize > maxScriptHeight &&
+      Math.abs(centerY(word) - (fit.slope * centerX(word) + fit.intercept)) > limit,
+  );
+}
+
+/**
+ * 贪心分桶：按给定顺序，每个元素并入**第一个**「键值相差不超过容差」的桶，
+ * 否则自成一桶。
+ *
+ * 抽出来共用是因为有两处必须**逐字节同口径**的分桶：
+ *  · `groupWordsIntoLines` 的正式分桶（键 = 中心 y，见 `orderKey`）；
+ *  · `buildWordSlopes` 的斜率估计（同一套桶，好让「这条行到底斜多少」
+ *    和「谁和谁算一行」用的是同一个判据）。
+ * 两处各写一份的话，改了一处忘了另一处就会得到互相矛盾的行模型。
+ */
+function bucketByKey<T>(
+  ordered: readonly T[],
+  keyOf: (item: T) => number,
+  tolerance: number,
+): { groups: T[][]; keys: number[] } {
+  const groups: T[][] = [];
+  const keys: number[] = [];
+  for (const item of ordered) {
+    const key = keyOf(item);
+    let hit = -1;
+    for (let i = 0; i < keys.length; i++) {
+      if (Math.abs((keys[i] ?? 0) - key) <= tolerance) {
+        hit = i;
+        break;
+      }
+    }
+    if (hit >= 0) groups[hit]?.push(item);
+    else {
+      keys.push(key);
+      groups.push([item]);
+    }
+  }
+  return { groups, keys };
+}
+
+/**
+ * 每个词「所在行基线的斜率」（与入参 `words` 下标一一对应）。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么在 `findScriptAnchors` 之前要单独分一次桶
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 角标判据里的纵向比较（「更小 + 更偏上/偏下」）本该相对**拟合基线**量，
+ * 但基线斜率要先有行、行要先有分桶，而正式分桶的入桶键又依赖
+ * `findScriptAnchors` 的绑定结果（见 `orderKey`）—— 互为循环。
+ * 解开的方式是这一次**独立**的平桶（不带绑定、纯按中心 y）：
+ * 倾斜行的每个碎片本身就是一个小桶，桶内的词仍落在同一条线上，
+ * 拟合出的斜率就是该处行基线的斜率。
+ *
+ * 于是判据里的 `centerY` 换成 `centerY − m·x` 即可：`m` 取自**基字**
+ * 所在桶（基字在基线上，它的桶才是可信的斜率来源）。
+ *
+ * ⚠️ 平直页面（拟合线漂移低于分桶容差，见 `BASELINE_MIN_DRIFT_RATIO`）
+ * 得到的全是 0，判据与引入本机制之前**逐字节相同** —— 这是本文件
+ * 反复强调的不变量。
+ */
+function buildWordSlopes(words: OcrWord[], pageMainFontSize: number): number[] {
+  const slopes: number[] = new Array<number>(words.length).fill(0);
+  if (!(pageMainFontSize > 0)) return slopes;
+
+  const indexOfWord = new Map<OcrWord, number>();
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
+    if (word) indexOfWord.set(word, i);
+  }
+
+  const ordered = [...words].sort((a, b) => centerY(a) - centerY(b) || a.bbox.x0 - b.bbox.x0);
+  const { groups } = bucketByKey(ordered, centerY, SAME_LINE_TOLERANCE);
+
+  for (const group of groups) {
+    const fit = lineBaseline(group, pageMainFontSize);
+    if (!fit) continue;
+    for (const word of group) {
+      const index = indexOfWord.get(word);
+      if (index !== undefined) slopes[index] = fit.slope;
+    }
+  }
+
+  return slopes;
+}
+
+/**
+ * 把「同一条倾斜行被切成几段」的几个桶重新并成一行。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么必须补这一步
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * `groupWordsIntoLines` 的分桶判据是「中心 y 相差不超过 5px」——
+ * 只对平直页面成立。扫描件一旦倾斜（书脊弯曲、装订歪、扫描台没摆正），
+ * 一条视觉上完整的行，中心 y 会随 x 漂移，行被切成几段。
+ * 后果不止是行断成两截：`assembleLineText` 要求「角标与基字在同一行」
+ * （它只在行内找基字），基字与指数一旦分属两段，
+ * 上下标判定整条失效，输出退回成平铺文本 —— 这正是不修不行的原因。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 判据：两段拼起来必须**真的是一条直线**，而且平桶根本装不下
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 1. **水平首尾相接**：两段在 x 上不重叠、间隙不超过 1.5 倍正文字高。
+ *    倾斜行的碎片一定彼此紧挨；这条同时把「分数」「跨行分支」挡在外面
+ *    （它们与主行横向**重叠**，是 `mergeContainedBranches` 的活），
+ *    也把隔了很远的另一栏挡在外面。
+ * 2. **拼起来是一条可信的直线**（`lineBaseline`：词数够 + 确实倾斜 +
+ *    残差小）。这一步是真正的判别器：两条平行且都倾斜的相邻行，
+ *    拼起来的残差约等于半个行距（≥ 半个字高），过不了残差闸门；
+ *    而真正被切开的同一条行，拼起来残差只有一两像素。
+ * 2b. **正文大小的词一个都不许离群**（`offBaselineWords`）。上一条的
+ *    残差是**中位数**，判据 1 恰好放行的正是「两段在 x 上首尾相接」的
+ *    组合 —— 两栏版面上左右两行、台阶状排布的两行都长这样，而它们
+ *    拼起来时中位残差可能只剩错位的一半的一半：实测两条各 3 词、
+ *    错开 38px 的平行行，中位残差 4.6px 就过了闸门，凭空「拟合」出
+ *    一条斜率（0.06），把两个视觉行焊成一行。残差是**怎么来的**不重要，
+ *    重要的是谁在离群：角标天生离群（骑在基字上），正文大小的词离群
+ *    就说明这两段不是一条线。
+ * 3. **纵向跨距超过 5px 容差**：不超过的话平桶本来就该把它们装在一起，
+ *    合并没有意义 —— 这条专门保证平直页面的分桶结果**逐字节不变**。
+ *
+ * 参数与输出都用「组」的形式（`words` + 该组在行序里的代表 y），
+ * 未发生任何合并时**原样返回入参的两个数组**。
+ */
+function mergeTiltedLineFragments(
+  buckets: OcrWord[][],
+  keys: number[],
+  pageMainFontSize: number,
+): { buckets: OcrWord[][]; keys: number[] } {
+  if (buckets.length < 2 || !(pageMainFontSize > 0)) return { buckets, keys };
+
+  const xRangeOf = (words: OcrWord[]): [number, number] => {
+    let x0 = Infinity;
+    let x1 = -Infinity;
+    for (const w of words) {
+      if (w.bbox.x0 < x0) x0 = w.bbox.x0;
+      if (w.bbox.x1 > x1) x1 = w.bbox.x1;
+    }
+    return [x0, x1];
+  };
+  const yExtentOf = (words: OcrWord[]): number => {
+    let y0 = Infinity;
+    let y1 = -Infinity;
+    for (const w of words) {
+      if (w.bbox.y0 < y0) y0 = w.bbox.y0;
+      if (w.bbox.y1 > y1) y1 = w.bbox.y1;
+    }
+    return y1 - y0;
+  };
+
+  const gapLimit = pageMainFontSize * TILT_JOIN_GAP_RATIO;
+  const groups: ({ words: OcrWord[]; key: number } | null)[] = buckets.map((words, i) => ({
+    words,
+    key: keys[i] ?? 0,
+  }));
+  let merged = false;
+
+  for (let round = 0; round < groups.length; round++) {
+    let changed = false;
+
+    for (let i = 0; i < groups.length; i++) {
+      const host = groups[i];
+      if (!host) continue;
+
+      for (let j = 0; j < groups.length; j++) {
+        if (i === j) continue;
+        const other = groups[j];
+        if (!other) continue;
+
+        // 判据 1：水平首尾相接（横向重叠的交给 mergeContainedBranches）
+        const [ax0, ax1] = xRangeOf(host.words);
+        const [bx0, bx1] = xRangeOf(other.words);
+        const gap = Math.max(bx0 - ax1, ax0 - bx1);
+        if (!(gap > 0) || gap > gapLimit) continue;
+
+        const union = [...host.words, ...other.words];
+        // 判据 3：平桶装得下的组合不归这里管（保证平直页面逐字节不变）
+        if (yExtentOf(union) <= SAME_LINE_TOLERANCE) continue;
+        // 判据 2：拼起来必须是一条可信的直线
+        const fit = lineBaseline(union, pageMainFontSize);
+        if (!fit) continue;
+        // 判据 2b：正文大小的词一个都不许离群（见 `offBaselineWords`）
+        if (offBaselineWords(union, fit, pageMainFontSize)) continue;
+
+        host.words = union;
+        host.key = fit.intercept + fit.slope * ((ax0 + ax1 + bx0 + bx1) / 4);
+        groups[j] = null;
+        merged = true;
+        changed = true;
+        break;
+      }
+    }
+
+    if (!changed) break;
+  }
+
+  if (!merged) return { buckets, keys };
+  const kept = groups.filter((g): g is { words: OcrWord[]; key: number } => g !== null);
+  return { buckets: kept.map((g) => g.words), keys: kept.map((g) => g.key) };
 }
 
 /**
@@ -1168,6 +1590,18 @@ function findScriptAnchors(words: OcrWord[], pageMainFontSize: number): Map<numb
   // 全行只有一两个词时，「哪个是正常字」本身就无从谈起，宁可不判
   if (words.length < SCRIPT_MIN_LINE_WORDS) return anchors;
 
+  /**
+   * 每个词所在行的基线斜率 —— 判据 2 与判据 5 的纵向比较都要先减去
+   * `m·x` 的倾斜分量（见 `buildWordSlopes`）。平直页面全是 0。
+   *
+   * 取**基字**的斜率（`slopes[j]`）：基字躺在基线上，它的桶才量得出
+   * 这条行的倾斜；角标自己小而偏，单独成桶是量不出东西的。
+   * 这条校正对长基字尤其要紧 —— 实测 `p (1 − p )x+y−2` 这样的公式词
+   * 宽到 1379px，同一个词两端的倾差可以到 20px 量级，
+   * 而判据 2 的门槛本来只有 0.25 倍字号。
+   */
+  const slopes = buildWordSlopes(words, pageMainFontSize);
+
   const maxScriptHeight = pageMainFontSize * SCRIPT_MAX_FONT_RATIO;
   const gapOf = (a: OcrWord, b: OcrWord): number =>
     a.bbox.x0 >= b.bbox.x1 ? a.bbox.x0 - b.bbox.x1 : b.bbox.x0 - a.bbox.x1;
@@ -1193,7 +1627,7 @@ function findScriptAnchors(words: OcrWord[], pageMainFontSize: number): Map<numb
     // 判据 1
     if (!(cand.fontSize > 0) || cand.fontSize > maxScriptHeight) continue;
 
-    const candCenter = centerY(cand);
+    const candCenterRaw = centerY(cand);
     let best = -1;
     let bestGap = Infinity;
 
@@ -1203,7 +1637,12 @@ function findScriptAnchors(words: OcrWord[], pageMainFontSize: number): Map<numb
       if (!base || base.fontSize < cand.fontSize) continue;
 
       // 判据 2：纵向错位。同基线并排的小字错位为 0，在这里被排除
-      const baseCenter = centerY(base);
+      //
+      // 比较在基字所在行的坐标系里做（`y' = y − m·x`，m 取基字的斜率）：
+      // 页面倾斜时右端的词天生更低，不扣掉这一项就会被当成「角标」。
+      const slope = slopes[j] ?? 0;
+      const baseCenter = centerY(base) - slope * centerX(base);
+      const candCenter = candCenterRaw - slope * centerX(cand);
       const isSuper = baseCenter - candCenter >= pageMainFontSize * SCRIPT_SUPER_SHIFT;
       const isSub = candCenter - baseCenter >= pageMainFontSize * SCRIPT_SUB_SHIFT;
       if (!isSuper && !isSub) continue;
@@ -1269,6 +1708,10 @@ function findScriptAnchors(words: OcrWord[], pageMainFontSize: number): Map<numb
 
 function centerY(word: OcrWord): number {
   return (word.bbox.y0 + word.bbox.y1) / 2;
+}
+
+function centerX(word: OcrWord): number {
+  return (word.bbox.x0 + word.bbox.x1) / 2;
 }
 
 // ───────────────────────────────────────────────────────────────
@@ -2085,23 +2528,39 @@ type ScriptKind = 'super' | 'sub';
  * 与 `findScriptAnchors` 的分工：绑定管「它属于哪个基字」（用重叠最多），
  * 这里管「它是上还是下」（用中心错位的方向）。两者分开是因为
  * 一个被绑定的词总要先确定归属，再确定形态。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么比较要在「基线坐标系」里做
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 页面倾斜时，同一行里「右端的词」天生比左端的低 `m·Δx`（m 是行基线斜率）。
+ * 若拿原始 y 去比，这段倾斜会被算进「上下标位移」：一个 `y` 与它的指数
+ * 横向隔开 100px 时，1.5% 的倾斜就能凭空造出 1.5px 的"上移"，
+ * 反过来把该判上标的判丢。所以先把两个词都投到 `y' = y − m·x`
+ * （即"相对拟合基线"的位置）再比。
+ *
+ * `baseline` 为 `null`（平直行 —— 拟合线漂移低于分桶容差，
+ * 见 `BASELINE_MIN_DRIFT_RATIO`）时 `skew()` 恒为 0，
+ * 判据与引入基线之前**逐字节相同**。
  */
 function inferScriptKind(
   word: OcrWord,
   candidate: OcrWord,
   pageMainFontSize: number,
+  baseline?: BaselineFit | null,
 ): ScriptKind | null {
   if (!candidate.text.trim()) return null;
   // 更小才算上下标：同样大小的词一律不碰
   if (candidate.fontSize > pageMainFontSize * SCRIPT_MAX_FONT_RATIO) return null;
 
-  const candCenter = centerY(candidate);
-  const baseCenter = centerY(word);
+  const skew = (w: OcrWord): number => (baseline ? baseline.slope * centerX(w) : 0);
+  const candCenter = centerY(candidate) - skew(candidate);
+  const baseCenter = centerY(word) - skew(word);
 
   // 上标：中心明显上移，且整体骑在基字中线之上（更严）
   if (
     baseCenter - candCenter >= pageMainFontSize * SCRIPT_SUPER_SHIFT &&
-    candidate.bbox.y1 <= baseCenter
+    candidate.bbox.y1 - skew(candidate) <= baseCenter
   ) {
     return 'super';
   }
@@ -2225,6 +2684,14 @@ function assembleLineText(
   }
 
   const pageMainFontSize = dominantFontSize(allWords);
+  /**
+   * 本行的拟合基线（拿不到 → `null` → 全部退回原判据）。
+   *
+   * 只有**这一行自己**量得到可信倾斜时才用：平直行的拟合线漂移低于
+   * 分桶容差（`BASELINE_MIN_DRIFT_RATIO`），`lineBaseline` 返回 `null`，
+   * 于是 `inferScriptKind` 收到的偏移量恒为 0 —— 与引入基线之前逐字节相同。
+   */
+  const baseline = lineBaseline(words, pageMainFontSize);
   let text = '';
   let scriptCount = 0;
 
@@ -2269,7 +2736,7 @@ function assembleLineText(
 
     const attached = scripts.get(anchor);
     if (!attached?.includes(word)) return false;
-    return attached.some((s) => inferScriptKind(anchor, s, pageMainFontSize) !== null);
+    return attached.some((s) => inferScriptKind(anchor, s, pageMainFontSize, baseline) !== null);
   };
 
   for (const word of words) {
@@ -2327,7 +2794,7 @@ function assembleLineText(
     const sorted = [...attached].sort((a, b) => a.bbox.x0 - b.bbox.x0);
     const kind =
       sorted
-        .map((s) => inferScriptKind(word, s, pageMainFontSize))
+        .map((s) => inferScriptKind(word, s, pageMainFontSize, baseline))
         .find((k): k is ScriptKind => k !== null) ?? null;
     if (!kind) continue;
 
