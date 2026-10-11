@@ -602,15 +602,38 @@ export async function ocrParsePdf(
          * 换算正是最容易悄悄出错的一环。
          *
          * 放在识别之后还有一个好处：模型没取到 / 推理抛错 / 结果异常时，
-         * `analyzePageLayout` 返回 null，这一页照常出结果，
+         * `analyzePageLayout` 报 `ok: false`（**七种原因各有稳定的 code**，
+         * 见 `layoutAnalysis.LAYOUT_SKIP_CODES`），这一页照常出结果，
          * 只是退回既有的几何启发式。**版面分析没有能力让识别失败** ——
          * 这是本方案的前提，也是它敢默认开启的理由。
+         *
+         * ⚠️ 这里**同时**收下 `outcome` 并原样带进这一页的导出结构
+         * （`ocrStructure.buildOcrStructure` 的 `layout` 字段）。
+         * 用户看不到控制台，所以「这次到底是不是版面模型干的」必须能从
+         * 导出的 JSON 里读出来 —— 否则 `HANDOFF.md` §5.11.7 那条
+         * 「版面模型从未在真实数据上推理过」就永远无法用数据追问。
+         *
+         * ⚠️ 失败时交给下游的仍然是 `undefined`（不是空数组、不是空对象）：
+         * 下游的 `layoutRegions?:` 是可选参数，缺席就走接入前那条老路，
+         * 「无版面信息时输出逐字节相同」这条不变量因此是**结构上成立**的。
          */
         noteOcrStage('layout', `第 ${pageNum} 页：版面分析`);
-        const layout = await analyzePageLayout(pageCanvas);
+        const { result: layout, outcome: layoutOutcome } = await analyzePageLayout(pageCanvas);
+        /**
+         * ⚠️ 这里**刻意保留原来的 `layout?.regions` 写法**，不改成
+         * `layoutOutcome.ok && layout.regions`。
+         *
+         * 理由：`layout` 的类型仍是 `LayoutAnalysisResult | null`（`result`
+         * 字段本身可空），而**「有区域」这件事本来就是由 `layout` 自己
+         * 表达的**。多加一个标志位判断只会多一个可能不一致的地方，
+         * 而且会让这行与改动前不再逐字对应 —— 而不变量要求它对应。
+         * `outcome` 只进导出，不参与任何判定。
+         */
         noteOcrStage(
           'layout-done',
-          `第 ${pageNum} 页：版面分析${layout ? `得到 ${layout.regions.length} 个区域` : '不可用，回退几何启发式'}`,
+          `第 ${pageNum} 页：版面分析${
+            layout ? `得到 ${layout.regions.length} 个区域` : `不可用（${layoutOutcome.code}），回退几何启发式`
+          }`,
         );
 
         /**
@@ -655,7 +678,13 @@ export async function ocrParsePdf(
           pageCanvas.height,
           // 只在有人要的时候才构造结构对象（见 `ocrResultToBlocks` 的说明）
           onPageStructure,
+          // ⚠️ 失败时给 `undefined`（**不是**空数组）：`layoutRegions` 是可选
+          // 参数，缺席即走接入前的老路。这条是「无版面信息时输出逐字节相同」
+          // 这个不变量在结构上的落点。`layout?.regions` 与改动前**逐字相同**。
           layout?.regions,
+          // 版面分析的结果码进导出 —— 用户看不到控制台，
+          // 「页眉被多滤掉一行到底是不是版面模型干的」只能靠它回答。
+          layoutOutcome,
         );
         if (blocks.length) {
           allDrafts.push(...blocks);

@@ -33,6 +33,16 @@ import {
   type AttachedChars,
   type CharSizeTable,
 } from '@/lib/ocrCharBoxes';
+// 版面分析的结果码。**只取类型与「结果 → 导出字段」两个纯函数** ——
+// 本文件不读 `getPageLayoutAnalysis()` 那个模块级记录，理由见下面 `layout` 字段。
+import {
+  LAYOUT_SKIP_CATALOG,
+  layoutOutcomeCode,
+  layoutOutcomeDetail,
+  type LayoutAnalysisOutcome,
+  type LayoutOutcomeCode,
+  type LayoutSkipCodeInfo,
+} from '@/lib/layoutAnalysis';
 
 /** 一个词在页面上的原始形态（字段名刻意取短，便于阅读与对比） */
 export interface OcrStructureWord {
@@ -237,6 +247,94 @@ export interface OcrStructure {
   blocks: { type: string; content: string; hasInlineMath: boolean }[];
   /** 体积控制的如实说明：被裁掉多少、以及为什么 */
   truncated: { wordsDropped: number; linesDropped: number; charBudget: number };
+  /**
+   * 本页**版面分析**的结果（是否用上了版面模型 / 没用上的话是为什么）。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * 为什么这个字段必须存在（本次任务的要点）
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 用户看不到浏览器控制台 —— 而 `analyzePageLayout()` 此前把**七种**
+   * 互不相同的原因全都写进 `console.warn` 后 `return null`。于是用户报
+   * 「页眉被多滤掉一行」时，谁也没法判断那是版面模型干的还是几何启发式干的：
+   * 前者意味着一个**从未在真实数据上跑过推理**的组件（`HANDOFF.md` §5.11.7）
+   * 动了正文，后者只是老问题。
+   *
+   * 有了 `code`，「是不是版面模型干的」这个问题在**第一页导出的 JSON 里**
+   * 就能回答，不需要控制台、不需要复现步骤、不需要猜。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * 为什么 `code` 是 `'none'` 而不是 `null`（「没有字段 ≠ 字段为空」）
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 本项目的既有规则是**拿不到的东西就不写字段**（拿不到字符框的词不写
+   * `chars`，见 `OcrStructureWord.chars`），而不是写一个空值 —— 因为
+   * 「字段不存在」与「字段存在但是空的」是两件不同的事，后者是一个结论。
+   * 这里沿用同一原则，三个状态各有确切含义：
+   *
+   *   | 导出里的样子                    | 含义                                     |
+   *   |---------------------------------|------------------------------------------|
+   *   | **没有 `layout` 字段**          | 这一页**根本没接版面分析**（调用方没传） |
+   *   | `layout.code === 'none'`        | 接了、跑了、**成功了**，区域就是模型给的 |
+   *   | `layout.code === '<某个码>'`    | 接了、**失败了**，这一页走的是几何启发式 |
+   *
+   * 也就是说：**「没用上」不是「没有这个字段」**。前者是 `used: false` 的
+   * 一个真实结论，后者是「没试过」。把两者混成同一个形状，就等于把
+   * 「开关关着」与「没人调用」混为一谈 —— 那正是本次要消灭的那种含糊。
+   *
+   * ⚠️ **按 `code` 分支，不要按 `meaning` / `nextAction` 分支。**
+   * 后两者是给人看的散文（照 MinerU 那条「不要按 message 里的散文分支」），
+   * 措辞随时可能改；`code` 才是稳定契约。类型是 `LayoutOutcomeCode`，
+   * 写错在 `tsc -b` 就报错。
+   */
+  layout?: OcrStructureLayout;
+}
+
+/**
+ * `OcrStructure.layout` 的确切形状。
+ *
+ * ⚠️ **刻意不是「每个码一段说明」的完整字典**：那会让每一页导出都背上
+ * 一份静态文案（`codeMeanings` 里全是同一批句子）。这里给的是
+ * 「**本次实际用到的那个码**」的说明 —— 导出是拿来读的，读者要的是
+ * 「这一页为什么没用上、我该做什么」，不是一本手册。
+ *
+ * 三种状态与 `OcrStructure.layout` 的注释完全一致，这里只补齐类型细节。
+ */
+export interface OcrStructureLayout {
+  /** 真 = 这一页的区域来自版面模型；false = 走了既有几何启发式 */
+  used: boolean;
+  /**
+   * 稳定的结果码：`'none'` = 成功。
+   *
+   * ⚠️ **`used === false` 时这个字段一定有值**（不是 null、不是 undefined）——
+   * 因为「失败」与「没试过」已经由「有没有 `layout` 字段」区分掉了，
+   * 走到了这里就一定试过，试过就一定有一个码。
+   */
+  code: LayoutOutcomeCode;
+  /** 成功时：模型给了几个区域 */
+  regionCount?: number;
+  /** 成功时：区域坐标所在画布的尺寸（与 `canvasHeight` 同一坐标系） */
+  width?: number;
+  height?: number;
+  /**
+   * 失败时：**本次这一条**的具体细节（截断到 200 字符）。
+   *
+   * 用来把「同一个码覆盖的多个失败点」分开 —— 例如
+   * `no_regions_detected` 的三个来源靠它区分（见 `meaningOfCode` 的 `sites`）。
+   * 没有细节时**不写这个字段**（同上：没有字段 ≠ 字段为空字符串）。
+   */
+  detail?: string;
+  /** `code` 的中文含义（给人看，不是判据） */
+  meaning?: string;
+  /** `code` 对应的下一步动作（给人看，不是判据） */
+  nextAction?: string;
+  /** 该码覆盖多个失败点时，逐条点明是哪几个（给人看，不是判据） */
+  sites?: string[];
+}
+
+/** 取一个码的说明；用不到的信息不写进导出（保持导出可读、体积可控） */
+function describeCode(code: LayoutOutcomeCode): LayoutSkipCodeInfo {
+  return LAYOUT_SKIP_CATALOG[code];
 }
 
 /**
@@ -288,6 +386,24 @@ export function buildOcrStructure(input: {
   blocks: Omit<ContentBlock, 'id'>[];
   thresholds?: Partial<OcrStructure['thresholds']>;
   charBudget?: number;
+  /**
+   * 本页版面分析的结果。**不传就不写 `layout` 字段**（留下「没试过」这个状态）。
+   *
+   * ⚠️ 为什么是**显式入参**，而不是在本函数里读 `getPageLayoutAnalysis()`：
+   *
+   *  1. **确定性。** 读模块级记录意味着导出的内容取决于「谁在什么时候调用过
+   *     `analyzePageLayout`」。本函数的注释第一行就写着它是**纯函数** ——
+   *     一旦去读全局，这条性质就没了，而「纯」正是它的测试能成立的前提
+   *     （`ocrStructure.charSize.test.ts` 全部依赖这一点）。
+   *  2. **「导出的是哪一次」必须无歧义。** 传进来的是调用方**当页那一次**
+   *     收到的 `outcome`（`pdfParser` 里与 `layout` 同一个 `await` 的解构结果），
+   *     所以不存在「每页多次调用时导出的是哪一次」这个问题 —— 它就是
+   *     「这一页那一次」。若改成读全局，答案会变成「最后一次调用」，
+   *     而那是时序的产物，不是事实。
+   *  3. **`used: false` 与「没字段」因此可以精确表达**：传了 → 写字段（附码）；
+   *     没传 → 不写字段。全局记录做不到这个区分（读不到与「没试过」同形）。
+   */
+  layout?: LayoutAnalysisOutcome;
 }): OcrStructure {
   const budget = input.charBudget ?? OCR_STRUCTURE_CHAR_BUDGET;
 
@@ -550,6 +666,46 @@ export function buildOcrStructure(input: {
       linesDropped: lineEntries.length - keptLines.length,
       charBudget: budget,
     },
+    /**
+     * 版面分析的结果。**`input.layout` 为 undefined 时整个字段缺席** ——
+     * 与上面的原则一致：「没试过」不是「试过但为空」。三种状态见
+     * `OcrStructure.layout` 的注释（这是本次任务要「看得见」的那个字段）。
+     */
+    ...(input.layout ? { layout: layoutOf(input.layout) } : {}),
+  };
+}
+
+/**
+ * 结果 → 导出字段。
+ *
+ * 教训来自 `charBoxSkips` 与 `buildId` 这两处：诊断信息必须是**可读的结论**，
+ * 而不是「一个需要回源码查表才知道什么意思的码」。用户不会去翻 GitHub，
+ * 所以该码的**含义**与**下一步动作**跟着一起进导出。
+ *
+ * ⚠️ 随码带进来的 `meaning` / `nextAction` / `sites` 是**给人看的散文**，
+ * 不是判据 —— 代码里任何地方都不得按它们分支（按 `code`）。
+ * 这也是为什么它们放在同一个对象里却排在 `code` 之后。
+ */
+function layoutOf(outcome: LayoutAnalysisOutcome): OcrStructureLayout {
+  const code = layoutOutcomeCode(outcome);
+  const detail = layoutOutcomeDetail(outcome);
+  const info = describeCode(code);
+
+  return {
+    used: outcome.ok,
+    code,
+    // 成功才有区域数/尺寸；失败时这两项没有意义，**不写**（不是写 0）
+    ...(outcome.ok
+      ? {
+          regionCount: outcome.regionCount,
+          width: outcome.width,
+          height: outcome.height,
+        }
+      : {}),
+    ...(detail ? { detail } : {}),
+    meaning: info.meaning,
+    nextAction: info.nextAction,
+    ...(info.sites ? { sites: [...info.sites] } : {}),
   };
 }
 

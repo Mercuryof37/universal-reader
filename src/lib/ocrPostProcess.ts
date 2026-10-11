@@ -19,6 +19,7 @@ import {
   detectColumns,
   furnitureRegionOfLine,
   readingOrderKeys,
+  type LayoutAnalysisOutcome,
   type LayoutRegion,
 } from '@/lib/layoutAnalysis';
 import {
@@ -517,12 +518,22 @@ function applyPiecewiseRecovery(lines: OcrLine[], allWords: OcrWord[]): OcrLine[
  *   硬性不变量，由 `applyLayoutToLines` 的三条闸门保证。
  *   放在 `onStructure` **之后**：回调在前、可选增强在后，
  *   既有的三参数调用点一个都不用改。
+ * @param layoutOutcome 本页版面分析的结果码（含成功 `'none'`）。
+ *   **与 `layoutRegions` 是两个独立维度，刻意不合并**：
+ *     · `layoutRegions === undefined` 但 `layoutOutcome` 有值 → 试过了但失败了，
+ *       `outcome` 说明为什么（这正是本次要修的东西）；
+ *     · `layoutRegions` 有值 → 必然伴随 `outcome.ok === true`；
+ *     · 两者都不传 → 调用方根本没接版面分析（导出里**不写** `layout` 字段）。
+ *   不合并的理由：区域是**数据**、结果是**元数据**，前者参与判定、后者只进导出。
+ *   把两者塞进一个参数会让「有 outcome 但没 regions」这种合法状态无法表达。
+ *   **本参数不影响任何判定** —— 它只在 `onStructure` 里落成 `layout` 字段。
  */
 export function ocrResultToBlocks(
   result: OcrPageResult,
   pageHeight?: number,
   onStructure?: (structure: OcrStructure) => void,
   layoutRegions?: readonly LayoutRegion[],
+  layoutOutcome?: LayoutAnalysisOutcome,
 ): Omit<ContentBlock, 'id'>[] {
   // 关键兜底：拿不到词级坐标时，用纯文本也要产出内容。
   // 否则就会出现"识别出 7058 字却报告什么都没识别到"这种荒唐结果。
@@ -809,6 +820,13 @@ export function ocrResultToBlocks(
           baselineMaxResidualRatio: BASELINE_MAX_RESIDUAL_RATIO,
           tiltJoinGapRatio: TILT_JOIN_GAP_RATIO,
         },
+        /**
+         * 本页版面分析的结果码 —— 直接来自调用方收到的 `outcome`，
+         * **不读模块级旁挂记录**。理由见 `buildOcrStructure` 的 `layout` 说明：
+         * 显式传入让「导出的是哪一次」不依赖时序，`ocrStructure.test.ts`
+         * 也因此能在不跑 OCR 的前提下构造这个字段。
+         */
+        layout: layoutOutcome,
       }),
     );
   }
