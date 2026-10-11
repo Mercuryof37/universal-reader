@@ -4,6 +4,8 @@ import tailwindcss from '@tailwindcss/vite';
 import { VitePWA } from 'vite-plugin-pwa';
 import { fileURLToPath } from 'node:url';
 
+import { DEFAULT_MODEL_TIER, modelCacheName } from './src/lib/modelCacheTiers';
+
 export default defineConfig({
   /**
    * 构建标识，注入成全局常量 `__BUILD_ID__`。
@@ -213,7 +215,7 @@ export default defineConfig({
           },
           {
             /**
-             * PaddleOCR 模型文件（检测 + 识别 + 字典，合计约 30MB）。
+             * PaddleOCR 模型文件（检测 + 识别 + 字典 + 版面，合计约 34.6MB）。
              *
              * **默认来源是同源 `/ocr-models/`**（构建时由 fetch-ocr-models.mjs
              * 取好放进 public/），因此这条同源规则才是实际生效的那条。
@@ -221,13 +223,35 @@ export default defineConfig({
              * 换回官方源或自建镜像 —— 漏掉任一来源，那批用户就会
              * 「用过一次也还是不能离线用」。
              *
-             * 不放进预缓存：30MB 会让首访安装体积暴涨，而 OCR 是可选功能。
+             * 不放进预缓存：35MB 会让首访安装体积暴涨，而 OCR 是可选功能。
              * CacheFirst 让「用过一次之后离线也能用」。
+             *
+             * ═══════════════════════════════════════════════════════
+             * ⚠️ 缓存名是**档位化**的：`modelCacheName(tier)`
+             * ═══════════════════════════════════════════════════════
+             *
+             * 「这份资产是在哪个质量档位下取的」必须能从缓存身份上看出来。
+             * 四个文件的 URL 在档位之间是**同一个**（`fast` 档只是不请求版面
+             * 模型），所以区分只能落在缓存名上：
+             *
+             *   standard（默认） → `ocr-models`            ← 与改动前同名
+             *   fast            → `ocr-models-fast-v1-xxxxxxxx`
+             *
+             * 默认档位保持裸名，是为了**不动用户已有的那份缓存**
+             * （不变量：默认档位的行为与改动前相同）。
+             * 指纹是「资产集合的内容身份」，不是构建号 —— 构建号每次部署都变，
+             * 会把同源同内容的缓存判成过期，用户每升一次版本就重下 35MB。
+             *
+             * `ensureModelTierAssets()`（src/lib/modelCacheTiers.ts）会把资产
+             * 直接写进**同名**缓存，因此离线时本条路由能直接命中。
+             * 换档位时由 `cleanupStaleModelCaches()` 清掉别的档位那一份 ——
+             * 它只认 `ocr-models` 前缀，不会碰 html-navigation / tess-assets
+             * / pdfjs-wasm / onnx-wasm 与 Workbox 的 precache。
              */
             urlPattern: /(\/ocr-models\/)|(^https:\/\/(huggingface\.co|hf-mirror\.com)\/)/,
             handler: 'CacheFirst',
             options: {
-              cacheName: 'ocr-models',
+              cacheName: modelCacheName(DEFAULT_MODEL_TIER),
               expiration: { maxEntries: 30, maxAgeSeconds: 60 * 60 * 24 * 365 },
               cacheableResponse: { statuses: [0, 200] },
             },

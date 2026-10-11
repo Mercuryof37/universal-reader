@@ -16,10 +16,19 @@ import type { ContentBlock } from '@/types/content';
 import type { OcrChar, OcrWord, OcrPageResult } from '@/lib/ocrTypes';
 import { buildOcrStructure, type OcrStructure } from '@/lib/ocrStructure';
 import {
+  compareLayoutAndGeometricDecisions,
   detectColumns,
   furnitureRegionOfLine,
+  geometricHeadingClaim,
+  headingDisposition,
+  lineLabelFromWords,
   readingOrderKeys,
+  summarizeLayoutDecisions,
+  type GeometricFurnitureVerdict,
+  type HeadingDisposition,
   type LayoutAnalysisOutcome,
+  type LayoutDecisionRow,
+  type LayoutDecisionSummary,
   type LayoutRegion,
 } from '@/lib/layoutAnalysis';
 import {
@@ -33,6 +42,42 @@ import {
 } from '@/lib/ocrCharBoxes';
 import { getTesseractEvidence } from '@/lib/ocrTesseractScripts';
 import { planPiecewise } from '@/lib/ocrPiecewise';
+
+/**
+ * 内部标记键（`Symbol`）—— 见 `OcrLine[LAYOUT_LABEL]` 的说明。
+ *
+ * ⚠️ 用 `Symbol()` 而不是 `Symbol.for()`：全局注册表里的符号会被
+ * 同名约定悄悄共享，而这两个键**只属于本模块**。
+ */
+const LAYOUT_LABEL = Symbol('universal-reader/layoutLabel');
+
+/**
+ * 「行 → 它主要落在哪个版面类别区域里」的映射（T3）。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么是 `WeakMap` 而不是给 `OcrLine` 加一个普通字段
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * `OcrLine` 出现在若干 `JSON.stringify` 比对里（诊断日志与单元测试），
+ * 加一个普通字段会改变那些字符串 —— 而不变量要求「模型缺席时逐字节
+ * 相同」，一旦有人在 `regions` 为空时也加上字段，那条不变量就静默破了。
+ * `WeakMap` **完全不碰对象形状**，也不阻止行被回收。
+ *
+ * ⚠️ 依赖同一个判据函数 `lineLabelFromWords`，与 `applyLayoutToLines`
+ * 里打的 `[LAYOUT_LABEL]` 标记**同源**。两份实现会漂移，漂移的表现是
+ * 「被摘掉的行」与「被免判标题的行」对不上，比不判更难查。
+ */
+function buildLineLabelMap(
+  lines: readonly OcrLine[],
+  regions: readonly LayoutRegion[],
+): WeakMap<OcrLine, string> {
+  const map = new WeakMap<OcrLine, string>();
+  for (const line of lines) {
+    const match = lineLabelFromWords(line, regions);
+    if (match) map.set(line, match.label);
+  }
+  return map;
+}
 
 interface OcrLine {
   words: OcrWord[];
@@ -59,6 +104,35 @@ interface OcrLine {
    * 有标记才能把判断依据一并说清楚（见 `filterHeaderFooter`）。
    */
   isPageFurniture?: boolean;
+  /**
+   * 本行主要落在**哪一个版面类别区域**里（T3 用）。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * 为什么用 `Symbol` 而不是普通字符串键
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * `OcrLine` 有两个出口会被**逐字节**比对：
+   *   · `pageLayoutInvariant.golden.ts` 的 golden（`JSON.stringify` 比对）；
+   *   · 本文件里多处 `JSON.stringify(line)` 形态的诊断与断言。
+   * `JSON.stringify` **会**序列化普通字符串键，**不会**序列化 `Symbol` 键 ——
+   * 所以加上这个字段对任何既有序列化结果都是**零影响**，而不变量
+   * （「拿不到版面信息时输出逐字节相同」）因此在结构上成立，
+   * 不用靠「记得别把它写进导出」这种人的纪律。
+   *
+   * ⚠️ **不变量**：`applyLayoutToLines` 在 `regions` 为空时**一个字段都不加**
+   * （第一行就 `return lines`），所以模型缺席时这个键**根本不存在**。
+   *
+   * 取值来自 `lineLabelFromWords`（行内过半数的词落在同一个区域）——
+   * 与 `furnitureRegionOfLine` 同一套计票，因此「被摘掉的行」与
+   * 「被免判标题的行」不可能对不上。
+   *
+   * ⚠️ **可选**（`?`）：用来构造 `OcrLine` 的地方有十余处（`groupWordsIntoLines`
+   * 的桶、构件合并、分段函数重组……），要求每一处都写上这个字段会逼着
+   * 那些**与版面无关**的构造点去关心版面 —— 而它们本来就不该知道这件事。
+   * `?` 的表达力刚好：**「可能没有」是这一层的常态**（模型缺席、模型没框住
+   * 这一行、这一行是重组出来的），而「有」只在 `applyLayoutToLines` 里发生。
+   */
+  [LAYOUT_LABEL]?: string | undefined;
   /**
    * 本行已被重组为一段独立公式（跨行大括号分段函数，见 `lib/ocrPiecewise.ts`）。
    *
@@ -534,6 +608,7 @@ export function ocrResultToBlocks(
   onStructure?: (structure: OcrStructure) => void,
   layoutRegions?: readonly LayoutRegion[],
   layoutOutcome?: LayoutAnalysisOutcome,
+  onLayoutApplication?: (report: LayoutPageReport) => void,
 ): Omit<ContentBlock, 'id'>[] {
   // 关键兜底：拿不到词级坐标时，用纯文本也要产出内容。
   // 否则就会出现"识别出 7058 字却报告什么都没识别到"这种荒唐结果。
@@ -558,10 +633,48 @@ export function ocrResultToBlocks(
   // 下面的每一步都与接入前逐字节相同 —— 版面分析绝不参与「识别是否成功」。
   // 分段函数（跨行大括号）的版面重组：必须在成行与版面重排**之后**做，
   // 因为要判的正是「这几段最终被排成了什么」；没有可信构造时原样返回。
-  const lines = applyPiecewiseRecovery(
-    applyLayoutToLines(heuristicLines, layoutRegions, pageHeight),
-    result.words,
-  );
+  const layoutApplied = applyLayoutToLines(heuristicLines, layoutRegions, pageHeight);
+  const lines = applyPiecewiseRecovery(layoutApplied.lines, result.words);
+
+  /**
+   * ═══════════════════════════════════════════════════════════════
+   * T3：这一行落在哪个**版面类别**区域里 —— 用于标题判定
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 只在**真的拿到区域**时构造这份映射。模型缺席时它是 `undefined`，
+   * 而下面每一处使用都经由 `layoutLabelOf?.get(...)` —— 于是「没有版面
+   * 信息」这条路径上**一个分支都不会进入**，输出与接入前逐字节相同。
+   *
+   * ⚠️ 为什么是 `WeakMap<OcrLine, string>` 而不是给行加普通字段：
+   * `OcrLine` 会出现在若干 `JSON.stringify` 比对里（诊断与测试），
+   * 加普通字段会改变那些字符串。`WeakMap` 完全不碰对象形状，
+   * 也不阻止行被回收。
+   *
+   * ⚠️ 与 `applyLayoutToLines` 里打的 `[LAYOUT_LABEL]` 标记**同源**：
+   * 两边都调 `lineLabelFromWords`（同一套「行内过半数词」计票）。
+   * 为什么不直接用那个标记：`applyPiecewiseRecovery` 会**重建**部分行
+   * 对象（摘走分支词的那些），重建出来的行没有标记 —— 而它们恰恰是
+   * 「跨行大括号」这个痛点里的行，正是最需要判定的地方。用 `WeakMap`
+   * 在这里现算一遍，口径相同而覆盖面更全。
+   */
+  const layoutLabelOf =
+    layoutRegions?.length && lines.length ? buildLineLabelMap(lines, layoutRegions) : undefined;
+
+  /**
+   * 取某一行的版面类别。**模型缺席时恒为 `undefined`** —— 这是不变量
+   * 在那条路径上成立的结构性理由（不存在「读到上一页残留值」的可能，
+   * 因为映射本身就没被构造）。
+   */
+  const labelOfLine = (line: OcrLine): string | undefined => layoutLabelOf?.get(line);
+
+  /**
+   * T3 的**逐类别作用计数**：哪一类真的改变了哪一次判定。
+   *
+   * 与 `layoutApplied.report.headingUse` 共享同一个对象引用，
+   * 因此 `ocrResultToBlocks` 返回后调用方能读到真实次数，而不是一个
+   * 永远为空的统计。模型缺席时它就是空对象，也不会有任何一行写进去。
+   */
+  const headingUse = layoutApplied.report.headingUse;
 
   const gaps: number[] = [];
   for (let i = 1; i < lines.length; i++) {
@@ -592,6 +705,18 @@ export function ocrResultToBlocks(
    * 一个块里可能第一行是公式、后面跟着正文，拿整段判就会两头都错。
    */
   let currentFirstText = '';
+  /**
+   * 本块**第一行**落在哪个版面类别区域里（T3）。
+   *
+   * ⚠️ 与 `currentFirstText` 严格配对：标题是**单行**的东西，
+   * 所以类别也必须取**同一行**的。若取整块里任意一行的类别，
+   * 一个「首行是公式、后面是正文」的块会两头都判错。
+   * `undefined` 有两层含义（都归结为「不表态」）：
+   *   · 模型缺席（`layoutLabelOf` 为 undefined）；
+   *   · 模型在，但这一行没有任何类别区域覆盖到它。
+   * 两种情况下 `headingDisposition` 都直接放行到既有几何路径。
+   */
+  let currentFirstLabel: string | undefined;
   let prevY: number | null = null;
   /** 上一行的原始行：回卷续行判据要看它的右缘与行尾标点 */
   let prevLine: OcrLine | null = null;
@@ -600,13 +725,66 @@ export function ocrResultToBlocks(
   const flushParagraph = (): void => {
     if (!currentText.trim()) return;
     const avgConf = currentConfCount > 0 ? currentConfSum / currentConfCount : 0;
-    // ⚠️ 这里用 currentFirstText（**本块第一行**）而不是 currentText：
-    // 标题是**单行**的东西，而拼到现在的整段文本可能已经把后面几行
-    // 并了进来。拿整段去判就会两头都错。
-    const isHeading =
-      currentFontSize > medianFontSize * HEADING_FONT_RATIO &&
-      currentFirstText.trim().length <= HEADING_MAX_CHARS &&
-      looksLikeHeading(currentFirstText);
+    /**
+     * ⚠️ 这里用 currentFirstText（**本块第一行**）而不是 currentText：
+     * 标题是**单行**的东西，而拼到现在的整段文本可能已经把后面几行
+     * 并了进来。拿整段去判就会两头都错。
+     *
+     * ═══════════════════════════════════════════════════════════════
+     * T3：标题判定 = **一次主张** + **一次否决**
+     * ═══════════════════════════════════════════════════════════════
+     *
+     * 判据本身在 `layoutAnalysis`（`geometricHeadingClaim` 与
+     * `headingDisposition`，完整理由在它们的注释里）。这里只说**复合方式**，
+     * 它刻意写成两步而不是把两个函数的结果 `||` 起来：
+     *
+     *   1. **主张**：这一行会不会被判成标题。
+     *      两条证据链**只在这个函数里**汇合，于是字号闸门与长度闸门
+     *      （`maxChars`）对两条链**一律生效** —— 这是第一版的教训：
+     *      当时把「模型确认」单独写成 `rule 存在 → true`，于是
+     *      **长度闸门被绕过了**，一行 30+ 字的长文本也能变标题
+     *      （用例「模型说是标题、但文本太长」当场变红）。
+     *   2. **否决**：模型说「这是公式 / 正文」时，把主张压成 `false`。
+     *      ⚠️ 这一步传入的 `layoutLabel` 是 **`undefined`**：
+     *      否决要走**改造前那条判据**去算「几何本来想不想要标题」，
+     *      不能借用「模型确认为标题」那条链，否则会自己否决自己。
+     *
+     * ⚠️ `layoutLabelOf` 为 `undefined`（模型缺席）时，第 2 步不发生、
+     * 第 1 步退化成改造前那条表达式（由
+     * `layoutCategoryUse.test.ts` 的「逐例相同」用例钉住）。
+     */
+    const claim = geometricHeadingClaim(
+      currentFirstText,
+      currentFontSize,
+      medianFontSize,
+      { fontRatio: HEADING_FONT_RATIO, maxChars: HEADING_MAX_CHARS },
+      looksLikeHeading,
+      currentFirstLabel,
+    );
+    const disposition: HeadingDisposition | undefined = layoutLabelOf
+      ? headingDisposition(
+          currentFirstLabel,
+          currentFirstText,
+          currentFontSize,
+          medianFontSize,
+          { fontRatio: HEADING_FONT_RATIO, maxChars: HEADING_MAX_CHARS },
+          // ⚠️ 传**真的**那个文本判据。默认值是一律为真，而那会让
+          // 「模型说 text → 否决」误伤几何本来就不判标题的行 ——
+          // 见 headingDisposition 的注释（「声称生效但没生效的判据」）。
+          looksLikeHeading,
+        )
+      : undefined;
+    const isHeading = disposition?.allowed === false ? false : claim.heading;
+    /**
+     * 逐类别计数：**只统计真的说出了结论的那一次**。
+     *
+     * 为什么不统计「规则被求值过几次」：那是个没有信息量的数（每块都会
+     * 求值）。有意义的问题是「哪一类把哪一次判定改掉了」，因为它才对应
+     * 一条真实存在的输出差异。
+     */
+    if (disposition?.rule !== undefined) {
+      headingUse[disposition.rule] = (headingUse[disposition.rule] ?? 0) + 1;
+    }
 
     blocks.push({
       type: isHeading ? 'heading' : 'paragraph',
@@ -641,6 +819,10 @@ export function ocrResultToBlocks(
       });
       currentText = '';
       currentFirstText = '';
+      // 与 `currentFirstText` 同步清空：留着上一块的类别会让**下一块**
+      // 的标题判定读到一个不属于它的类别（那是「读到残留值」这种
+      // 本项目已经吃过亏的假保护形态）。
+      currentFirstLabel = undefined;
       currentConfSum = 0;
       currentConfCount = 0;
       currentScripts = 0;
@@ -754,6 +936,9 @@ export function ocrResultToBlocks(
       flushParagraph();
       currentText = line.text;
       currentFirstText = line.text;
+      // ⚠️ 类别必须与本块第一行**配对**：`flushParagraph` 判标题时读的是
+      // `currentFirstText`，所以类别也只能是这一行的（见 `currentFirstLabel`）。
+      currentFirstLabel = labelOfLine(line);
       currentConfSum = line.avgConfidence * line.words.length;
       currentConfCount = line.words.length;
       currentFontSize = line.fontSize;
@@ -775,6 +960,17 @@ export function ocrResultToBlocks(
   }
 
   flushParagraph();
+
+  /**
+   * ⚠️ 报告必须在**所有段落都收束之后**才交出去：`headingUse` 是在
+   * `flushParagraph` 里逐块累加的，提前交出去会得到一个「只统计了前半页」
+   * 的数 —— 而那种数看起来是完整的。
+   *
+   * 放在 `onStructure` **之前**：`onStructure` 是导出通道（用户可见的
+   * JSON），这个回调是**诊断通道**（测试与将来的会话轨迹）。导出先走，
+   * 免得诊断里的一个异常影响到导出。
+   */
+  onLayoutApplication?.(layoutApplied.report);
 
   // ── 导出识别结构（只在调用方要的时候才构造）────────────────────
   //
@@ -941,7 +1137,103 @@ function filterHeaderFooter(
 }
 
 /**
- * 用**版面模型的区域**取代几何启发式：页眉页脚判定 + 阅读顺序。
+ * `applyLayoutToLines` 的返回：**行** + **本次接入了什么**。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么把返回从 `OcrLine[]` 改成对象（一处形状改动，理由要写清）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * T2 要求「能从真实运行里累积出**版面模型 vs 几何启发式**的可比较数字」，
+ * 而那个数字只能在**这一层**算出来：只有这里同时握着「已成形的行」与
+ * 「版面区域」，也只有这里知道**哪些行是版面摘掉的**。把数字挂在别处
+ * （例如另一遍重算）一定会与判定漂移。
+ *
+ * 用对象同时交出两者，而不是「返回值不变 + 全局旁挂记录」：
+ * 本项目已经明确否决过旁挂记录给判定供数的做法（见 `layoutAnalysis.ts`
+ * 里 `getPageLayoutAnalysis()` 那段）—— **读全局会让「这份报告是哪一次
+ * 的」变成时序的产物**。这里同理：报告必须与那一次的行严格配对。
+ *
+ * ⚠️ 调用点因此从 `applyLayoutToLines(...)` 改成
+ * `applyLayoutToLines(...).lines`，那是**形状**变化、不是行为变化；
+ * `.lines` 在不变量成立时**就是输入那个引用**（连拷贝都没有）。
+ */
+export interface LayoutLineApplication {
+  /** 应用版面判定之后的行（模型缺席时**就是输入那个引用**） */
+  lines: OcrLine[];
+  /** 本次接入了什么、以及 T2 的逐行对照与汇总 */
+  report: LayoutPageReport;
+}
+
+/**
+ * 一页的**版面接入报告** —— T2 的「可累积指标」就是它。
+ *
+ * ⚠️ 它**不参与任何判定**，也**不进导出**：`ocrStructure` 的契约要
+ * **T5 配合**才能加字段（本任务的文件边界明确不许改那个文件，
+ * 详见交付说明里的「需要 T5 配合」一条）。它有两个现成的读点：
+ *   1. **控制台那一行**（前缀 `[ocrPostProcess] layout-metrics` + 单行
+ *      JSON）—— 真实运行时可累积，用户复制出来就能按类别求和；
+ *   2. 单元测试（在合成页面上逐行钉住口径）。
+ */
+export interface LayoutPageReport {
+  /** 参与对照的行数（= 进入本函数的行数） */
+  lineCount: number;
+  /** 版面模型额外摘掉的行数（几何启发式漏掉、被模型抓住的） */
+  removedByLayout: number;
+  /** 逐类别：版面摘掉了多少行 */
+  removedByLabel: Record<string, number>;
+  /** 是否因为版面信息而重排了阅读顺序 */
+  reordered: boolean;
+  /** 逐行对照表（几何判定 vs 版面判定） */
+  decisionRows: LayoutDecisionRow[];
+  decisionSummary: LayoutDecisionSummary;
+  /**
+   * T3：各类别在**标题判定**上实际起了什么作用（逐类别计数）。
+   * 由 `ocrResultToBlocks` 在段落收束时累加，因此它反映的是
+   * **真的影响了输出**的次数，而不是「代码里写了这条规则」。
+   */
+  headingUse: Record<string, number>;
+}
+
+/**
+ * 一页的版面接入报告 → **单行、机器可读**的指标日志。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 这是 T2「从真实运行里累积出可比较数字」的落点
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 格式刻意定成「固定前缀 + **单行 JSON**」：
+ *   · 单行 —— 于是可以 `grep 'layout-metrics'` 一次取完，不需要人眼
+ *     把多行日志拼回一个对象；
+ *   · 前缀固定 `[ocrPostProcess] layout-metrics` —— 于是「换了格式」
+ *     这件事本身可见；
+ *   · 字段名与 `LayoutPageReport` 一一对应 —— 读的人不必再猜哪个数是哪个。
+ *
+ * ⚠️ **它回答什么、不回答什么**（写清楚是为了不让这行日志被过度解读）：
+ *   · 回答：「这一页有几行、版面模型额外摘了几行、摘的是什么类别、
+ *     有没有重排、逐行对照里多少一致多少分歧、多少行模型没覆盖到」；
+ *   · **不回答**：谁判得准。那需要标注（`evaluateLayoutPredictions`）。
+ *     这个数只能说明「两个判定分歧在哪、分歧有多少」。
+ *
+ * ⚠️ 为什么抽成**导出的纯函数**而不是就地拼字符串：变异测试 M13
+ * 把前缀改掉时**没有任何用例变红** —— 说明那段格式零覆盖。
+ * 抽出来之后它可被直接断言（见 `layoutReleaseMetrics.test.ts`）。
+ */
+export function renderLayoutMetricsLine(report: LayoutPageReport): string {
+  return `[ocrPostProcess] layout-metrics ${JSON.stringify({
+    lineCount: report.lineCount,
+    removedByLayout: report.removedByLayout,
+    removedByLabel: report.removedByLabel,
+    reordered: report.reordered,
+    same: report.decisionSummary.same,
+    differ: report.decisionSummary.differ,
+    layoutCaught: report.decisionSummary.layoutCaught,
+    uncovered: report.decisionSummary.uncovered,
+    headingUse: report.headingUse,
+  })}`;
+}
+
+/**
+ * 用**版面模型的区域**取代几何启发式：页眉页脚判定 + 阅读顺序 + 标题类别。
  *
  * ═══════════════════════════════════════════════════════════════
  * 为什么这一步是**纯函数**，而且与 `groupWordsIntoLines` 分开
@@ -969,6 +1261,18 @@ function filterHeaderFooter(
  * 本函数只能**补充**摘掉启发式漏掉的（用户实测那两个页眉页脚正是这种），
  * 因此方向上只会「少留页面家具」，不会「多删正文」。
  *
+ * ═══════════════════════════════════════════════════════════════
+ * T3：本函数现在**多交出一件事** —— 每行落在哪个类别区域里
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 给保留下来的每一行打上 `[LAYOUT_LABEL]` 标记（行内过半数的词落在
+ * 同一个区域里），供后面的**标题判定**用「类别」而不是「字号阈值」
+ * 去否决误判。标记用 `Symbol` 键，因此**任何序列化结果都不受影响**
+ * （`JSON.stringify` 跳过 Symbol 键，见 `OcrLine[LAYOUT_LABEL]` 的说明）。
+ *
+ * ⚠️ 这一步**不改变本函数摘哪些行、也不改变行序**：与接入 T3 之前
+ * 逐字节相同（由不变量测试守着）。
+ *
  * @param lines    已成形的行（`groupWordsIntoLines` 的输出）
  * @param regions  版面模型给出的区域；空数组/undefined 表示不可用
  * @param pageWidth 页面画布宽度（像素），用于判栏
@@ -977,8 +1281,55 @@ export function applyLayoutToLines(
   lines: OcrLine[],
   regions: readonly LayoutRegion[] | undefined,
   pageWidth: number | undefined,
-): OcrLine[] {
-  if (!regions?.length || !lines.length) return lines;
+): LayoutLineApplication {
+  /**
+   * ⚠️ 这条短路**必须**发生在构造任何报告之前。
+   *
+   * 理由不是性能：模型缺席时报告也必须是「一眼看出什么都没发生」的形状。
+   * 一个「全 0 的统计」与它看起来很像，但读的人会把全 0 误读成
+   * 「模型跑了、一个都没抓到」—— 而事实是**根本没有模型**。
+   * 两者的下一步动作完全相反（查标注 vs 查模型），所以这里返回
+   * `decisionRows: []` + 全 0，并且在 `lineCount` 上如实写行数。
+   */
+  if (!regions?.length || !lines.length) {
+    return {
+      lines,
+      report: {
+        lineCount: lines.length,
+        removedByLayout: 0,
+        removedByLabel: {},
+        reordered: false,
+        decisionRows: [],
+        decisionSummary: summarizeLayoutDecisions([]),
+        headingUse: {},
+      },
+    };
+  }
+
+  // ── 0. T2：先做**逐行对照**，再动手 ───────────────────────────
+  //
+  // 刻意放在摘行**之前**：摘完之后 `kept` 里只剩「版面认为该留的行」，
+  // 对照表就再也看不到分歧 —— 而分歧正是它要展示的东西。
+  //
+  // ⚠️ `geometric` 一栏的口径（**必须写清，否则这张表会被读错**）：
+  // 本函数拿到的行已经**全部**通过了 `filterHeaderFooter`，也就是它们在
+  // 几何判定下**都是 `'kept'`** —— 被判为家具的行早在上一步就被摘掉了，
+  // 根本到不了这里。所以下面传的是一个恒为 `'kept'` 的出处函数。
+  //
+  // 它**不是**「几何启发式什么都没判」，而是「**在仍留在行序里的这些行上**，
+  // 几何判定与版面判定分歧在哪」。这条限制是**结构性的**，不是疏忽：
+  // 反方向（几何摘掉、版面想留）需要 `filterHeaderFooter` 把被它摘掉的
+  // 行也交出来，而那要改 `groupWordsIntoLines` 的返回契约（**另一个人的
+  // 文件**，本任务不许动）。因此 `decisionSummary.geometricOnly` 在真实
+  // 链路上**恒为 0** —— 这个 0 的含义是「本层看不到」，不是「不存在」，
+  // 交付说明里如实标注。
+  const keptLineVerdict: GeometricFurnitureVerdict = 'kept';
+  const decisionRows = compareLayoutAndGeometricDecisions(
+    lines,
+    regions,
+    { width: pageWidth ?? 0, height: 0 },
+    () => keptLineVerdict,
+  );
 
   // ── 1. 页眉页脚：由**区域类别**决定，不再看字号与宽度 ──────────
   const kept: OcrLine[] = [];
@@ -999,12 +1350,62 @@ export function applyLayoutToLines(
     );
   }
 
+  // ── 1b. T3：给**留下来的**每一行打上「它落在哪个类别里」的标记 ──
+  //
+  // 用 `Object.defineProperty` 而不是 `line[LAYOUT_LABEL] = …`：
+  // 赋值会创建**可枚举**属性（Symbol 键在 `for…in`/`Object.keys` 里本来就
+  // 不出现，但 `Object.getOwnPropertySymbols` 与调试器会看到它，而且赋值
+  // 是一个可见的副作用）。`defineProperty` 默认 `enumerable: false`，
+  // 让这个标记在**所有**枚举视角下都不存在 —— 它是内部备注，不是数据。
+  for (const line of kept) {
+    const match = lineLabelFromWords(line, regions);
+    Object.defineProperty(line, LAYOUT_LABEL, {
+      value: match?.label,
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+  }
+
+  /** 收尾：把报告与行一起交出去（**本函数每一条出口都必须经过它**） */
+  const done = (out: OcrLine[], reordered: boolean): LayoutLineApplication => {
+    const removedByLabelObject: Record<string, number> = {};
+    for (const [label, n] of removedByLabel) removedByLabelObject[label] = n;
+    const report: LayoutPageReport = {
+      lineCount: lines.length,
+      removedByLayout: [...removedByLabel.values()].reduce((a, b) => a + b, 0),
+      removedByLabel: removedByLabelObject,
+      reordered,
+      decisionRows,
+      decisionSummary: summarizeLayoutDecisions(decisionRows),
+      // 标题判定的逐类别计数在 `ocrResultToBlocks` 里累加：只有那里才知道
+      // 「本块最终是不是标题」。这里先给出一个空的累加器（同一个对象引用）。
+      headingUse: {},
+    };
+    /**
+     * ⚠️ 这一行是 T2「从真实运行里累积」的**落点**。
+     *
+     * 为什么走控制台而不是导出：导出的契约（`ocrStructure`）属于 **T5**，
+     * 本任务的文件边界明确不许改它。控制台是真实运行里唯一现成的、
+     * 用户能复制出来的通道。
+     *
+     * ⚠️ 文本由 `renderLayoutMetricsLine` 产出、**不是在这里拼的**：
+     * 第一版把 `JSON.stringify({...})` 直接写在这行里，于是变异测试 M13
+     * （把前缀 `layout-metrics` 改掉）**没有让任何用例变红** ——
+     * 那段格式完全没有测试覆盖，改坏了没人会知道。
+     * 抽成导出纯函数之后它可以被直接断言（见 `layoutReleaseMetrics.test.ts`
+     * 的「指标行」一组）。**这是把一条变异测试变绿的信息变成红的第一步。**
+     */
+    console.info(renderLayoutMetricsLine(report));
+    return { lines: out, report };
+  };
+
   // ── 2. 阅读顺序：**只有确证多栏**时才重排 ───────────────────────
   const width = pageWidth ?? 0;
-  if (!(width > 0)) return kept;
+  if (!(width > 0)) return done(kept, false);
 
   const columns = detectColumns(regions, width);
-  if (!columns) return kept;
+  if (!columns) return done(kept, false);
 
   const keys = readingOrderKeys(regions, width);
   const spanOf = (line: OcrLine) => {
@@ -1061,12 +1462,14 @@ export function applyLayoutToLines(
     console.warn(
       '[ocrPostProcess] 有行未被任何版面区域覆盖，本页不重排阅读顺序（保持既有顺序）',
     );
-    return kept;
+    return done(kept, false);
   }
 
-  return located
+  const reordered = located
     .sort((a, b) => a.key[0]! - b.key[0]! || a.key[1]! - b.key[1]! || a.key[2]! - b.key[2]!)
     .map((entry) => entry.line);
+
+  return done(reordered, true);
 }
 
 /**

@@ -200,14 +200,21 @@ describe('不变量：无版面信息时输出与接入前逐字节相同', () =
     const withEmpty = applyLayoutToLines(lines, [], 1400);
 
     // 必须是**同一个引用**：说明它是原样返回，而不是「算出一份等价的」
-    expect(withUndefined).toBe(lines);
-    expect(withEmpty).toBe(lines);
-    expect(JSON.stringify(withEmpty)).toBe(JSON.stringify(withUndefined));
+    expect(withUndefined.lines).toBe(lines);
+    expect(withEmpty.lines).toBe(lines);
+    expect(JSON.stringify(withEmpty.lines)).toBe(JSON.stringify(withUndefined.lines));
+
+    // 报告也必须如实说「什么都没发生」—— 模型缺席时它不是「全 0 的统计」
+    expect(withUndefined.report.decisionRows).toEqual([]);
+    expect(withEmpty.report.decisionRows).toEqual([]);
+    expect(withEmpty.report.removedByLayout).toBe(0);
+    expect(withEmpty.report.reordered).toBe(false);
+    expect(withEmpty.report.headingUse).toEqual({});
 
     // 反面：给一个真的有区域的数组就不再是恒等（证明上面两条不是因为它永远原样返回）
     const oneRegion = [
       { classId: 13, label: 'header', score: 0.9, x0: 0, y0: 0, x1: 500, y1: 40 },
     ];
-    expect(applyLayoutToLines(lines, oneRegion, 1400)).not.toBe(lines);
+    expect(applyLayoutToLines(lines, oneRegion, 1400).lines).not.toBe(lines);
   });
 });

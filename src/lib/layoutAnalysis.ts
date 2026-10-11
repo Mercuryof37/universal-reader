@@ -1384,6 +1384,13 @@ export async function analyzePageLayout(
         ` · 画布 ${width}×${height}`,
     );
 
+    /**
+     * ⚠️ **第二行**是取数通道，不是重复日志：上面那行给人看（只有家具的
+     * 类别计数），下面这行给脚本与「逐行对照」用（**全部**类别 + 坐标）。
+     * 详见 `dumpSummary` 的注释 —— 现有导出**没有**这些字段。
+     */
+    console.info(`[layoutAnalysis] layout-dump ${dumpSummary(regions)}`);
+
     return done({ regions, width, height }, {
       ok: true,
       code: 'none',
@@ -1405,6 +1412,56 @@ function furnitureSummary(regions: readonly LayoutRegion[]): string {
     counts.set(region.label, (counts.get(region.label) ?? 0) + 1);
   }
   return [...counts.entries()].map(([label, n]) => `${label}×${n}`).join('、');
+}
+
+/**
+ * 「这一页模型看到了什么」的**逐类别 + 逐区域**机器可读转储。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么必须把它打出来（这不是日志，是**取数通道**）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 那个「拿 30 个真实区域与几何启发式逐行对照」的比对**没法从现有导出做**：
+ * `ocrStructure.layout` 只带 `{used, code, regionCount, width, height}`
+ * 五个字段，**既没有类别名也没有坐标**（见 `OcrStructureLayout`）。
+ * 也就是说「用户导出的 `layout` 报了成功」这件事能证明模型跑了，
+ * 却**不足以**回答「这 30 个区域分别是什么」。
+ *
+ * 而 `regionCount` 也不是这个转储的替代品：它连「有几个页眉」都答不了。
+ * 缺了这两样，任何「模型判得准不准」的追问都只能靠猜 —— 那正是
+ * `HANDOFF.md` §5.11.7「测试证明的是接得对、退得回，不是判得准」
+ * 这句话至今仍然成立的原因。
+ *
+ * 所以这里把**判定真正用到的那份数据**原样交出来：类别 + 置信度 + 坐标。
+ * 格式刻意是**单行 JSON**（可跨行粘贴、可 grep、可喂脚本），
+ * 前缀 `[layoutAnalysis] layout-dump` 固定不变。
+ *
+ * ⚠️ **它不改变任何判定**：纯输出。而且只在**推理成功**时打一行，
+ * 所以模型不可用时连这行都没有（与「失败码」那套的语义一致）。
+ *
+ * ⚠️ 为什么不写进导出：`ocrStructure` 的契约属于 **T5**
+ * （本任务的文件边界明确不许动那个文件）。若将来 T5 把区域明细加进
+ * `layout` 字段，本转储仍应保留 —— 它的价值在**首次运行即可得**，
+ * 不需要用户走一遍导出流程。
+ */
+function dumpSummary(regions: readonly LayoutRegion[]): string {
+  const byLabel: Record<string, number> = {};
+  for (const region of regions) byLabel[region.label] = (byLabel[region.label] ?? 0) + 1;
+  return JSON.stringify({
+    count: regions.length,
+    byLabel,
+    /**
+     * 区域列表按坐标排序（`decodeLayoutDetectionsDetailed` 已经排好：先上后下、
+     * 再左后右），四舍五入到整数像素 —— 保留小数只会让这行更长，
+     * 而「这个框是不是盖住了那一行」这个判断用不到亚像素。
+     */
+    regions: regions.map((r) => ({
+      label: r.label,
+      classId: r.classId,
+      score: Math.round(r.score * 100) / 100,
+      box: [Math.round(r.x0), Math.round(r.y0), Math.round(r.x1), Math.round(r.y1)],
+    })),
+  });
 }
 
 /**
@@ -1437,3 +1494,1225 @@ function readPixels(source: ImageData | HTMLCanvasElement | OffscreenCanvas): Im
   if (!ctx) throw new Error('无法创建 2D 上下文');
   return ctx.getImageData(0, 0, canvas.width, canvas.height);
 }
+/**
+ * 一行被判归到**哪一个类别区域**（少数服从多数），以及是哪一张票赢的。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 与 `furnitureRegionOfLine` 的关系：同一套计票，多问一个问题
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * `furnitureRegionOfLine` 只回答「这一行是不是页面家具」，因为当时
+ * **只有那一个判据在用版面类别**（`HANDOFF.md` §5.11.5 明文：
+ * 「只接了页眉页脚 + 阅读顺序」，另外两个痛点没动）。
+ *
+ * 本函数把同一套计票逻辑抽出来，回答一个**更一般**的问题：
+ * 「这一行主要落在哪个类别的区域里」。它不改 `furnitureRegionOfLine`
+ * 的任何判据 —— 后者仍然是「只在家具类别里挑赢家」，因此
+ * 「页眉页脚判定」这条既有行为**逐字节不变**（由不变量测试守着）。
+ *
+ * ⚠️ **为什么必须与 `furnitureRegionOfLine` 共用同一套 `regionForWord` 与
+ * 「词数过半」判据**：两处若各写一遍，迟早漂移，而漂移的表现是
+ * 「被摘掉的行」与「被免判标题的行」对不上 —— 同一行被一个判据说成
+ * `footer`、被另一个说成 `text`。那种不一致比不判更难查。
+ *
+ * 返回值里的 `votes` / `total` 是**证据**，不是装饰：判据要能回答
+ * 「凭几张票判的」，否则 `1/2` 与 `11/12` 这两种情况会被混为一谈。
+ *
+ * @returns 得票过半的类别区域；一个都没过半（或没有任何词落在区域里）时
+ *          返回 `undefined` —— **宁可判不出，也不要硬归一类**
+ */
+export function lineLabelFromWords(
+  line: LayoutLineLike,
+  regions: readonly LayoutRegion[],
+): { region: LayoutRegion; label: string; votes: number; total: number } | undefined {
+  const words = line?.words ?? [];
+  const total = words.length;
+  if (!total || !regions.length) return undefined;
+
+  const votes = new Map<LayoutRegion, number>();
+  for (const word of words) {
+    const region = regionForWord(word, regions);
+    if (!region) continue;
+    votes.set(region, (votes.get(region) ?? 0) + 1);
+  }
+  if (!votes.size) return undefined;
+
+  const needed = total / 2;
+  let winner: LayoutRegion | undefined;
+  let bestVotes = 0;
+  for (const [region, count] of votes) {
+    if (count <= needed) continue;
+    // 与 `furnitureRegionOfLine` 同一套并列裁决：票数相同时取 score 更高的，
+    // 否则「哪一个区域成了判定依据」会随 Map 插入顺序变化，诊断不可复现。
+    if (
+      count > bestVotes ||
+      (count === bestVotes && winner !== undefined && region.score > winner.score)
+    ) {
+      winner = region;
+      bestVotes = count;
+    }
+  }
+  if (!winner) return undefined;
+  return { region: winner, label: winner.label, votes: bestVotes, total };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ⓪ 版面判定 vs 几何判定：**逐行对照表**
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * 一个**区域**在某个坐标系里的位置。用于「这个区域覆盖了画布多少比例」。
+ *
+ * ⚠️ 刻意**不叫** `LayoutAnalysisResult`：那个类型是「一次推理的产物」，
+ * 有 `regions` 字段；这里只要一个框。混用会让「传错了对象」这件事
+ * 在编译期看不出来（两个类型都有 width/height，差一个 regions）。
+ */
+export interface LayoutCanvas {
+  width: number;
+  height: number;
+}
+
+/** 一行在「该不该丢」这件事上的几何判定结果 */
+export type GeometricFurnitureVerdict =
+  /** 判为页面家具（会被 filterHeaderFooter 摘掉） */
+  | 'furniture'
+  /** 判为正文（留在行序里） */
+  | 'kept';
+
+/** 一行在「该不该丢」这件事上的版面判定结果 */
+export type LayoutFurnitureVerdict =
+  /** 落在某个家具类别区域里（header/footer/number/seal/…） */
+  | 'furniture'
+  /** 落在某个内容类别区域里 */
+  | 'content'
+  /** 一个类别区域都没覆盖到（或没过半） */
+  | 'uncovered';
+
+/** 两个判定的关系 */
+export type LayoutDecisionAgreement =
+  /** 两者得出同一个结论（都丢或都留） */
+  | 'same'
+  /** **两者结论相反** —— 这才是这个对照表要找的行 */
+  | 'differ';
+
+/**
+ * 逐行对照表里的一行。
+ *
+ * ⚠️ **`agreement` 只说「一样/不一样」，不说「谁对」。** 这个数据里
+ * **没有真值**：几何启发式与版面模型都是判定器，不是标注。
+ * 所以本结构**没有** `correct` 字段 —— 想加一个的话，先得有标注
+ * （见 `evaluateLayoutPredictions`，那才是带真值的评估）。
+ */
+export interface LayoutDecisionRow {
+  /** 行序（0 起，按 y 排），用来把表与页面视觉位置对上 */
+  index: number;
+  /** 行中心 y */
+  y: number;
+  /** 行文本（可能为空字符串，但字段一定在） */
+  text: string;
+  /** 行内词数 */
+  wordCount: number;
+  /** 几何启发式的结论 */
+  geometric: GeometricFurnitureVerdict;
+  /** 版面模型的结论 */
+  layout: LayoutFurnitureVerdict;
+  /** 版面模型给出的类别名；`uncovered` 时为 `undefined` */
+  layoutLabel?: string;
+  /** 类别区域的置信度；`uncovered` 时为 `undefined` */
+  layoutScore?: number;
+  /** 类别票数 / 行内词数 —— 「凭几张票判的」 */
+  layoutVotes?: number;
+  layoutTotal?: number;
+  /** 该类别区域覆盖画布面积的比例（家具类别在版面上通常很小） */
+  layoutAreaRatio?: number;
+  agreement: LayoutDecisionAgreement;
+  /**
+   * 若不一致，**按一套写明的约定**谁更可能对。这只是约定，不是真值：
+   *   · `'layout'`   —— 几何判「留」、版面判「家具」，且该类别在本项目
+   *     语料上是强信号（`number` = 页码、`header`/`footer` = 页眉页脚）。
+   *     几何启发式**结构性**看不到这些（用户实测那条同字号页脚就是例子）；
+   *   · `'geometric'` —— 版面判「内容」而几何判「家具」。本项目的方向是
+   *     「宁可漏判页眉，不可误删正文」，所以这一侧选几何；
+   *   · `'unknown'`   —— 上面两条都不适用（例如 `uncovered`）。
+   *     **`unknown` 不是失败**，它如实表示「这条分歧靠现有数据判不了」。
+   */
+  preferred?: 'layout' | 'geometric' | 'unknown';
+}
+
+/**
+ * 逐行对照表需要的那点信息：`LayoutLineLike` **加上** y 与文本。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * ⚠️ 为什么单独一个类型，而不是给 `LayoutLineLike` 加两个可选字段
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 第一版实现就在这里错了一次，代价是**整张表的文本列全空、y 全是 0**：
+ * 对照函数当时收的是 `LayoutLineLike`，而那个类型**只有 `words`** ——
+ * 它读 `line.y` / `line.text` 时拿到 `undefined`，被兜底逻辑变成了 `0`
+ * 与 `''`，于是表「看起来有内容」（有行号、有判定、有类别），
+ * **只有「哪一行」这一列是假的**。这是最坏的一种错：结论列全对，
+ * 标识列全错，而人不会去怀疑一个排得整整齐齐的表。
+ *
+ * 所以这里把它做成**独立的类型**：
+ *   · `LayoutLineLike` 保持只有 `words`（`furnitureRegionOfLine` 等
+ *     判定函数只需要它，不该被迫关心行有没有文本）；
+ *   · 对照函数要求 `LayoutDecisionLineLike`，**于是「忘了传行」在编译期
+ *     就报错**，而不是在运行期变成一列 `0` 与 `（空行）`。
+ *
+ * 两个字段都刻意**可选**：几何判定与类别归属完全不依赖它们，
+ * 缺了只是「表里那一列没有信息」，不该让对照本身失败。
+ */
+export interface LayoutDecisionLineLike extends LayoutLineLike {
+  /** 行中心 y（缺了给 0，并在表里显示 0 —— 不假装知道） */
+  y?: number;
+  /** 行文本（缺了显示「（空行）」） */
+  text?: string;
+}
+
+/**
+ * ⓪ 的核心：把「几何判定」与「版面判定」按**行**对照起来。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 口径（**这一段就是「口径必须写清」的落点**）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * **1. 区域 → 行的映射怎么定的**
+ *
+ *   不是「中心点落在哪个框里」，也不是新造一套判据，而是**逐词投票**：
+ *   每个词先按 `regionForWord`（既有的、有测试的判据：覆盖率最大、
+ *   并列时比 score、再比 classId）找到归属区域，然后**行内过半数的词**
+ *   落在同一个区域里，这一行就归它（`lineLabelFromWords`）。
+ *
+ *   为什么按行内过半而不是按行中心：实测那份习题 PDF 上，一个跨行
+ *   大括号的公式区域会把**相邻正文行的一部分**盖进去；按中心点判时
+ *   一个词的归属会随几像素抖动翻转，按「行内过半」则与「一行要么是
+ *   家具、要么是正文」这个语义一致（这也是 `furnitureRegionOfLine`
+ *   当初选它的理由，本函数沿用同一口径，两边**不会漂移**）。
+ *
+ * **2. 用的是类别还是坐标**
+ *
+ *   **两个都用了，而且分工是刻意的**：
+ *     · 「该不该丢」这个结论只由**类别**决定 ——
+ *       `layout = isFurnitureLabel(label) ? 'furniture' : 'content'`。
+ *       坐标只用来回答「这个词/行落在哪个区域里」，**不参与**
+ *       「是不是家具」的判断（否则就又变成几何启发式了）；
+ *     · 表里仍把 `layoutScore` / `layoutVotes` / `layoutAreaRatio` /
+ *       `y` 一起报出来，因为**分歧要能被追问**：一个 1/2 票、
+ *       score 0.31 的 `footer` 与 11/12 票、score 0.9 的 `footer`
+ *       在结论上一样，在可信度上完全不同。
+ *
+ * **3. 几何判定从哪来**
+ *
+ *   `geometricOf` 是**必传**的。理由：几何判定的真实来源是
+ *   `filterHeaderFooter` 里那三条判据（位置 / 小字号 / 结构孤立），
+ *   而它**已经把判为家具的行摘掉了** —— 一个已经被摘掉的行不会出现在
+ *   这里的 `lines` 里。「摘掉了」与「留下了」是**两个都来自几何**的结论，
+ *   本函数无从反推，所以必须由调用方如实告知（见 `GeometricProvenance`
+ *   的说明）。**编一个默认值会把「不知道」变成「判为正文」**，
+ *   那正是本项目反复吃过亏的那种静默错误。
+ *
+ * **4. 没有真值**
+ *
+ *   所以本表**不排名、不算准确率**，只回答「哪些行上两个判定分歧了、
+ *   各自判成什么」。要算准确率必须有标注，那是 `evaluateLayoutPredictions`。
+ *
+ * @param lines      要对照的行（**按 y 排好**；本函数不重排输入）
+ * @param regions    版面模型给出的区域；空/undefined 时返回**空表**
+ *                   （不是「全部 same」—— 没有模型就没有版面判定可言）
+ * @param canvas     坐标画布尺寸（用于 `layoutAreaRatio`）
+ * @param geometricOf 取某行的几何判定
+ */
+export function compareLayoutAndGeometricDecisions(
+  lines: readonly LayoutDecisionLineLike[],
+  regions: readonly LayoutRegion[] | undefined,
+  canvas: LayoutCanvas,
+  geometricOf: (line: LayoutDecisionLineLike, index: number) => GeometricFurnitureVerdict,
+): LayoutDecisionRow[] {
+  if (!regions?.length || !lines.length) return [];
+
+  const canvasArea =
+    Number.isFinite(canvas.width) && Number.isFinite(canvas.height)
+      ? Math.max(0, canvas.width) * Math.max(0, canvas.height)
+      : 0;
+
+  const rows: LayoutDecisionRow[] = [];
+  lines.forEach((line, index) => {
+    const match = lineLabelFromWords(line, regions);
+    const geometric = geometricOf(line, index);
+
+    const layout: LayoutFurnitureVerdict = !match
+      ? 'uncovered'
+      : isFurnitureLabel(match.label)
+        ? 'furniture'
+        : 'content';
+
+    // 两个判定都是二值的「丢 / 留」；`uncovered` 不构成一个「留」的结论，
+    // 所以它与任何几何结论都算**不同**（如实记，不替模型圆场）。
+    const agree =
+      layout !== 'uncovered' && (layout === 'furniture') === (geometric === 'furniture');
+
+    const row: LayoutDecisionRow = {
+      index,
+      y: lineY(line),
+      text: lineText(line),
+      wordCount: line?.words?.length ?? 0,
+      geometric,
+      layout,
+      agreement: agree ? 'same' : 'differ',
+    };
+
+    if (match) {
+      row.layoutLabel = match.label;
+      row.layoutScore = match.region.score;
+      row.layoutVotes = match.votes;
+      row.layoutTotal = match.total;
+      if (canvasArea > 0) {
+        const area =
+          Math.max(0, match.region.x1 - match.region.x0) *
+          Math.max(0, match.region.y1 - match.region.y0);
+        row.layoutAreaRatio = round4(area / canvasArea);
+      }
+    }
+
+    if (!agree) row.preferred = preferredOnDisagreement(geometric, layout, match?.label);
+    rows.push(row);
+  });
+
+  return rows;
+}
+
+/**
+ * 不一致时「谁更可能对」的**约定**（不是真值，见 `LayoutDecisionRow.preferred`）。
+ *
+ * 写成独立函数是为了让这条约定**只有一个定义点**：它被对照表、被渲染器、
+ * 被报告引用，三处各写一遍迟早漂移，而漂移的后果是「表里说 layout、
+ * 报告里说 geometric」。
+ */
+function preferredOnDisagreement(
+  geometric: GeometricFurnitureVerdict,
+  layout: LayoutFurnitureVerdict,
+  label: string | undefined,
+): 'layout' | 'geometric' | 'unknown' {
+  if (layout === 'furniture' && geometric === 'kept') {
+    // 几何启发式**结构性**看不到「同字号、排在版心内」的页眉页脚
+    // （用户实测那条页脚正是如此，见 ocrPostProcess.filterHeaderFooter）。
+    // 而能落到 `furniture` 的类别是有限的几个，都是明确的家具语义。
+    return 'layout';
+  }
+  if (layout === 'content' && geometric === 'furniture') {
+    // 反方向：本项目的方向是「宁可漏判页眉，不可误删正文」
+    // （见 FURNITURE_LABELS 的说明），所以这一侧站几何。
+    return 'geometric';
+  }
+  // `uncovered`：模型没框住这一行，谁对无从判断 —— 如实说不知道
+  void label;
+  return 'unknown';
+}
+
+/** 行的 y（缺字段时给 0，绝不抛错：对照表是诊断，不该有能力弄挂一次识别） */
+function lineY(line: LayoutDecisionLineLike): number {
+  const y = line?.y;
+  return typeof y === 'number' && Number.isFinite(y) ? y : 0;
+}
+
+/** 行的文本（同上：缺字段给空串，表里显示成「（空行）」） */
+function lineText(line: LayoutDecisionLineLike): string {
+  const text = line?.text;
+  return typeof text === 'string' ? text : '';
+}
+
+function round4(v: number): number {
+  return Math.round(v * 10000) / 10000;
+}
+
+/**
+ * 逐行对照表 → Markdown 表格。
+ *
+ * ⚠️ 表头**逐字**标注了「谁更可能对是约定不是真值」——
+ * 一张看起来像判决书的表比没有表更危险，所以这句话必须跟着表走，
+ * 而不是只写在源码注释里。
+ */
+export function renderLayoutDecisionTable(rows: readonly LayoutDecisionRow[]): string {
+  const head =
+    '| # | y | 行文本 | 几何判定 | 版面判定 | 类别 | 置信度 | 票数 | 是否一致 | 谁更可能对（**约定，非真值**） |\n' +
+    '|---|---|---|---|---|---|---|---|---|---|';
+  if (!rows.length) return `${head}\n| — | — | （没有版面区域，无从对照） | — | — | — | — | — | — | — |`;
+
+  const cells = rows.map((row) => {
+    const label = row.layoutLabel ?? '—';
+    const score = row.layoutScore === undefined ? '—' : row.layoutScore.toFixed(2);
+    const votes =
+      row.layoutVotes === undefined ? '—' : `${row.layoutVotes}/${row.layoutTotal ?? 0}`;
+    return `| ${row.index} | ${row.y} | ${escapeCell(row.text)} | ${row.geometric} | ${row.layout} | ${label} | ${score} | ${votes} | ${row.agreement} | ${row.preferred ?? '—'} |`;
+  });
+  return [head, ...cells].join('\n');
+}
+
+/** Markdown 单元格转义：`|` 会截断表格，换行会截断行 */
+function escapeCell(text: string): string {
+  const flat = text.replace(/[\r\n]+/g, ' ').replace(/\|/g, '\\|').trim();
+  if (!flat) return '（空行）';
+  return flat.length > 40 ? `${flat.slice(0, 40)}…` : flat;
+}
+
+/** 对照表的汇总计数 —— 「多少行一致」这个数要能被直接引用 */
+export interface LayoutDecisionSummary {
+  /** 参与对照的行数 */
+  total: number;
+  /** 两者结论相同的行数 */
+  same: number;
+  /** 两者结论不同的行数 */
+  differ: number;
+  /** 几何判「留」、版面判「家具」—— 版面**额外**摘掉的行数（本次接入的收益面） */
+  layoutCaught: number;
+  /** 几何判「家具」、版面判「内容」—— 版面想救回的行数（本接入**不做**，只记录） */
+  geometricOnly: number;
+  /** 版面一个类别区域都没覆盖到的行数 */
+  uncovered: number;
+  /** 逐类别：版面把多少行判成这个类别 */
+  layoutByLabel: Record<string, number>;
+}
+
+export function summarizeLayoutDecisions(
+  rows: readonly LayoutDecisionRow[],
+): LayoutDecisionSummary {
+  const layoutByLabel: Record<string, number> = {};
+  let same = 0;
+  let layoutCaught = 0;
+  let geometricOnly = 0;
+  let uncovered = 0;
+
+  for (const row of rows) {
+    if (row.agreement === 'same') same++;
+    if (row.layout === 'uncovered') uncovered++;
+    else {
+      const key = row.layoutLabel ?? 'unknown';
+      layoutByLabel[key] = (layoutByLabel[key] ?? 0) + 1;
+    }
+    if (row.geometric === 'kept' && row.layout === 'furniture') layoutCaught++;
+    if (row.geometric === 'furniture' && row.layout === 'content') geometricOnly++;
+  }
+
+  return {
+    total: rows.length,
+    same,
+    differ: rows.length - same,
+    layoutCaught,
+    geometricOnly,
+    uncovered,
+    layoutByLabel,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// T3：把版面**类别**用足（不再只取 header/footer）
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * T3 用到的类别 → 它产生什么行为。**每一条都必须能说出「改了什么」**，
+ * 否则就落回「只接了页眉页脚 + 阅读顺序」那个状态（`HANDOFF.md` §5.11.5）。
+ *
+ * ⚠️ 与 `FURNITURE_LABELS` / `CONTENT_LABELS` 的分工：
+ *   那两个集合回答「这个类别算不算正文」（用于**摘行**与**分栏**）；
+ *   这里回答「这个类别的区域**落在某一行上**时，对该行的**标题判定**
+ *   有什么影响」。两者不重叠、也不该合并 —— 合并会让「只摘页眉」
+ *   这条刻意保守的规则意外带上「影响标题」的副作用。
+ */
+export const HEADING_VETO_LABELS: ReadonlySet<LayoutLabel> = new Set<LayoutLabel>([
+  /**
+   * `formula` / `formula_number` —— **这正是 `HANDOFF.md` §5.11.1 表里
+   * 「三行公式被误判成大标题」的那一类**。几何判据（字号 > 中位数 1.3 倍）
+   * 注定会误判它：跨行大括号、分式、堆叠上下标的检测框会把「行字号」
+   * 抬得很高，而字号只能证明「它被排得很大」，证明不了「它是标题」。
+   */
+  'formula',
+  'formula_number',
+  /**
+   * `text` / `content` / `abstract` / `reference` —— 模型说这几行是**正文**，
+   * 而几何说它是标题。极端行高会把正文行推过 1.3 倍门槛（实测：含分式的
+   * 正文行字号 43 对纯文字 36，差 16%），模型的这一票比字号阈值可信。
+   */
+  'text',
+  'content',
+  'abstract',
+  'reference',
+  /**
+   * ⚠️ **刻意不进这份清单**（写下来是为了让「没做」也是一个决定）：
+   *   · `table` / `table_title` / `figure_title` / `chart_title`：它们是内容，
+   *     但「表格里的粗体大字」本来就可能是小标题 —— 拿它否决标题判定，
+   *     收益不明而回归面很大；
+   *   · `footnote` / `aside_text`：`FURNITURE_LABELS` 的注释已经说明
+   *     它们**不排除**（脚注在习题集里常是关键提示）。既不算正文、也不算
+   *     家具，那就不该拿它去否决标题；
+   *   · `seal` / `header` / `footer` / `number` / `header_image` /
+   *     `footer_image`：它们**已经在前面被摘掉了**（`FURNITURE_LABELS`），
+   *     走不到标题判定这一步，放在这里只会是一条永不触发的死规则 ——
+   *     而「一条永远不会失败的规则」正是本项目反复清理的假保护。
+   */
+]);
+
+/**
+ * `paragraph_title` 作为标题的**正向证据**时的额外闸门。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么不直接信 `paragraph_title`
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * `PP-DocLayout-S` 的 mAP(0.5) 只有 **70.9**（上游自评，500 张自建集），
+ * 而且**从未在本项目语料上评估过**（`HANDOFF.md` §5.11.7）。让一个
+ * 从未在真实数据上跑过的模型**单方面**决定「这一行是标题」，等于把
+ * 一个未验证的组件放进正文链路 —— 那正是 T1/T2 存在的原因。
+ *
+ * 所以正向证据的作用被刻意限制成**「在字号上再确认一次」**：
+ * 它把几何的 1.3 倍字号门槛放松 **5%**（`0.95`），
+ * 但**长度闸门（`maxChars`）一道都不放松**。
+ *
+ * 取 0.95 的理由：几何门槛是 `中位字号 × 1.3`，而 0.95 × 1.3 ≈ 1.235 ——
+ * 也就是说「模型说是小标题」时，字号只需**接近**几何门槛即可确认。
+ * 再松下去（例如 0.8）就会把正文行拉进标题，而那种误判在视觉上是
+ * 「一段正文被渲染成二级标题」，比漏判显眼得多。
+ */
+export const PARAGRAPH_TITLE_MIN_FONT_RATIO = 0.95;
+
+/**
+ * 几何启发式的阈值 —— **必须与 `ocrPostProcess` 里的常量同值**。
+ *
+ * ⚠️ 为什么把它们作为**参数**传进来而不是在这里再定义一份：
+ * 判据只能有一个定义点。调用点把 `ocrPostProcess` 里的常量原样传进来，
+ * 本函数就不可能与它漂移；在这里另立一份常量则一定会漂移，
+ * 而漂移的表现是「模型缺席时的行为」和「模型在场时的兜底行为」不一致 ——
+ * 那正是不变量测试要防的东西。传进来的值由测试与 `ocrPostProcess`
+ * 的导出常量比对钉住。
+ */
+export interface HeadingGeometryThresholds {
+  /** `HEADING_FONT_RATIO`：字号要超过中位字号的这个倍数 */
+  fontRatio: number;
+  /** `HEADING_MAX_CHARS`：首行文本长度上限 */
+  maxChars: number;
+}
+
+/**
+ * 一行在**标题判定**上的结论。
+ *
+ * ⚠️ `allowed === false` 时**必然**有一条 `rule` 说明是哪条规则否决的；
+ * `allowed === true` 时 `rule` 可能是：
+ *   · `'layout_paragraph_title'` —— 版面模型的小标题类别把它确认为标题；
+ *   · `'layout_doc_title'`       —— 版面模型的文档标题类别；
+ *   · `undefined`                —— **走的完全是既有几何路径**（模型没说话）。
+ *     这一种是绝大多数，也是不变量成立的地方。
+ */
+export interface HeadingDisposition {
+  allowed: boolean;
+  rule?: string;
+  /** 做出这个结论时实际用到的版面类别（供「哪个类别产生了什么行为」统计） */
+  label?: string;
+}
+
+/** 一行的文本是否本身就像标题（由调用点传入 `ocrPostProcess.looksLikeHeading`） */
+export type HeadingTextEvidence = (text: string) => boolean;
+
+/**
+ * T3 的核心判据：**版面类别如何参与标题判定**。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 与几何启发式的关系：证据的**换手**，不是「把判断权交给模型」
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 模型只在**它明确框住这一行**时才有票（`layoutLabel` 为 `undefined` 时
+ * 本函数恒返回 `{ allowed: true }`，一个字都不改）。
+ *
+ * 当它确实框住了这一行时，动作是**用一个类别的语义去替代一条几何判据**，
+ * 而且**替代的方向对两个类别族群是相反的**：
+ *
+ *  · **否决族群**（`HEADING_VETO_LABELS`：`formula` / `formula_number` /
+ *    正文类）：模型说「这是公式 / 正文」，几何却是靠「字号大」想把它
+ *    判成标题 —— 采信模型，**不判标题**。
+ *    ⚠️ 前提是几何**确实在要**一个标题（`geometricHeadingClaim` 为 true）。
+ *    否则这次「否决」是一次**空操作**，却会让 `rule` 声称一条从没生效过的
+ *    规则 —— 那正是本项目反复吃过的假保护（本项目第 N 次）。
+ *
+ *  · **确认族群**（`paragraph_title` / `doc_title`）：模型说「这是标题」，
+ *    于是它**替代几何那条「文本必须像标题」的判据**
+ *    （`looksLikeHeading` —— 它拒收「（一）极限的定义」这类中文编号标题，
+ *    因为纯几何分不清它们与题号行）。
+ *    ⚠️ **但字号闸门与长度闸门一条都不放松**：字号仍须
+ *    `>= 中位字号 × fontRatio × PARAGRAPH_TITLE_MIN_FONT_RATIO`，
+ *    文本仍须 `<= maxChars`。也就是说模型**不能**把一行小字或一整段
+ *    长文变成标题，它只能把「够大、够短、但按文本判据不像标题」的行
+ *    确认为标题。
+ *
+ * ⚠️ **「确认」这条规则为什么必须能改变输出**：如果确认的结论与几何
+ * 永远相同（都是 allowed），那它就是一条**永远不会生效的规则** ——
+ * 记进 `headingUse` 只会让统计好看。这一版里它是能改判的：
+ * 「（一）极限的定义」在模型缺席时是 `paragraph`（`looksLikeHeading` 拒收），
+ * 在模型说 `paragraph_title` 时是 `heading`。两种情形都有用例钉住
+ * （`layoutCategoryUse.test.ts` 的「双向」一组）。
+ *
+ * ⚠️ **代价与接受它的理由**：确认这条会把一部分判断权交给一个
+ * **从未在本项目语料上评估过**的模型（`HANDOFF.md` §5.11.7）。
+ * 缓解有三条，都写在代码里：字号闸门、长度闸门、以及
+ * `PARAGRAPH_TITLE_MIN_FONT_RATIO` 的 5% 余量。判错的后果是
+ * 「一行被渲染成二级标题」—— 内容一个字不丢，比误删正文轻得多。
+ */
+export function headingDisposition(
+  layoutLabel: string | undefined,
+  firstLineText: string,
+  blockFontSize: number,
+  medianFontSize: number,
+  thresholds: HeadingGeometryThresholds,
+  looksLikeHeading: HeadingTextEvidence = () => true,
+): HeadingDisposition {
+  // ── 闸门：模型没框住这一行 → 完全走既有几何路径（不变量在这里成立）
+  if (!layoutLabel) return { allowed: true };
+
+  const text = firstLineText.trim();
+
+  // ── 方向一：否决 ─────────────────────────────────────────────
+  if (HEADING_VETO_LABELS.has(layoutLabel as LayoutLabel)) {
+    const claim = geometricHeadingClaim(
+      text,
+      blockFontSize,
+      medianFontSize,
+      thresholds,
+      looksLikeHeading,
+      undefined,
+    );
+    if (claim.heading) {
+      return { allowed: false, rule: 'layout_says_not_heading', label: layoutLabel };
+    }
+    return { allowed: true };
+  }
+
+  /**
+   * ── 方向二：确认（用类别**替代**「文本像标题」那一条判据）────────
+   *
+   * ⚠️ 字号与长度闸门在这里**没有放松**，只是把门槛从
+   * `fontRatio` 降到 `fontRatio × PARAGRAPH_TITLE_MIN_FONT_RATIO`（5% 余量）
+   * —— 理由见 `PARAGRAPH_TITLE_MIN_FONT_RATIO`。
+   */
+  if (layoutLabel === 'paragraph_title' || layoutLabel === 'doc_title') {
+    const bigEnough =
+      medianFontSize > 0 &&
+      text.length > 0 &&
+      text.length <= thresholds.maxChars &&
+      blockFontSize >= medianFontSize * thresholds.fontRatio * PARAGRAPH_TITLE_MIN_FONT_RATIO;
+    if (bigEnough) {
+      return {
+        allowed: true,
+        rule:
+          layoutLabel === 'doc_title' ? 'layout_says_doc_title' : 'layout_says_paragraph_title',
+        label: layoutLabel,
+      };
+    }
+  }
+
+  // ── 其他类别：不表态，走既有几何路径 ───────────────────────────
+  return { allowed: true };
+}
+
+/**
+ * 「**在给定版面信息下**，几何启发式会不会判这一行是标题」。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么不叫「几何判定」而叫「标题主张」
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 因为标题判定在这一版之后**不是纯几何**的了：`paragraph_title` 这条
+ * 类别可以**替代**文本证据那一条判据。所以真正的问题是
+ * 「**这一行是否被主张为标题**」，而主张可以来自两条证据链：
+ *
+ *   · `'text'`    —— 几何证据齐了（字号 + 长度 + 文本像标题）；
+ *   · `'layout'`  —— 版面模型确认是标题，字号与长度仍由几何把着。
+ *
+ * ⚠️ 这个区分**必须留下**：不区分的话，「某条分类规则生效了」与
+ * 「几何本来就判它」会混成一个 `true`，于是无法回答
+ * 「到底是哪条规则让它变成标题的」—— 而那正是 T3 要能回答的问题。
+ *
+ * `layoutLabel` 为 `undefined`（模型缺席）时，本函数**逐字退化成**
+ * 改动前那条判据：字号 × 1.3、长度上限、`looksLikeHeading` 三条全与
+ * `ocrPostProcess.flushParagraph` 里原来的表达式一致。不变量因此是
+ * **结构性**的，不是靠测试碰巧覆盖。
+ */
+export function geometricHeadingClaim(
+  firstLineText: string,
+  blockFontSize: number,
+  medianFontSize: number,
+  thresholds: HeadingGeometryThresholds,
+  looksLikeHeading: HeadingTextEvidence = () => true,
+  layoutLabel?: string,
+): { heading: boolean; basis: 'text' | 'layout' } {
+  const text = firstLineText.trim();
+  if (!(text.length > 0)) return { heading: false, basis: 'text' };
+  if (!(medianFontSize > 0)) return { heading: false, basis: 'text' };
+  if (text.length > thresholds.maxChars) return { heading: false, basis: 'text' };
+
+  // ── 证据链 A：纯几何（模型缺席时**只有**这一条）─────────────────
+  if (blockFontSize > medianFontSize * thresholds.fontRatio && looksLikeHeading(firstLineText)) {
+    return { heading: true, basis: 'text' };
+  }
+
+  // ── 证据链 B：版面模型说是标题（替代文本证据，字号/长度不放松）──
+  if (
+    (layoutLabel === 'paragraph_title' || layoutLabel === 'doc_title') &&
+    blockFontSize >= medianFontSize * thresholds.fontRatio * PARAGRAPH_TITLE_MIN_FONT_RATIO
+  ) {
+    return { heading: true, basis: 'layout' };
+  }
+
+  return { heading: false, basis: 'text' };
+}
+
+/**
+ * 「**去掉所有版面信息后**，几何启发式会不会判这一行是标题」。
+ *
+ * 这是 `geometricHeadingClaim` 在 `layoutLabel === undefined` 时的特例，
+ * 单独留一个名字是为了让「T3 新增的每一条判据，在模型缺席时都不会触发」
+ * 这句话**可被逐条断言**，而不是靠读代码相信它。
+ */
+export function geometricWouldBeHeading(
+  firstLineText: string,
+  blockFontSize: number,
+  medianFontSize: number,
+  thresholds: HeadingGeometryThresholds,
+  looksLikeHeading: HeadingTextEvidence = () => true,
+): boolean {
+  return geometricHeadingClaim(
+    firstLineText,
+    blockFontSize,
+    medianFontSize,
+    thresholds,
+    looksLikeHeading,
+    undefined,
+  ).heading;
+}
+
+/**
+ * 一行在「该不该丢」这件事上的**几何判定出处**。
+ *
+ * ⚠️ 为什么映射要由调用方传进来，而不是在本模块里算：
+ * 几何判定的真实来源是 `filterHeaderFooter`，它在
+ * `groupWordsIntoLines` **内部**就已经把判为家具的行**摘掉了** ——
+ * 落到对照函数手里的 `lines` 里，已经没有「被几何摘掉的行」。
+ * 所以只有那条链路自己知道每一行是被摘了还是留下了，
+ * 本模块无从反推。**不许在这里编一个默认值**（见
+ * `compareLayoutAndGeometricDecisions` 的口径第 3 条）。
+ */
+export type GeometricProvenance = (
+  line: LayoutDecisionLineLike,
+  index: number,
+) => GeometricFurnitureVerdict;
+
+// ═══════════════════════════════════════════════════════════════
+// T2：可发版指标 —— 逐类别 precision / recall + **基准标识**
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * 一处人工标注的区域。
+ *
+ * `label` 用 `LAYOUT_LABELS` 里的字符串（**不是 class_id**）：
+ * id 是模型内部的索引，标注是文档的属性；把标注也写成 0–22 会让
+ * 「换个模型（类别表不同）就再也读不懂旧标注」。
+ */
+export interface LayoutTruthRegion {
+  label: string;
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+/** 一页真值 + 该页的模型预测 */
+export interface LayoutEvalPage {
+  /** 页面标识（文件名/页码）—— 报告里要能指回具体哪一页 */
+  pageId: string;
+  width: number;
+  height: number;
+  /** 人工标注 */
+  truth: readonly LayoutTruthRegion[];
+  /** 模型输出（`analyzePageLayout` 成功时的 `result.regions` 原样传入） */
+  predicted: readonly LayoutTruthRegion[];
+}
+
+/**
+ * 逐类别的混淆计数。
+ *
+ * 四个数都留着而不是只留 precision/recall：**分母是几**决定了这个分数
+ * 有多可信。`tp=1, fp=0, fn=0` 的 `seal` 与 `tp=40, fp=8, fn=6` 的
+ * `text` 都被算成「不错的分数」，但它们对决策的价值完全不同。
+ */
+export interface LayoutCategoryScore {
+  label: string;
+  tp: number;
+  fp: number;
+  fn: number;
+  /** 标注里有几个（`tp + fn`） */
+  truthCount: number;
+  /** 模型报了几个（`tp + fp`） */
+  predictedCount: number;
+  /** `tp / (tp + fp)`；模型一个都没报时为 `null` —— **不是 0** */
+  precision: number | null;
+  /** `tp / (tp + fn)`；标注里没有这一类时为 `null` */
+  recall: number | null;
+  /** `2PR / (P + R)`；任一为 `null` 或 `P + R === 0` 时为 `null` */
+  f1: number | null;
+}
+
+/**
+ * **评测的基准标识** —— 这是 T2 里最不能省的一段。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么分数必须挂在一个有名字的基准上
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 官方那份 `PP-DocLayout-S` 的自评 mAP 是 **70.9**，但它挂在**「500 张
+ * 中英文论文/报纸/试卷的自建集」**上；同一族里 `PP-DocLayout-L` 是 90.4，
+ * 挂在「500 张自建集」上、`PP-DocLayout_plus-L` 是 83.2，挂在
+ * **「1300 张自建集」**上。三套评测集口径不同，
+ * **跨口径比较 mAP 是错的**（这一点路线图 附录 A 已经指出）。
+ *
+ * 所以本项目的分数也必须连**基准身份**一起报，否则下次换了标注集
+ * 就会得到一串无法比较的数字。参照 MinerU 的做法（changelog 里每次
+ * 报分都写明 `OmniDocBench v1.5` / `v1.6`）—— **只借鉴这个纪律，
+ * 没有引入它任何代码或权重**。
+ */
+export interface LayoutBenchmarkIdentity {
+  /** 基准名（例如 `ur-layout-bench`）；换标注集必须换名字 */
+  name: string;
+  /** 基准版本（例如 `v1`）；同名不同版本**不可比** */
+  version: string;
+  /** 标注页数 */
+  pageCount: number;
+  /** 页都是从哪来的（用户文档名/类型）—— 「分数是拿什么测的」 */
+  source: string;
+  /** 谁标的（单人/双人交叉）—— 标注质量决定分数上限 */
+  annotatedBy: string;
+  /** 标注时间（ISO 日期），便于与代码版本对齐 */
+  annotatedAt: string;
+}
+
+/**
+ * 一次评测的**模型身份** —— 分数必须能追到具体是哪份权重跑出来的。
+ *
+ * 用 sha256 而不是「模型名」：本项目下载脚本与 `verify-dist.mjs`
+ * 都按 `LAYOUT_MODEL_SHA256` 硬校验，所以这个值在生产里是**真的钉住**的。
+ * 写「PP-DocLayout-S」是不够的 —— 上游换了导出件，名字不会变。
+ */
+export interface LayoutModelIdentity {
+  file: string;
+  sha256: string;
+  /** 上游声明的精度，连同它的口径一起记 —— 不然后人会拿它和本项目分数直接比 */
+  upstreamMap: number;
+  upstreamMapBasis: string;
+}
+
+/** 可发版判据：哪些类别必须达到多少 recall / precision */
+export interface LayoutReleaseGate {
+  /** 这些类别**不允许**漏到 `recall` 之下 */
+  minRecall: Readonly<Record<string, number>>;
+  /** 这些类别**不允许**precision 掉到之下（防「为了召回乱框」） */
+  minPrecision: Readonly<Record<string, number>>;
+  /**
+   * ⭐ 这些类别**必须至少报出这么多个**，否则门禁直接不通过。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * 为什么必须有这一条（这是写负向测试时**实测发现**的一个门禁漏洞）
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * `precision = tp / (tp + fp)` —— 模型**一个都没报**时这个分数是
+   * `null`（「没报过」不等于「报错了」，见 `LayoutCategoryScore.precision`
+   * 的注释）。而门禁原来的写法是「`actual === null` → 本轮未被检验 → 通过」。
+   *
+   * 两条放在一起就出现一个**荒唐的漏洞**：
+   *
+   *   把某一类的预测**全部删掉**（或全改判成别的类），
+   *   那一类的 `precision` 变成 `null` → 门禁**判它通过**。
+   *   也就是说「模型什么都不做」比「模型做错」更容易过门禁。
+   *
+   * 这个漏洞是**实测**出来的，不是想出来的：负向测试
+   * 「把所有 `text` 预测改成 `image`」原本断言 `text.precision === 0`，
+   * 实测拿到的是 `null` —— 断言红了，红的原因不是测试写错，
+   * 而是**门禁本身漏了一种情况**。
+   *
+   * 所以补上这一条：*报得少* 这件事本身就要能被门禁抓住。
+   * 取 1 是刻意的**最低**要求 —— 它的意思只是「这一类至少出现过」，
+   * 不假装能替代「覆盖了多少区域」（那要看 `predictedCount` 本身）。
+   */
+  minPredictedCount: Readonly<Record<string, number>>;
+}
+
+/**
+ * 本项目的默认发版门禁。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么门禁只压三个类别
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 与本项目的**用户可见缺陷**对齐（不是与 mAP 对齐）：
+ *
+ *  · `header` / `footer` —— 页眉页脚。**漏判的直接后果是用户看到一行
+ *    页脚混在正文里**（用户实测报障过的两行正是这种）。recall 门槛
+ *    取 0.8：允许漏，但一页里大部分必须抓到；
+ *  · `text` —— 正文。precision 门槛是这里**最重要**的一个：本项目
+ *    把 `text` 区域用于「否决标题判定」，一旦模型把标题也框成 `text`，
+ *    标题就会整片消失。0.9 对应「十行里最多错一行」。
+ *
+ * ⚠️ **不给 `seal` / `formula_number` / `header_image` 之类设门槛**：
+ * 它们在真实页面上出现次数极少（常常 0–1 个），一页标错就让
+ * recall 变 0 或 1 —— 拿这种数当发版门禁只会让人把门禁关掉。
+ * 它们仍然**照常报分**，只是不参与 pass/fail。
+ *
+ * ⚠️ **门禁是「不许更差」，不是「够好了」**：它的作用与
+ * `scripts/verify-dist.mjs` 同形 —— 拦住回归，而不是宣布质量。
+ */
+export const DEFAULT_LAYOUT_RELEASE_GATE: LayoutReleaseGate = {
+  minRecall: { header: 0.8, footer: 0.8 },
+  minPrecision: { text: 0.9 },
+  /**
+   * ⚠️ 这三类**至少各要报出来一个**：它们的 `precision` 在「一个都没报」
+   * 时是 `null`，而 `null` 按「未被检验」处理会让门禁静默放行
+   * （见 `LayoutReleaseGate.minPredictedCount` 的注释）。
+   * 也就是说：**「模型没干活」本身就必须是一条能拦住发版的事实。**
+   */
+  minPredictedCount: { text: 1, header: 1, footer: 1 },
+};
+
+/** 一个类别在门禁下的结论 */
+export interface LayoutGateVerdict {
+  label: string;
+  metric: 'recall' | 'precision' | 'predictedCount';
+  required: number;
+  /** 实测值；`predictedCount` 这一项永远是数，另两项可能是 `null` */
+  actual: number | null;
+  pass: boolean;
+  /** `actual === null` 时说明为什么没有这个数（不能在报告里变成一个空格） */
+  note?: string;
+}
+
+/** 一次评测的完整结果 —— 这就是「发版要报的那一份」 */
+export interface LayoutEvaluationReport {
+  benchmark: LayoutBenchmarkIdentity;
+  model: LayoutModelIdentity;
+  /** 逐类别，按 `LAYOUT_LABELS` 顺序（固定顺序 = 两份报告可以逐行 diff） */
+  categories: LayoutCategoryScore[];
+  /** 微平均（把全部类别的 tp/fp/fn 加起来算一个数） */
+  micro: { precision: number | null; recall: number | null; f1: number | null };
+  gate: LayoutGateVerdict[];
+  /**
+   * **能不能发版**。语义严格限定为「上面那些门禁是否全过」——
+   * 它**不**表示「模型够好」，只表示「没有踩到已登记的红线」。
+   */
+  releasable: boolean;
+  /** 匹配口径的**一句话自述**，必须原样出现在报告里（见 `matchRegions`） */
+  matcher: string;
+}
+
+/**
+ * 预测区域与真值区域的匹配口径。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么是「IoU ≥ 阈值 + 类别相同」的贪心匹配，而不是按中心点
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 中心点匹配会把一个**只框住标题一半**的预测算成全中（中心落在真值里），
+ * 于是 `precision` 虚高；而版面模型在 480×480 上判小字号区域时，
+ * 框偏一点是常态。IoU 对「框得多准」敏感，是更诚实的口径。
+ *
+ * 贪心（每个真值取 IoU 最大的未占用预测）而不是匈牙利算法：
+ * 后者的收益在**同类且重叠**的区域上才体现，而那种情况在单页二十来个
+ * 区域的规模下极少；代价是几十行实现与一个必须维护的不变量。
+ * **取 0.5** 与 COCO 的 mAP@0.5 同口径 —— 上游自评的 70.9 就是 mAP(0.5)，
+ * 同口径才能把两个数字放在一起看（虽然评测集不同，仍必须标注）。
+ *
+ * @returns 逐类别的 tp/fp/fn，以及匹配口径的自述文本
+ */
+export function matchRegions(
+  truth: readonly LayoutTruthRegion[],
+  predicted: readonly LayoutTruthRegion[],
+  iouThreshold = 0.5,
+): {
+  tp: Map<string, number>;
+  fp: Map<string, number>;
+  fn: Map<string, number>;
+  matcher: string;
+} {
+  const tp = new Map<string, number>();
+  const fp = new Map<string, number>();
+  const fn = new Map<string, number>();
+
+  const bump = (map: Map<string, number>, key: string): void => {
+    map.set(key, (map.get(key) ?? 0) + 1);
+  };
+
+  const usedPred = new Set<number>();
+  for (const t of truth) {
+    let bestIndex = -1;
+    let bestIou = 0;
+    predicted.forEach((p, i) => {
+      if (usedPred.has(i)) return;
+      if (p.label !== t.label) return;
+      const iou = boxIoU(t, p);
+      if (iou > bestIou) {
+        bestIou = iou;
+        bestIndex = i;
+      }
+    });
+    if (bestIndex >= 0 && bestIou >= iouThreshold) {
+      usedPred.add(bestIndex);
+      bump(tp, t.label);
+    } else {
+      bump(fn, t.label);
+    }
+  }
+  predicted.forEach((p, i) => {
+    if (!usedPred.has(i)) bump(fp, p.label);
+  });
+
+  return {
+    tp,
+    fp,
+    fn,
+    matcher: `同类 + IoU ≥ ${iouThreshold}（贪心一对一，每个真值取 IoU 最大的未占用预测）`,
+  };
+}
+
+/** 标准 IoU；任一框零面积时返回 0（而不是 NaN 或 Infinity） */
+export function boxIoU(a: LayoutTruthRegion, b: LayoutTruthRegion): number {
+  const w = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0);
+  const h = Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0);
+  if (w <= 0 || h <= 0) return 0;
+  const inter = w * h;
+  const areaA = Math.max(0, a.x1 - a.x0) * Math.max(0, a.y1 - a.y0);
+  const areaB = Math.max(0, b.x1 - b.x0) * Math.max(0, b.y1 - b.y0);
+  const union = areaA + areaB - inter;
+  if (!(union > 0)) return 0;
+  return inter / union;
+}
+
+/**
+ * T2 的主入口：**真值 + 预测 → 逐类别 precision / recall + 发版结论**。
+ *
+ * ⚠️ 本函数**不做任何阈值调整**。这是刻意的：第一个版本只测量
+ * （MinerU 的「发版即报分」纪律里，报分与调参是两件事）。想调阈值，
+ * 请先在报告里留下**调之前**的那个分数，否则「变好了」无从证明。
+ *
+ * ⚠️ 「分母为零」一律给 `null` 而不是 0：
+ *   · 模型一个 `seal` 都没报 → precision **无定义**（不是 0%）。
+ *     写成 0 会让报告显示「seal 精度 0%」，而事实是「没报过」；
+ *   · 标注里没有 `seal` → recall 无定义。
+ * 这两种情况在表里显示 `—`，在门禁里显示「没有这个数」并**不算失败**
+ * （否则没标注的类别会永久堵住发版）—— 但 `minPredictedCount` 那一层
+ * 仍然会拦住「模型什么都没报」。
+ */
+export function evaluateLayoutPredictions(
+  pages: readonly LayoutEvalPage[],
+  benchmark: LayoutBenchmarkIdentity,
+  model: LayoutModelIdentity,
+  gate: LayoutReleaseGate = DEFAULT_LAYOUT_RELEASE_GATE,
+  iouThreshold = 0.5,
+): LayoutEvaluationReport {
+  if (!pages.length) {
+    throw new Error('版面评测至少要有一页真值 —— 空评测集会产出「全部分母为 0」的假报告');
+  }
+
+  const totalTp = new Map<string, number>();
+  const totalFp = new Map<string, number>();
+  const totalFn = new Map<string, number>();
+  let matcher = '';
+
+  for (const page of pages) {
+    if (!(page.width > 0) || !(page.height > 0)) {
+      throw new Error(`版面评测：页 ${page.pageId} 的画布尺寸非法（${page.width}×${page.height}）`);
+    }
+    for (const region of [...page.truth, ...page.predicted]) {
+      if (!LAYOUT_LABELS.includes(region.label as LayoutLabel)) {
+        /**
+         * 未知类别必须**当场报错**而不是忽略：忽略的表现是
+         * 「这一类的分数永远是 0」，而人会去找模型的问题 ——
+         * 实际原因只是标注里拼错了一个词。
+         */
+        throw new Error(
+          `版面评测：页 ${page.pageId} 出现未知类别 '${region.label}'（必须是 LAYOUT_LABELS 之一）`,
+        );
+      }
+    }
+    const m = matchRegions(page.truth, page.predicted, iouThreshold);
+    matcher = m.matcher;
+    for (const [k, v] of m.tp) totalTp.set(k, (totalTp.get(k) ?? 0) + v);
+    for (const [k, v] of m.fp) totalFp.set(k, (totalFp.get(k) ?? 0) + v);
+    for (const [k, v] of m.fn) totalFn.set(k, (totalFn.get(k) ?? 0) + v);
+  }
+
+  // 顺序固定跟着 LAYOUT_LABELS：两份报告可以逐行 diff，不会因为
+  // 「哪一类先出现」而看起来不同。
+  const categories: LayoutCategoryScore[] = LAYOUT_LABELS.map((label) => {
+    const tp = totalTp.get(label) ?? 0;
+    const fp = totalFp.get(label) ?? 0;
+    const fn = totalFn.get(label) ?? 0;
+    const precision = tp + fp > 0 ? tp / (tp + fp) : null;
+    const recall = tp + fn > 0 ? tp / (tp + fn) : null;
+    const f1 =
+      precision !== null && recall !== null && precision + recall > 0
+        ? (2 * precision * recall) / (precision + recall)
+        : null;
+    return {
+      label,
+      tp,
+      fp,
+      fn,
+      truthCount: tp + fn,
+      predictedCount: tp + fp,
+      precision: precision === null ? null : round4(precision),
+      recall: recall === null ? null : round4(recall),
+      f1: f1 === null ? null : round4(f1),
+    };
+  });
+
+  const sum = (map: Map<string, number>): number => [...map.values()].reduce((a, b) => a + b, 0);
+  const mTp = sum(totalTp);
+  const mFp = sum(totalFp);
+  const mFn = sum(totalFn);
+  const microPrecision = mTp + mFp > 0 ? mTp / (mTp + mFp) : null;
+  const microRecall = mTp + mFn > 0 ? mTp / (mTp + mFn) : null;
+  const microF1 =
+    microPrecision !== null && microRecall !== null && microPrecision + microRecall > 0
+      ? (2 * microPrecision * microRecall) / (microPrecision + microRecall)
+      : null;
+
+  const byLabel = new Map(categories.map((c) => [c.label, c]));
+  const gateVerdicts: LayoutGateVerdict[] = [];
+  for (const [label, required] of Object.entries(gate.minRecall)) {
+    const score = byLabel.get(label);
+    const actual = score?.recall ?? null;
+    gateVerdicts.push({
+      label,
+      metric: 'recall',
+      required,
+      actual,
+      // 「标注里没有这一类」→ 这个门禁**本轮没有被检验**，不算失败。
+      // 若算失败，一份没标 seal 的集合会永久堵住发版。
+      pass: actual === null ? true : actual >= required,
+      ...(actual === null ? { note: '本轮真值里没有这一类，门禁未被检验' } : {}),
+    });
+  }
+  for (const [label, required] of Object.entries(gate.minPrecision)) {
+    const score = byLabel.get(label);
+    const actual = score?.precision ?? null;
+    gateVerdicts.push({
+      label,
+      metric: 'precision',
+      required,
+      actual,
+      pass: actual === null ? true : actual >= required,
+      ...(actual === null ? { note: '本轮模型没有报出这一类，门禁未被检验' } : {}),
+    });
+  }
+  /**
+   * ⭐ 报得**太少**也要能拦住 —— 否则「一个都没报」会让上面那条
+   * precision 门禁因为 `null` 而静默通过（见
+   * `LayoutReleaseGate.minPredictedCount` 的注释，那是实测发现的漏洞）。
+   */
+  for (const [label, required] of Object.entries(gate.minPredictedCount)) {
+    const score = byLabel.get(label);
+    const actual = score?.predictedCount ?? 0;
+    gateVerdicts.push({
+      label,
+      metric: 'predictedCount',
+      required,
+      actual,
+      pass: actual >= required,
+      ...(actual < required
+        ? { note: `模型一个 \`${label}\` 区域都没报出来 —— 它可能根本没在工作` }
+        : {}),
+    });
+  }
+
+  return {
+    benchmark,
+    model,
+    categories,
+    micro: {
+      precision: microPrecision === null ? null : round4(microPrecision),
+      recall: microRecall === null ? null : round4(microRecall),
+      f1: microF1 === null ? null : round4(microF1),
+    },
+    gate: gateVerdicts,
+    releasable: gateVerdicts.every((v) => v.pass),
+    matcher,
+  };
+}
+
+/**
+ * 报告 → 可直接贴进 `HANDOFF.md` 的 Markdown。
+ *
+ * **表头三行是刻意放在最上面的**：基准名/版本、模型 sha256、匹配口径。
+ * MinerU 的 changelog 每次报分都写明基准版本（`v1.5` / `v1.6`），
+ * 本项目照抄这条纪律 —— 一个没有基准标识的分数，下一次换标注集之后
+ * 就变成了一串无法解释的数字。
+ */
+export function renderLayoutEvaluationReport(report: LayoutEvaluationReport): string {
+  const { benchmark: b, model: m } = report;
+  const pct = (v: number | null): string => (v === null ? '—' : `${(v * 100).toFixed(1)}%`);
+
+  const lines: string[] = [];
+  lines.push(`### 版面模型发版评测：${report.releasable ? '✅ 可发版' : '❌ 不可发版'}`);
+  lines.push('');
+  lines.push(
+    `- **基准**：\`${b.name}\` **${b.version}**（${b.pageCount} 页；来源：${b.source}；标注：${b.annotatedBy}；${b.annotatedAt}）`,
+  );
+  lines.push(`- **模型**：\`${m.file}\` sha256 \`${m.sha256.slice(0, 16)}…\``);
+  lines.push(
+    `- **上游自评**：mAP(0.5) = ${m.upstreamMap}（口径：${m.upstreamMapBasis}）—— ⚠️ **与本表不可直接比较**（标注集不同）`,
+  );
+  lines.push(`- **匹配口径**：${report.matcher}`);
+  lines.push('');
+  lines.push('| 类别 | 真值数 | 预测数 | TP | FP | FN | precision | recall | F1 |');
+  lines.push('|---|---|---|---|---|---|---|---|---|');
+  for (const c of report.categories) {
+    lines.push(
+      `| \`${c.label}\` | ${c.truthCount} | ${c.predictedCount} | ${c.tp} | ${c.fp} | ${c.fn} | ${pct(c.precision)} | ${pct(c.recall)} | ${pct(c.f1)} |`,
+    );
+  }
+  lines.push(
+    `| **微平均** | — | — | — | — | — | **${pct(report.micro.precision)}** | **${pct(report.micro.recall)}** | **${pct(report.micro.f1)}** |`,
+  );
+  lines.push('');
+  lines.push('**发版门禁**：');
+  lines.push('');
+  lines.push('| 类别 | 指标 | 门槛 | 实测 | 结论 |');
+  lines.push('|---|---|---|---|---|');
+  const asText = (v: LayoutGateVerdict): string =>
+    v.metric === 'predictedCount' ? `${v.actual} 个` : pct(v.actual);
+  for (const v of report.gate) {
+    lines.push(
+      `| \`${v.label}\` | ${v.metric} | ≥ ${v.metric === 'predictedCount' ? v.required : `${(v.required * 100).toFixed(0)}%`} | ${asText(v)} | ${v.pass ? '通过' : '**不通过**'}${v.note ? `（${v.note}）` : ''} |`,
+    );
+  }
+  lines.push('');
+  lines.push(
+    '> ⚠️ 「可发版」的语义严格限定为「上面这些门禁全过」，**不表示模型够好**；' +
+      '它拦的是回归，不是宣布质量（与 `scripts/verify-dist.mjs` 同一纪律）。',
+  );
+  return lines.join('\n');
+}
+
+/**
+ * 负向测试用的**预测扰动器**：把某一类别的预测整体改成另一类。
+ *
+ * 为什么要把它**放在生产模块里导出**、而不是写在测试文件里：
+ * 它是「这个评测脚本真的在测量」这条验收标准的**可执行形式** ——
+ * T2 的验收标准第 3 条要求「把所有 `header` 改成 `text`，
+ * `header` 的 recall 必须掉到接近 0」。把扰动器放进测试文件，
+ * 下次有人重写测试时它会跟着消失；放在这里，它是一条有名字的能力，
+ * 可以被测试、被报告、被复用。
+ *
+ * ⚠️ 它**只改 `label`，不动坐标**：坐标一动就会连带改变 IoU 匹配，
+ * 于是 recall 的下降无法归因到「类别被判错」这一件事上。
+ */
+export function scrambleLabels(
+  regions: readonly LayoutTruthRegion[],
+  from: string,
+  to: string,
+): LayoutTruthRegion[] {
+  return regions.map((r) => (r.label === from ? { ...r, label: to } : { ...r }));
+}
+
