@@ -40,10 +40,20 @@
 > 用户导入 md / txt / pdf / epub，获得双语对照、语音朗读、批注能力，
 > **文档全程不离开浏览器**。
 >
-> ⚠️ 最后一句有**一处例外，且已于本轮收口**：`5184bde` 引入的 SimpleTex 公式 OCR
-> 是**唯一**会把页面局部像素送出本机的路径，但它现在是**默认关闭的显式开关**
-> （`settingsStore.formulaOcrEnabled`，默认 `false`）—— 不勾选就一个字节都不外发。
-> 详见 §1 的 T2、§5.8 与 §1 末尾的「本轮三项决定」。
+> ⚠️ 最后一句是**承诺，不是宣传语** —— 它在默认状态下字面为真。
+> 全项目共有**三条**能把文档内容送出本机的路径，**三条都是默认关闭的显式开关**：
+>
+> | 路径 | 设置项 | 默认 |
+> |---|---|---|
+> | 公式识别增强（页面局部像素 → SimpleTex） | `formulaOcrEnabled` | `false` |
+> | 云端翻译（段落正文 → DeepL / OpenAI） | `cloudTranslationConsent` | `false` |
+> | 云端语音合成（段落正文 → Azure） | `ttsCloudConsent` | `false` |
+>
+> **不勾选就一个字节都不外发。** 机器可读的清单见 `src/lib/outboundPaths.ts`，
+> 它同时被设置面板渲染、被 `src/store/outboundPrivacy.test.ts` 断言。
+> 详见 §1 的 T2。⚠️ **本轮更正**：此前 T2 把公式 OCR 记成「**唯一**」一条，
+> 那是错的 —— 云端翻译与云端语音当时还是静默开启的（`ttsPreference: 'auto'`
+> 配了端点就自动把正文 POST 到 Azure，界面上零告知），缺口是三倍而不是零。
 
 | 项 | 值 |
 |---|---|
@@ -94,7 +104,7 @@
 | 编号 | 张力 | 具体事实 |
 |---|---|---|
 | T1 | **C2 离线 × 首次 OCR 需要联网**（**仍未解决，但第三方域名的依赖风险已部分收口**） | OCR 引擎换成 PaddleOCR / ONNX Runtime Web 之后，**模型（约 30MB）与 ONNX WASM（约 28MB，来自 jsDelivr）都只在运行时缓存里**（`ocr-models`、`onnx-wasm`，均 CacheFirst），**不在预缓存清单里**。也就是说「用过一次之后才能离线用」。国内网络对第三方 CDN 的可达性不保证，这是**外部依赖风险**。<br>**§5.10 那一轮部分收口**：模型改为**构建时取好、与站点同源发布**（`scripts/fetch-ocr-models.mjs` → `public/ocr-models/`，默认 base 就是同源 `/ocr-models`），运行时**不再请求 `huggingface.co` / `hf-mirror.com`** —— 那正是浏览器报 `TypeError: Failed to fetch` 的来源。但模型**仍不在预缓存清单里**，所以「首次 OCR 必须联网」这一条**不变**；ONNX WASM 仍来自 `cdn.jsdelivr.net`<br>**今天后半程补记（§5.11）**：模型现在是 **4 个 / 34.59 MiB**（新增版面模型 `PP-DocLayout-S` **4.69 MiB**），**同样不在预缓存清单里** —— 它走的是 `ocr-models` 这条运行时缓存（`vite.config.ts` 里 `cacheName: 'ocr-models'` 的那条规则），所以**首次 OCR 要多取 4.7 MiB**，「首次必须联网」这一条**不变**【实测】模型字节数 / 读源码 |
-| T2 | **C3 隐私 × SimpleTex 公式 OCR**（**本轮已收口**） | `5184bde` 引入的公式增强会把**页面局部像素**（裁剪出的公式区域，客户端上限 `MAX_IMAGE_SIZE = 2_000_000` 字节）POST 到自建 Worker，再由 Worker 以 `Authorization: Bearer <key>` 转发到第三方 `https://server.simpletex.cn/api/v1/simpletex_recognize`。这是本项目**唯一**把文档内容送出本机的路径。**本轮改为默认关闭的显式开关**（`settingsStore.formulaOcrEnabled`，默认 `false`）：不勾选 → 不发起任何网络请求、一个字节都不外发。**但残余点必须保留**：勾选后仍会上传；需要联网；Worker 未配 `SIMPLETEX_API_KEY` 时该端点在线上实测仍返回 500；应用内**没有**「上传了什么」的审计视图。见 §5.8 与 §4.2 |
+| T2 | **C3 隐私 × 三条外发路径**（**本轮真正收口**；此前只收了三条里的第一条） | **⚠️ 本条此前写着「这是本项目唯一把文档内容送出本机的路径」—— 那句话是错的。** 实际有**三条**：<br>① **公式增强**：`5184bde` 引入，把**页面局部像素**（裁剪出的公式区域，客户端上限 `MAX_IMAGE_SIZE = 2_000_000` 字节）POST 到自建 Worker，再由 Worker 以 `Authorization: Bearer <key>` 转发到第三方 `https://server.simpletex.cn/api/v1/simpletex_recognize`。**已改为默认关闭的显式开关** `formulaOcrEnabled`（默认 `false`）。<br>② **云端翻译**：把**段落正文**经 Worker 转发给 DeepL / OpenAI。此前 `resolveInitialEngine()` 只要构建时配了 `VITE_TRANSLATE_ENDPOINT` 就自动选 `'deepl'` —— **用户什么都不用做，正文就会外发**。<br>③ **云端语音**：把**段落正文**经 Worker 转发给 Azure。此前 `ttsPreference` 默认 `'auto'`，语义正是「配了 `VITE_TTS_ENDPOINT` 就用云端」—— **零告知的默认外发**。<br>**本轮把 `formulaOcrEnabled` 的四要素推广成不变量，三条全部满足**：① 默认关闭 ② 用户显式同意（`ttsCloudConsent` / `cloudTranslationConsent`，独立于引擎偏好）③ 代码层第二道防线（`translationService.translateWithProxy` / `ttsEngine.CloudTTSEngine.speak` / `formulaOcrService.recognizeFormula` 各自再查一次）④ 代价透明（设置面板写清"什么内容、发到哪、为什么"）。<br>**残余点（如实保留）**：勾选后仍会上传；需要联网；Worker 未配密钥时对应端点会 500；本机外发记录**只有当前开关状态，没有历史外发日志**。见 §5.8 与 `src/store/outboundPrivacy.test.ts` |
 
 > 上一轮单列的「PWA 更新模式自相矛盾」**已于本轮拍板**：保留 `autoUpdate`，永不触发的提示 UI 已删除。见 §5.7。
 

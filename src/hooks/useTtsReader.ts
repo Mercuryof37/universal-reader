@@ -4,6 +4,7 @@ import { describeUnknownError } from '@/lib/diagnostics';
 import {
   BrowserTTSEngine,
   createTTSEngine,
+  resolveTtsEngineId,
   type TTSEngine,
   type TTSOptions,
 } from '@/services/ttsEngine';
@@ -20,6 +21,7 @@ import { useSettingsStore } from '@/store/settingsStore';
  */
 export function useTtsReader(blocks: ContentBlock[]) {
   const preference = useSettingsStore((s) => s.ttsPreference);
+  const cloudConsent = useSettingsStore((s) => s.ttsCloudConsent);
   const rate = useSettingsStore((s) => s.ttsRate);
   const pitch = useSettingsStore((s) => s.ttsPitch);
   const voiceName = useSettingsStore((s) => s.ttsVoiceName);
@@ -39,7 +41,7 @@ export function useTtsReader(blocks: ContentBlock[]) {
   autoContinueRef.current = autoContinue;
   playingIndexRef.current = playingIndex;
 
-  /** 引擎按偏好懒创建；创建失败时降级到浏览器原生 */
+  /** 引擎按偏好懒创建（`createTTSEngine` 内部会再过一次同意位） */
   const getEngine = useCallback((): TTSEngine => {
     if (!engineRef.current) {
       engineRef.current = createTTSEngine(preference);
@@ -47,13 +49,17 @@ export function useTtsReader(blocks: ContentBlock[]) {
     return engineRef.current;
   }, [preference]);
 
-  // 切换引擎偏好时销毁旧实例，避免"云端引擎还在放音，浏览器引擎又开始读"
+  // 切换引擎偏好或**撤回/给出同意**时销毁旧实例。
+  //
+  // `cloudConsent` 必须在依赖里：撤回同意会让 `createTTSEngine` 改走浏览器
+  // 原生，而旧实例是云端引擎 —— 不销毁就会出现「界面说已关闭外发，
+  // 而云端引擎还在放上一段音频」，那是一种新的不诚实。
   useEffect(() => {
     return () => {
       engineRef.current?.stop();
       engineRef.current = null;
     };
-  }, [preference]);
+  }, [preference, cloudConsent]);
 
   const stop = useCallback(() => {
     sessionRef.current += 1;
@@ -134,10 +140,23 @@ export function useTtsReader(blocks: ContentBlock[]) {
   /** 可用音色列表（仅浏览器原生引擎需要展示） */
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   useEffect(() => {
-    if (preference === 'cloud') return;
+    // 与 `createTTSEngine` 同口径：只有**真的**会走云端时才不取原生音色。
+    // 以前这里只看 preference，于是「选了云端但没配端点/没同意」时
+    // 音色列表是空的 —— 而实际播放的是浏览器原生，用户选不了音色。
+    if (resolveTtsEngineId(preference) === 'cloud') return;
     const engine = new BrowserTTSEngine();
     void engine.getVoices().then(setVoices).catch(() => setVoices([]));
-  }, [preference]);
+  }, [preference, cloudConsent]);
+
+  /**
+   * 此刻实际会用的引擎。
+   *
+   * 目前只有测试直接消费它 —— 界面侧由 `TtsVoiceSelector` 用**同一个函数**
+   * （`resolveTtsEngineId`）自己算一遍，所以两边不可能给出不同答案。
+   * 保留在返回值里是为了让「界面显示的引擎」这条事实**可以被断言**，
+   * 而不必去渲染组件。
+   */
+  const activeEngine = resolveTtsEngineId(preference);
 
   const progress = useMemo(
     () => (playingIndex === null || !blocks.length ? 0 : (playingIndex + 1) / blocks.length),
@@ -150,6 +169,8 @@ export function useTtsReader(blocks: ContentBlock[]) {
     progress,
     voices,
     error,
+    /** 实际生效的引擎（= 'browser' 时不会外发任何内容） */
+    activeEngine,
     clearError: () => setError(null),
     toggle,
     playFrom,

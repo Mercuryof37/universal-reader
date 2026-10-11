@@ -1,4 +1,5 @@
 import { splitForSpeech } from '@/lib/utils';
+import { useSettingsStore } from '@/store/settingsStore';
 
 export interface TTSOptions {
   /** 0.5 - 2.0 */
@@ -165,6 +166,27 @@ export class CloudTTSEngine implements TTSEngine {
   constructor(private endpoint = '/api/tts') {}
 
   async speak(text: string, lang: string, options: TTSOptions = {}): Promise<void> {
+    /**
+     * 第二道防线（**在真正发请求的那个类里**）。
+     *
+     * `createTTSEngine` 已经拦了一次，但那是**工厂**的自律：本类是
+     * `export` 的，将来任何一处直接 `new CloudTTSEngine(endpoint)`
+     * 都会绕过工厂，静默把正文发出去。真正执行外发的是下面那个
+     * `fetch`（`fetchChunk`），所以拒绝必须发生在这里 ——
+     * 与 `formulaOcrService.ts` 的 `recognizeFormula` 是同一个理由、
+     * 同一种写法。
+     *
+     * 抛错而不是静默改成浏览器原生：这里已经进到"要放音"的路径上了，
+     * 静默换成另一个引擎会让 `useTtsReader` 的播放状态机错乱
+     * （上层的 `engineRef` 认为自己在用云端）。抛错会被
+     * `useTtsReader.speakIndex` 的 catch 收敛成一条可读提示。
+     */
+    if (!useSettingsStore.getState().ttsCloudConsent) {
+      throw new Error(
+        '云端语音未获同意（ttsCloudConsent = false），已拒绝发送正文。请在「设置 → 语音朗读」中显式开启。',
+      );
+    }
+
     this.stop();
     const chunks = splitForSpeech(text, 220);
 
@@ -293,21 +315,72 @@ export function hasCloudTTSConfig(): boolean {
 
 /**
  * 引擎选择策略：把"降级"写在一个地方。
- * auto 模式下有云端配置用云端，否则用浏览器原生——保证功能永远不会因为没配密钥而不可用。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 第二道防线：没有显式同意，就不允许走云端
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 这条路径此前是**静默开启**的。原来的实现是：
+ *
+ *   function createTTSEngine(preference) {
+ *     if (preference === 'cloud') { … }
+ *     if (preference === 'browser') return new BrowserTTSEngine();
+ *     return hasCloudTTSConfig()          // ← 'auto' 分支
+ *       ? new CloudTTSEngine(import.meta.env.VITE_TTS_ENDPOINT)
+ *       : new BrowserTTSEngine();
+ *   }
+ *
+ * 而 `ttsPreference` 的默认值就是 `'auto'`。于是「构建时配了
+ * `VITE_TTS_ENDPOINT`」这一个**部署侧**事实，等价于「**每个**用户都同意
+ * 把自己的正文 POST 到 Azure」——用户点「朗读」时，正文就已经在网线上，
+ * 而界面上一个字都没说。这与 manifest 里「文档全程留在本机浏览器，
+ * 不上传服务器」直接冲突。
+ *
+ * 修法有两层，缺一不可：
+ * 1. **`'auto'` 这个取值被删除**（见 `store/settingsStore.ts` 的
+ *    `TtsPreference`）—— 只要它还在，就永远存在「用户没做任何动作、
+ *    内容却外发」的状态，把默认值改掉只是把同一个洞挪个位置。
+ * 2. **这里仍然再查一次同意位**。这就是第二道防线：调这个函数的
+ *    可能是 `useTtsReader`，也可能是将来任何一个新调用方；
+ *    而 `ttsPreference` 本身来自 `localStorage`（可直接编辑）。
+ *    没有这道检查，"状态被误置"就直接等于"正文被发出去"。
+ *
+ * ⚠️ **绝不回退到云端**：同意位为 false 时一律返回 `BrowserTTSEngine`，
+ * 即使调用方点名要 `'cloud'`。失败的方向必须是**不外发**那一边 ——
+ * 用户会听到系统的音色而不是 Azure 的音色，这比悄悄上传好得多。
+ * 界面上会解释为什么（见 `components/TtsVoiceSelector.tsx`）。
  */
-export function createTTSEngine(preference: 'auto' | 'browser' | 'cloud'): TTSEngine {
+export function createTTSEngine(preference: 'browser' | 'cloud'): TTSEngine {
+  const consented = useSettingsStore.getState().ttsCloudConsent;
+  const endpoint = import.meta.env.VITE_TTS_ENDPOINT;
+
   if (preference === 'cloud') {
-    const endpoint = import.meta.env.VITE_TTS_ENDPOINT;
-    if (!endpoint) {
-      throw new Error('未配置云端语音端点（VITE_TTS_ENDPOINT），请改用浏览器原生朗读。');
-    }
+    // 同意的顺序要严格：先问「准不准」，再问「有没有能力」。
+    // 反过来写（先看端点、再报"未配置"）会让一个没有同意过的用户
+    // 收到一条关于端点的技术报错，而真正的原因是缺同意 —— 报错必须
+    // 指向用户能做的那个动作。
+    if (!consented) return new BrowserTTSEngine();
+    if (!endpoint) return new BrowserTTSEngine();
     return new CloudTTSEngine(endpoint);
   }
-  if (preference === 'browser') return new BrowserTTSEngine();
-  return hasCloudTTSConfig()
-    ? new CloudTTSEngine(import.meta.env.VITE_TTS_ENDPOINT)
-    : new BrowserTTSEngine();
+
+  // 'browser'：无需任何检查，它本来就不出本机
+  return new BrowserTTSEngine();
 }
+
+/**
+ * 某个偏好在此刻**实际**会落到哪个引擎上（给界面用）。
+ *
+ * 存在的理由：界面上那个「云端合成」的下拉选项与这里必须同源。
+ * 否则会出现「下拉框写着云端、实际在放浏览器原生」的静默不一致 ——
+ * 那正是这次要修的那类不诚实，只是换了个位置。
+ */
+export function resolveTtsEngineId(preference: 'browser' | 'cloud'): 'browser' | 'cloud' {
+  if (preference !== 'cloud') return 'browser';
+  const consented = useSettingsStore.getState().ttsCloudConsent;
+  return consented && hasCloudTTSConfig() ? 'cloud' : 'browser';
+}
+
 
 function clamp(v: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, v));

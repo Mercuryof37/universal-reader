@@ -363,6 +363,11 @@ export function FileUploadZone({ compact = false }: { compact?: boolean }) {
             <p className="text-xs text-[var(--reader-muted)]">
               文件全程只在你本机浏览器中解析，不会上传到任何服务器
             </p>
+            <p className="text-[11px] leading-relaxed text-[var(--reader-muted)]">
+              唯一的例外是扫描件的<b>公式识别增强</b>：默认关闭，开启后只会把
+              公式所在的那一小块图片发往第三方服务，整份文件始终留在本机。
+              开关与代价写在下面的识别选项里。
+            </p>
           </>
         )}
       </div>

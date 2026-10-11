@@ -4,8 +4,14 @@
  * 将图片中的数学公式识别为 LaTeX，通过 Cloudflare Worker 代理调用 SimpleTex API。
  * 用于扫描版 PDF 中公式区域的精确识别（替代通用 OCR 对公式的低质量输出）。
  *
- * ⚠️ 这是全应用**唯一**会把文档内容送出本机的函数，因此它自己也要检查隐私开关
- * （见下方 `recognizeFormula` 的第二道防线），而不是只依赖调用方自觉。
+ * ⚠️ 这是三条会把文档内容送出本机的路径之一。**不是「唯一」** ——
+ * 这个口径以前写在这里，是错的，也是「本机外发记录」那个审计缺口
+ * 被低估成三分之一的根因：另外两条是云端翻译（`translationService.ts`
+ * 的 `translateWithProxy`）与云端语音（`ttsEngine.ts` 的 `CloudTTSEngine`）。
+ * 三条共用同一套四要素，清单见 `lib/outboundPaths.ts`（并被设置面板渲染）。
+ *
+ * 因此它自己也要检查隐私开关（见下方 `recognizeFormula` 的第二道防线），
+ * 而不是只依赖调用方自觉。
  */
 
 import { useSettingsStore } from '@/store/settingsStore';

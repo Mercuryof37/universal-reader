@@ -292,7 +292,14 @@ export function ReaderView() {
                   targetLang={targetLang}
                   speaking={tts.playingIndex === index}
                   translating={
+                    /*
+                      `translation.engineUsable` 这一项是「安静降级」的另一半：
+                      没有可用引擎时，连"翻译中…"的占位也不该出现 ——
+                      一个永远转下去的占位符，本身就是一句谎话
+                      （它声称有事正在发生，而实际上什么都不会发生）。
+                    */
                     showTranslation &&
+                    translation.engineUsable &&
                     !block.translations[targetLang] &&
                     block.type !== 'code' &&
                     block.type !== 'image'
@@ -405,17 +412,36 @@ export function ReaderView() {
       )}
 
       {/* ── 错误提示 ── */}
-      {(tts.error || translation.error) && (
-        <div className="no-print fixed bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-red-400/60 bg-red-500/10 px-4 py-2 text-xs text-red-700 backdrop-blur dark:text-red-300">
-          {tts.error ?? translation.error}
+      {/*
+        ⚠️ 翻译的「不可用」**不在这里**出现。
+
+        这里以前把 `translation.error` 与 `tts.error` 并列渲染。于是
+        未配代理的部署 + Firefox（用户主用的浏览器）上，每一段翻译都
+        往这个位置推一条「当前浏览器不支持内置翻译」—— 错误条刷屏，
+        而唯一的按钮是「知道了」，用户没有任何出路。
+
+        现在翻译的不可用由两处承担，都不在阅读界面：
+        · 安静降级（不显示译文列、不入队）—— `hooks/useViewportTranslation.ts`；
+        · 可操作的说明 —— 设置里的 `TranslationPanel`。
+
+        保留在这里的是**朗读**的错误，因为那是用户刚刚点了一下、
+        正在期待有声音的场景：这时候安静才是错的，他需要知道为什么没声音。
+        并且给它一个能直达的出路（打开设置），而不是只有一个「知道了」。
+      */}
+      {tts.error && (
+        <div className="no-print fixed bottom-4 left-1/2 z-50 flex max-w-[min(90vw,36rem)] -translate-x-1/2 items-center gap-3 rounded-lg border border-red-400/60 bg-red-500/10 px-4 py-2 text-xs text-red-700 backdrop-blur dark:text-red-300">
+          <span className="min-w-0 flex-1">{tts.error}</span>
           <button
             type="button"
-            className="ml-3 underline"
+            className="shrink-0 underline"
             onClick={() => {
-              if (tts.error) tts.clearError();
-              if (translation.error) translation.clearError();
+              tts.clearError();
+              setPanel('settings');
             }}
           >
+            去设置
+          </button>
+          <button type="button" className="shrink-0 underline" onClick={tts.clearError}>
             知道了
           </button>
         </div>

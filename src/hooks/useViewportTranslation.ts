@@ -2,6 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ContentBlock } from '@/types/content';
 import { describeUnknownError } from '@/lib/diagnostics';
 import {
+  hasCloudTranslationConfig,
+  detectBrowserTranslator,
+} from '@/lib/outboundPaths';
+import {
   TARGET_LANGUAGES,
   isBrowserTranslationAvailable,
   translateBlock,
@@ -18,17 +22,43 @@ import { useLibraryStore } from '@/store/libraryStore';
  * 用户根本不会一次看完——只翻译"看得见的 ± 缓冲"就够用，
  * 成本与等待都降到 1/10 以下。
  *
- * 实现要点：
- * - 并发上限 3：再高会触发多数翻译 API 的限流（429）；
- * - 队列用 ref 保存而不是 state：避免每次入队都触发重渲染；
- * - 译文写回 store 时生成新对象（zustand 靠引用变化感知更新）。
+ * ═══════════════════════════════════════════════════════════════
+ * 「安静降级」：不可用时不要翻译，也不要在阅读界面报错
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 这里以前没有可用性判断，于是未配置代理的部署 + Firefox 上的表现是：
+ * **每一段**翻译都抛一次错，错误条刷满屏幕，而用户没有任何出路
+ * （云端引擎在这个部署上同样不可用）。翻译成了死路，界面还在不停地说
+ * 「失败了」—— 用户既不知道为什么，也不知道能做什么。
+ *
+ * 现在的分工是刻意分开的：
+ * - **阅读界面**：不可用就**根本不入队**（`translateRange` 直接返回），
+ *   用户看不到任何红字，只是没有译文列；
+ * - **解释**：放在用户主动去看的地方（设置 → 双语对照），
+ *   写清缺什么、去哪里配。
+ *
+ * 这个分工本身就是对「诚实」的实现：**阅读界面不撒谎说自己在翻译，
+ * 也不拿一条用户无法处置的错误去打扰他。**
  */
 export function useViewportTranslation(blocks: ContentBlock[]) {
   const targetLang = useSettingsStore((s) => s.translationTargetLang);
   const engine = useSettingsStore((s) => s.defaultTranslationEngine);
+  const cloudConsent = useSettingsStore((s) => s.cloudTranslationConsent);
   const showTranslation = useSettingsStore((s) => s.showTranslation);
   const patchCurrentDoc = useLibraryStore((s) => s.patchCurrentDoc);
   const currentDoc = useLibraryStore((s) => s.currentDoc);
+
+  /**
+   * 这台机器此刻能不能真的翻译。
+   *
+   * 三个条件缺一不可，而且**云端那支还要求用户同意** ——
+   * 「配了端点」只说明能做，不说明准做。
+   */
+  const engineUsable = useMemo(() => {
+    if (!engine) return false;
+    if (engine === 'browser') return detectBrowserTranslator();
+    return hasCloudTranslationConfig() && cloudConsent;
+  }, [engine, cloudConsent]);
 
   const [pending, setPending] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -96,6 +126,19 @@ export function useViewportTranslation(blocks: ContentBlock[]) {
     (startIndex: number, endIndex: number) => {
       if (!showTranslation) return;
 
+      /**
+       * ⭐ 安静降级的那一行。
+       *
+       * 引擎不可用（没有 Translator 的浏览器 / 没配端点 / 云端未获同意）
+       * 时**根本不入队** —— 于是不会产生任何错误、不会刷任何红字，
+       * 阅读界面只是没有译文列。原因写在设置里（`TranslationPanel`）。
+       *
+       * 放在这里而不是放在 `translateBlock` 的 catch 里，是刻意的：
+       * 前者是「不做无意义的事」，后者是「做了再失败再解释」。
+       * 后者在滚动时每帧都会重试一遍，也就是原来那个"刷屏"的来源。
+       */
+      if (!engineUsable) return;
+
       abortRef.current ??= new AbortController();
 
       let queued = 0;
@@ -111,7 +154,7 @@ export function useViewportTranslation(blocks: ContentBlock[]) {
       }
       if (queued) pump();
     },
-    [blocks, showTranslation, pump],
+    [blocks, showTranslation, pump, engineUsable],
   );
 
   /** 一次性翻译全篇（用户明确要求导出或通读时用） */
@@ -157,6 +200,8 @@ export function useViewportTranslation(blocks: ContentBlock[]) {
     targetLang,
     languages: TARGET_LANGUAGES,
     browserTranslationAvailable: isBrowserTranslationAvailable(),
+    /** 此刻是否真的会翻译 —— 界面用它决定要不要画译文列（安静降级） */
+    engineUsable,
   };
 }
 
