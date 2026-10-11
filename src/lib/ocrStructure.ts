@@ -21,7 +21,18 @@ import type { ContentBlock } from '@/types/content';
 import type { OcrWord } from '@/lib/ocrTypes';
 // 字符框不在 `OcrWord` 上 —— 由 `ocrCharBoxes` 用 WeakMap 旁挂，必须显式取。
 // 这条例外值得写出来：看上去像"少了一个字段"，其实是刻意的设计。
-import { getAttachedChars, getCharBoxSkips } from '@/lib/ocrCharBoxes';
+//
+// `buildCharSizeTable` / `charSizeKey` 是**机制 5 那条判据自己用的函数**
+// （不是本文件另写一份）：导出里的「页内同字符最大高度」必须与判据同源，
+// 否则两边会各自漂移（见 `buildOcrStructure` 里 `sizeTable` 的注释）。
+import {
+  buildCharSizeTable,
+  charSizeKey,
+  getAttachedChars,
+  getCharBoxSkips,
+  type AttachedChars,
+  type CharSizeTable,
+} from '@/lib/ocrCharBoxes';
 
 /** 一个词在页面上的原始形态（字段名刻意取短，便于阅读与对比） */
 export interface OcrStructureWord {
@@ -51,6 +62,84 @@ export interface OcrStructureWord {
      * 也是判断那道门到底有没有用的**唯一依据** —— 见下面写出处的注释。
      */
     confidence?: number | null;
+    /**
+     * ═══════════════════════════════════════════════════════════════
+     * 机制 5（按字符自身尺寸）用的三个量 —— 下面三个字段是**一组**
+     * ═══════════════════════════════════════════════════════════════
+     *
+     * **给谁用**：给**下一次改「机制 2（置信度门）与机制 5（按字符自身尺寸
+     * 缩小）的关系」的人**用。现在的判据顺序是「几何 → 置信度 → 自身尺寸」，
+     * 而真指数 `x+y−2` 的高度比**其实已经算出来了** —— 实测 `x` ≈ 0.35、
+     * `2` ≈ 0.50，两者都 < `SCRIPT_MECH5_SCALEDOWN_RATIO`（0.8）；它们
+     * **只是被置信度门挡在前面**（那五个字符的逐字符置信度 0.9205–0.9997，
+     * 门槛 ≈ 0.91）。也就是说「几何合格 **且** 尺寸比 < 0.8 就算通过」
+     * 是一条有实测数字支撑的改法。
+     *
+     * 但**在动手之前，这些量必须先能被看见**：导出里此前只有
+     * `chars[].confidence`，**没有高度比** —— 于是「比值到底是多少」
+     * 只能靠推算，而那正是本项目已经栽过三次的坑（同一个错误：用一个
+     * 没验证过的假设去验证另一个假设），三次都是靠「把看不见却决定结论的
+     * 量变成字段」走出来的：`charBoxSkips` → `charConfidencesComplete`
+     * → `chars[].confidence`。这三个字段是同一件事的第四步。
+     *
+     * ⚠️ 三个字段**永远写出来**（量不到时写 `null`）——「量到了但是 null」
+     * 本身就是信息，与「没有这个字段」是两回事（后者见 `chars` 本身：
+     * 拿不到字符框的词连 `chars` 都不写）。
+     */
+    /**
+     * 该字符的**像素**墨迹高度（= `bbox[3] - bbox[1]`，画布坐标，1 位小数）。
+     *
+     * `null` = 这一位**没有墨迹**：空白位（`word.text` 里的空格，对账时
+     * 给的是退化框），或识别多出/漏掉、逐列墨迹分析没量到墨迹的位。
+     * 判定用的标志与机制 5 建表时**是同一个**：`measurements[i] === null`
+     * （= `buildCharSizeTable` 的第 1 条过滤规则）。
+     *
+     * ───────────────────────────────────────────────────────────────
+     * ⚠️ 为什么必须是**像素**高度，而不是 `InkMeasurement.h`（归一化高度）
+     * ───────────────────────────────────────────────────────────────
+     *
+     * `h` 的分母是**本词自己的裁剪高**，而检测框的紧致程度差异极大 ——
+     * 同一个 `=`（墨迹高 6.1）在两个词里量出来是：
+     *
+     *   · 第 1 词（框高 43 → 裁剪高 ≈ 49）：6.1 / 49 ≈ **0.124**；
+     *   · 第 16 词（框高 ≈ 23 → 裁剪高 ≈ 27）：6.1 / 27 ≈ **0.226**。
+     *
+     * 归一化后两者之比 0.124 / 0.226 ≈ **0.55 < 0.8** —— 本该**拒绝**的
+     * 第 1 词等号会被判成「被缩小了」而**接受**。像素高度是「墨迹本身有
+     * 多高」，两个词的框紧不紧都不影响它，这才是「该字符应有的高度」的
+     * 口径（完整算式与依据见 `ocrCharBoxes.buildCharSizeTable` 的注释）。
+     */
+    inkHeight: number | null;
+    /**
+     * 机制 5 的分母 `H(c)`：**页内同字符**的最大实测像素高度。
+     *
+     * 取自机制 5 那张页级表（`ocrCharBoxes.buildCharSizeTable`），
+     * 键用同一个 `charSizeKey`（只折全角；**不**折大小写、**不**把 Unicode
+     * 上下标归到基字符 —— 每一条都有实测理由，见那个函数的注释）。
+     * 因此它与 `inkHeight` **同源同口径**，可以直接相除。
+     *
+     * `null` 有两种情形，都表示「这个字符在本页没有可用基准」：
+     *  1. **整页都没有表**（提供字符框的词少于 `SCRIPT_MECH5_MIN_WORDS`，
+     *     机制 5 本来就没启用）→ 这一页每个字符都是 `null`；
+     *  2. 这个字符不在表里 —— 它在整页没有留下任何可用的测量值，或者
+     *     它**本身即 Unicode 上下标字符**（`²`/`₂`…，建表刻意排除它们：
+     *     让「天生就矮」的形态去定义「全尺寸」是语义错误）。
+     *     判据对第 2 类走**例外分支直接接受**，根本不查表。
+     */
+    pageMaxHeight: number | null;
+    /**
+     * `inkHeight / pageMaxHeight`（3 位小数）—— 就是机制 5 最后那次比较的
+     * 左操作数（`px / full < SCRIPT_MECH5_SCALEDOWN_RATIO`）。
+     *
+     * `null` = 上面两个量有任何一个为 `null`（没有墨迹，或没有基准）。
+     * 两个高度各舍入到 0.1px 之后才相除，所以 JSON 里这三个数**自洽**：
+     * `heightRatio × pageMaxHeight` 就是 `inkHeight`。
+     *
+     * 为什么比值比坐标多留 2 位小数：这份真实数据里两个**待定读数**相隔
+     * 只有 0.047（`2` 用全页最大 23 → 0.496；只认「21+」那个最保守的
+     * 读数 → 0.543）。1 位小数会把两者都写成 0.5，恰好抹掉要看的差别。
+     */
+    heightRatio: number | null;
   }[];
   /** 整串逐字符置信度是否齐备；缺一个则为 `false`（`AttachedChars` 同一规则） */
   charConfidencesComplete?: boolean;
@@ -202,6 +291,42 @@ export function buildOcrStructure(input: {
 }): OcrStructure {
   const budget = input.charBudget ?? OCR_STRUCTURE_CHAR_BUDGET;
 
+  /**
+   * ═══════════════════════════════════════════════════════════════
+   * 机制 5 的**页级**字符高度表：复用判据自己那一张，不另建一份
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * `chars[].pageMaxHeight` / `heightRatio` 必须与机制 5 **同源**：
+   * 另写一份统计（哪怕口径写得一模一样）迟早会与判据漂移，而漂移之后
+   * 导出的数字会「证明」一个判据并没有在做的事 —— 那比没有数据更糟。
+   * 所以这里直接调用判据用的那个纯函数 `buildCharSizeTable()`，
+   * 输入就是本函数收到的这份 `words`。
+   *
+   * 为什么重建等于「同一张表」（逐个理由）：
+   *  1. `buildCharSizeTable` 是**纯函数**，只读词上旁挂的字符框
+   *     （`getAttachedChars`）与 `measurements`，不看行、不看时间、不缓存；
+   *  2. `ocrPostProcess.groupWordsIntoLines()` 建表用的是
+   *     **同一个数组**（`result.words`）—— 它就是 `ocrResultToBlocks` 之后
+   *     交给本函数的那一份；
+   *  3. 建行之后到导出之前**没有任何代码修改词或字符框**（页面家具过滤、
+   *     构件合并、版面重排动的都是「行」，不是词）。
+   * 于是重建出来的表与判据当时用的那张**逐键相同**。这条不变量有测试钉着：
+   * `ocrStructure.charSize.test.ts` 里「同一个表」那条用例要求导出中每个
+   * 字符的 `pageMaxHeight` 都等于
+   * `buildCharSizeTable(words)!.get(charSizeKey(char))`。
+   *
+   * ⚠️ 为什么**不**把表直接传进来（那才是最字面的"同一张"）：
+   * 表是 `groupWordsIntoLines()` 的局部量。要把它交出来，得改
+   * `groupWordsIntoLines` → `ocrResultToBlocks` → `buildOcrStructure`
+   * 三处签名，也就动了**判据链路**本身的形状。而本任务的前提是
+   * 「不改任何判据」—— 「同一个纯函数 + 同一份输入」是零风险的等价物。
+   *
+   * 拿不到表时（提供字符框的词少于 `SCRIPT_MECH5_MIN_WORDS`）机制 5
+   * 本来就不启用：导出里所有字符的 `pageMaxHeight` / `heightRatio` 都是
+   * `null` —— 那不是「量到了但是空」，而是**这一页没有基准**。
+   */
+  const sizeTable = buildCharSizeTable(input.words);
+
   const wordEntries: OcrStructureWord[] = input.words.map((word, i) => {
     const height = word.bbox.y1 - word.bbox.y0;
     return {
@@ -259,6 +384,16 @@ export function buildOcrStructure(input: {
               confidence: Number.isFinite(getAttachedChars(word)!.confidences?.[i])
                 ? Math.round((getAttachedChars(word)!.confidences![i] as number) * 1e4) / 1e4
                 : null,
+              /**
+               * 机制 5 的三个量（像素墨迹高 / 页内同字符最大高 / 两者之比）。
+               *
+               * ⚠️ 它们**必须**与 `confidence` 放在同一个对象里：判据正是
+               * 「置信度足够低 **且** 尺寸比足够小」这条合取式，而下一个要
+               * 回答的问题就是「这两个条件该怎么组合」—— 把两个量分放在
+               * 两处，就等于又要靠推算去拼它们。三个字段的语义、口径与
+               * `null` 的边界见接口声明处的长注释。
+               */
+              ...charSizesOf(getAttachedChars(word)!, i, sizeTable),
             })),
             // 整串置信度是否齐备，一眼可见：缺一个就不写（与 `AttachedChars` 同一规则）
             charConfidencesComplete: Boolean(getAttachedChars(word)!.confidences),
@@ -447,4 +582,56 @@ function thresholdsOf(over?: Partial<OcrStructure['thresholds']>): OcrStructure[
 function round(value: number): number {
   if (!Number.isFinite(value)) return 0;
   return Math.round(value * 10) / 10;
+}
+
+/**
+ * 比值保留 3 位小数。
+ *
+ * 为什么比坐标（1 位）多留 2 位：机制 5 在这份真实数据上有两个**待定读数**
+ * 相隔只有 0.047 —— 指数里的 `2`（墨迹高 11.4）：用全页最大 `2`（23）算
+ * 得 **0.496**，只认「21+」那个最保守的读数则是 **0.543**。1 位小数会把
+ * 两者都写成 0.5，恰好抹掉下次要看的那个差别（判据离阈值 0.8 有多远，
+ * 全靠这个数）。多 2 位小数的代价是每个字符多几个字节，可以忽略。
+ */
+function roundRatio(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.round(value * 1000) / 1000;
+}
+
+/**
+ * 一个字符的「机制 5 三个量」。
+ *
+ * 口径与判据**逐条对齐**（不是近似、也不是另写一遍统计）：
+ *
+ *  · `inkHeight`：`chars[i].y1 - chars[i].y0` —— 与 `buildCharSizeTable`
+ *    放进表里的那个像素高**是同一个算式**；`measurements[i]` 为 `null`
+ *    （空白位 / 没量到墨迹）时给 `null`，那正是建表的第 1 条过滤规则。
+ *    由 `measureCharPixelSpans` 保证「量到墨迹 ⟹ `y1 > y0`」，所以
+ *    非 `null` 的 `inkHeight` 一定是正数（有测试钉着这条）。
+ *  · `pageMaxHeight`：`sizeTable.get(charSizeKey(char))` —— 连键的算法都是
+ *    同一个 `charSizeKey`（只折全角；不折大小写、不归 Unicode 上下标）。
+ *  · `heightRatio`：`inkHeight / pageMaxHeight`，即判据最后那次比较的左操作数。
+ *
+ * 唯一的差别是**显示精度**：两个高度各舍入到 0.1px（本文件既有的省体积
+ * 做法），比值再由舍入后的两个数算出。这样做的好处是 JSON 里的三个数
+ * **自洽**：`heightRatio × pageMaxHeight` 就是 `inkHeight`，
+ * 拿导出数据复核判据的人不必怀疑「这三个数为什么对不上」。
+ */
+function charSizesOf(
+  attached: AttachedChars,
+  i: number,
+  sizeTable: CharSizeTable | null,
+): { inkHeight: number | null; pageMaxHeight: number | null; heightRatio: number | null } {
+  const box = attached.chars[i];
+  if (!box) return { inkHeight: null, pageMaxHeight: null, heightRatio: null };
+
+  const inkHeight = attached.measurements[i] ? round(box.y1 - box.y0) : null;
+
+  const full = sizeTable?.get(charSizeKey(box.char));
+  const pageMaxHeight = typeof full === 'number' && full > 0 ? round(full) : null;
+
+  const heightRatio =
+    inkHeight !== null && pageMaxHeight !== null ? roundRatio(inkHeight / pageMaxHeight) : null;
+
+  return { inkHeight, pageMaxHeight, heightRatio };
 }
