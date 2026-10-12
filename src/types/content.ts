@@ -107,6 +107,44 @@ export interface StableAnchor {
   selectedText: string;
 }
 
+/**
+ * 批注锚点：**块内字符偏移**的定位符字符串。
+ *
+ * 形态（本项目自己的语义，不是 MinerU 的坐标格式）：
+ *
+ * ```
+ * doc:{documentId}/page:{pageIdx}/block:{blockIdx}/char:{offset}+{length}
+ * ```
+ *
+ * **base 约定（三个数各不相同，因此写死在这里，改动必须同步改测试）：**
+ * - `doc` —— `documents` 表主键 `DocDocument.id`，原样，不做转义；
+ * - `page` —— **1-based**（与 `BlockMetadata.pageNumber` 一致，与用户看到的页码一致）。
+ *   ⚠️ 没有页概念的格式（md / txt / epub）**没有这个段**，连 `page:` 都不写 ——
+ *   不写一个假的 `page:1`，因为那会让"这本 md 有第 1 页"变成一句谎话；
+ * - `block` —— **0-based**，`DocDocument.blocks` 里的数组序号；
+ * - `char` —— **0-based**，**块内**字符偏移（`block.content` 的 UTF-16 code unit 下标，
+ *   换行符计入 1）。`+{length}` 是选区长度；`{length}` 为 0 时退化成点锚点。
+ *
+ * 为什么不复用 MinerU 的 1-based block：本项目的数组下标本来就是 0-based，
+ * 多一次 ±1 换算就多一处能写错的地方。**纪律在于"写清楚"，不在于选哪个 base。**
+ */
+export type AnnotationLocator = string;
+
+/**
+ * 迁移留痕（纯增量字段，只在真的迁移过之后才写入）。
+ *
+ * 记录"这条旧批注是什么时候、以什么方式升级到块内字符偏移的"，
+ * 让用户能看见升级发生过、也能看见升级时位置挪了多少。
+ */
+export interface AnnotationMigration {
+  /** 迁移时间（ISO 字符串） */
+  at: string;
+  /** 迁移时用的判据：‘exact’ 原位命中；‘repaired’ 靠块内修复命中 */
+  strategy: 'exact' | 'repaired' | 'rebased';
+  /** 相对旧偏移挪了多少字符（0 表示没挪） */
+  shiftedBy: number;
+}
+
 /** 单条批注 */
 export interface Annotation {
   id: string;
@@ -115,6 +153,17 @@ export interface Annotation {
   type: AnnotationType;
   /** 选区锚点；纯笔记类批注（针对整段）可以没有选区 */
   anchor?: StableAnchor;
+  /**
+   * 块内字符偏移定位符（纯增量字段）。
+   *
+   * 旧批注没有这个字段，渲染时自动退回 `anchor` 的文本匹配路径；
+   * 打开文档时会被一次性迁移补上（见 `lib/annotationAnchor.ts` 的 migrateAnnotation）。
+   * ⚠️ **迁移只新增、不删除** —— `anchor` 永久保留作为降级路径，
+   * 删掉它等于让历史批注在迁移失败时彻底丢失。
+   */
+  locator?: AnnotationLocator;
+  /** 旧锚点被迁移到定位符时留下的痕迹 */
+  migration?: AnnotationMigration;
   /** 笔记正文 / 提问内容 */
   content?: string;
   color: HighlightColor;

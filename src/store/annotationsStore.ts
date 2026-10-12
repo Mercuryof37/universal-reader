@@ -1,23 +1,54 @@
 import { create } from 'zustand';
-import type { Annotation, AnnotationType, HighlightColor } from '@/types/content';
+import type { Annotation, AnnotationType, ContentBlock, HighlightColor } from '@/types/content';
 import {
   deleteAnnotation as dbDeleteAnnotation,
   listAnnotations,
   saveAnnotation,
 } from '@/lib/db';
 import { makeAnchor, uid } from '@/lib/utils';
+import { makeAnnotationAnchor, migrateAnnotations } from '@/lib/annotationAnchor';
+
+/**
+ * 打开文档时对旧批注做的一次性迁移结果。
+ *
+ * 为什么要把它放进 store 而不是丢掉：迁移是**用户数据的改动**，
+ * 用户有权知道"我的批注被升级了 N 条、还有 M 条定不了位"。
+ * 静默迁移与静默丢弃在这件事上一样糟。
+ */
+export interface AnchorMigrationReport {
+  docId: string;
+  /** 成功升级到"块内字符偏移"的条数 */
+  migrated: number;
+  /** 有的是旧格式但没能升级（**不会被删除**，继续走文本匹配） */
+  failed: number;
+  /** 迁移过程中写库失败的条数（内存里已生效，下次打开会重试） */
+  persistFailed: number;
+  at: string;
+}
 
 interface AnnotationsState {
   docId: string | null;
   annotations: Annotation[];
   activeAnnotationId: string | null;
   loading: boolean;
+  migration: AnchorMigrationReport | null;
 
-  load: (docId: string) => Promise<void>;
+  /**
+   * 载入某文档的批注。
+   *
+   * `blocks` 可选：给了就对旧格式批注做一次迁移（只新增 `locator` 字段）。
+   * ⚠️ 不给 `blocks` 时**绝不猜** —— 没有当前文档的内容就没法验证位置，
+   * 迁移会被跳过而不是用错的位置糊上去。
+   */
+  load: (docId: string, blocks?: readonly ContentBlock[]) => Promise<void>;
   clear: () => void;
   add: (input: {
     blockId: string;
     blockContent: string;
+    /** 0-based 块下标；给了才会写定位符 */
+    blockIndex?: number;
+    /** 1-based 页码（PDF 才有）；不传就**不写** `page:` 段，而不是写个假的 1 */
+    pageIdx?: number;
     type: AnnotationType;
     color: HighlightColor;
     content?: string;
@@ -36,23 +67,95 @@ export const useAnnotationsStore = create<AnnotationsState>((set, get) => ({
   annotations: [],
   activeAnnotationId: null,
   loading: false,
+  migration: null,
 
-  load: async (docId) => {
+  load: async (docId, blocks) => {
     set({ loading: true, docId });
     try {
-      set({ annotations: await listAnnotations(docId) });
+      const stored = await listAnnotations(docId);
+      if (!blocks || !blocks.length) {
+        set({ annotations: stored, migration: null });
+        return;
+      }
+
+      const { annotations, migrated, failed } = migrateAnnotations(stored, { id: docId, blocks });
+
+      // 先落内存：即使写库失败，本次会话里批注也已经是升级后的状态
+      set({
+        annotations,
+        migration: {
+          docId,
+          migrated,
+          failed: failed.length,
+          persistFailed: 0,
+          at: new Date().toISOString(),
+        },
+      });
+
+      // 只写真正变过的那些 —— 全量 put 会让"打开文档"变成一次无谓的批量写盘
+      let persistFailed = 0;
+      for (let i = 0; i < annotations.length; i++) {
+        if (annotations[i] === stored[i]) continue; // 同一个引用 = 没动过
+        try {
+          await saveAnnotation(annotations[i]!);
+        } catch {
+          persistFailed += 1;
+        }
+      }
+      if (persistFailed) {
+        set({ migration: { ...get().migration!, persistFailed } });
+      }
     } finally {
       set({ loading: false });
     }
   },
 
-  clear: () => set({ docId: null, annotations: [], activeAnnotationId: null }),
+  clear: () => set({ docId: null, annotations: [], activeAnnotationId: null, migration: null }),
 
   add: async (input) => {
     const { docId } = get();
     if (!docId) throw new Error('尚未打开任何文档，无法添加批注。');
 
     const now = new Date().toISOString();
+    const anchor = input.selection
+      ? makeAnchor(input.blockContent, input.selection.start, input.selection.end)
+      : undefined;
+
+    /*
+      定位符必须走 `makeAnnotationAnchor` 这一个构造入口。
+
+      ⚠️ 曾经在这里直接拼字符串，结果是"格式"有两份实现：
+      删掉 `makeAnnotationAnchor` 里的字段，端到端用例照样全绿 ——
+      典型的假保护。唯一入口是有测试保证的（见 annotationAnchor.test.ts
+      的"add() 写的定位符与构造器逐字节相同"）。
+
+      块序号用 `input.blockIndex`：定位符里的 `block` 段是**文档级**下标，
+      而这个合成数组只有目标块自己 —— 下标必须显式对上，否则每条批注都会
+      写成 `block:0`（实测抓到的错误：第二块的批注被写成 block:0）。
+    */
+    const blockIdx = input.blockIndex;
+    const locator =
+      blockIdx === undefined || !input.selection
+        ? undefined
+        : makeAnnotationAnchor({
+            docId,
+            blocks: [
+              {
+                id: input.blockId,
+                type: 'paragraph',
+                content: input.blockContent,
+                translations: {},
+                metadata: {},
+              },
+            ],
+            blockIdx: 0,
+            start: input.selection.start,
+            end: input.selection.end,
+            pageIdx: input.pageIdx,
+            // 合成数组里目标块在 0 位，但写进定位符的必须是**文档级**下标
+            locatorBlockIdx: blockIdx,
+          });
+
     const annotation: Annotation = {
       id: uid('ann'),
       docId,
@@ -61,9 +164,8 @@ export const useAnnotationsStore = create<AnnotationsState>((set, get) => ({
       color: input.color,
       content: input.content,
       tags: input.tags ?? [],
-      anchor: input.selection
-        ? makeAnchor(input.blockContent, input.selection.start, input.selection.end)
-        : undefined,
+      anchor,
+      ...(locator ? { locator } : {}),
       createdAt: now,
       updatedAt: now,
     };

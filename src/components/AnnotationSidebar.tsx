@@ -3,6 +3,7 @@ import { Download, Highlighter, MessageSquare, Search, Trash2, TriangleAlert } f
 import type { Annotation, ContentBlock } from '@/types/content';
 import { TYPE_LABEL, useAnnotationsStore } from '@/store/annotationsStore';
 import { HIGHLIGHT_COLORS } from '@/types/content';
+import { anchorFailureMessage, resolveAnnotationAnchor } from '@/lib/annotationAnchor';
 
 /** 批量下载文本为文件；不经过服务器，纯前端 Blob */
 function downloadText(filename: string, content: string, mime = 'text/plain;charset=utf-8') {
@@ -21,6 +22,10 @@ function downloadText(filename: string, content: string, mime = 'text/plain;char
  *
  * 一个关键取舍：批注失锚（文档被重新解析后找不到原文位置）时不删除，
  * 而是标记出来让用户自己确认。静默丢弃用户的笔记是最不可接受的行为。
+ *
+ * ⚠️ 失锚判定**必须走 `resolveAnnotationAnchor`**（渲染层用的同一个函数）：
+ * 侧栏若自己写一套"能不能找到"的判断，就会出现"侧栏说没失锚、正文里却画不出来"
+ * 这种自相矛盾的界面。
  */
 export function AnnotationSidebar({
   blocks,
@@ -37,26 +42,23 @@ export function AnnotationSidebar({
   const remove = useAnnotationsStore((s) => s.remove);
   const update = useAnnotationsStore((s) => s.update);
   const exportAs = useAnnotationsStore((s) => s.exportAs);
+  const migration = useAnnotationsStore((s) => s.migration);
 
   const [query, setQuery] = useState('');
   const [typeFilter, setTypeFilter] = useState<'all' | Annotation['type']>('all');
 
-  const blockMap = useMemo(() => new Map(blocks.map((b) => [b.id, b])), [blocks]);
-
-  /** 失锚检测：有选区但原文中找不到 */
-  const lostIds = useMemo(() => {
-    const lost = new Set<string>();
-    for (const a of annotations) {
-      if (!a.anchor) continue;
-      const block = blockMap.get(a.blockId);
-      if (!block) {
-        lost.add(a.id);
-        continue;
-      }
-      if (!block.content.includes(a.anchor.selectedText)) lost.add(a.id);
-    }
-    return lost;
-  }, [annotations, blockMap]);
+  /**
+   * 逐条还原锚点，拿回"命中方式 + 失锚原因"。
+   *
+   * 不再用 `block.content.includes(selectedText)` 这种粗判：
+   * 它既认不出"文字还在但位置漂了"（该提示"已修复"），
+   * 也认不出"同一段文字出现两次时锚到了错的那一处"。
+   */
+  const resolutions = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof resolveAnnotationAnchor>>();
+    for (const a of annotations) map.set(a.id, resolveAnnotationAnchor(a, blocks));
+    return map;
+  }, [annotations, blocks]);
 
   const filtered = annotations.filter((a) => {
     if (typeFilter !== 'all' && a.type !== typeFilter) return false;
@@ -77,6 +79,19 @@ export function AnnotationSidebar({
           批注
           <span className="text-xs text-[var(--reader-muted)]">({annotations.length})</span>
         </h2>
+
+        {/*
+          迁移是**对用户数据的改动**，必须看得见：
+          "升级了 N 条"与"有 M 条定不了位"都要说清楚。
+          没有旧格式批注时不显示这一行 —— 不能拿一条日常都是 0 的提示占位置。
+        */}
+        {migration && (migration.migrated > 0 || migration.failed > 0) && (
+          <p className="text-[10px] leading-relaxed text-[var(--reader-muted)]">
+            已把 {migration.migrated} 条旧批注升级为「块内字符偏移」锚点
+            {migration.failed > 0 && `，另有 ${migration.failed} 条无法定位（已保留，未删除）`}
+            {migration.persistFailed > 0 && `；${migration.persistFailed} 条写入失败，下次打开会重试`}
+          </p>
+        )}
 
         <div className="relative">
           <Search
@@ -118,7 +133,10 @@ export function AnnotationSidebar({
         ) : (
           <ul className="flex flex-col gap-3">
             {filtered.map((a) => {
-              const isLost = lostIds.has(a.id);
+              const resolution = resolutions.get(a.id);
+              // 整段笔记没有选区，不算失锚
+              const isLost = resolution ? !resolution.resolved && resolution.reason !== 'no-anchor' : false;
+              const wasRepaired = resolution?.resolved === true && resolution.strategy === 'repaired';
               const isActive = activeId === a.id;
 
               return (
@@ -177,7 +195,19 @@ export function AnnotationSidebar({
                   {isLost && (
                     <p className="mt-1.5 flex items-center gap-1 text-[10px] text-amber-600 dark:text-amber-400">
                       <TriangleAlert className="h-3 w-3" aria-hidden />
-                      原文已改动，无法定位到具体位置
+                      {anchorFailureMessage(resolution?.reason ?? 'text-missing')}
+                    </p>
+                  )}
+
+                  {/*
+                    修复过就必须说：批注确实挪了位置。用户看到高亮"稍微偏了一点"时，
+                    界面要能解释为什么，而不是让人以为是自己记错了。
+                  */}
+                  {wasRepaired && resolution && (
+                    <p className="mt-1.5 text-[10px] text-[var(--reader-muted)]">
+                      原文有改动，锚点已按块内偏移修正
+                      {resolution.shiftedBy !== 0 &&
+                        `（${resolution.shiftedBy > 0 ? '后' : '前'}移 ${Math.abs(resolution.shiftedBy)} 字）`}
                     </p>
                   )}
 

@@ -1,5 +1,5 @@
 import type { Annotation, ContentBlock, InlineSpan } from '@/types/content';
-import { resolveAnchor } from '@/lib/utils';
+import { resolveAnnotationAnchor } from '@/lib/annotationAnchor';
 
 export interface TextSegment {
   text: string;
@@ -22,19 +22,24 @@ export interface TextSegment {
  * 因此这里统一用"边界点切分 + 区间归属"的方式，不做字符串替换。
  * 批注与行内格式共用同一次切分：两者的边界放在一起排序，
  * 每个片段同时携带"属于哪些批注"与"带哪些格式"，渲染层从内到外依次包裹。
+ *
+ * ⚠️ 位置还原走 `resolveAnnotationAnchor`（块内字符偏移优先，旧锚点文本匹配降级）：
+ * 它只承认**通过逐字验证**的位置，拿不到证据就返回 `null` 让批注被跳过 ——
+ * 「错的坐标比没有坐标更糟」。本函数依赖"失锚返回 null"这个契约，不要改。
  */
 export function buildStyledSegments(
   content: string,
   annotations: Annotation[],
   inlines: InlineSpan[] = [],
+  blocks: readonly ContentBlock[] = [],
 ): TextSegment[] {
   if (!content) return [];
 
   const ranges: { start: number; end: number; annotation: Annotation }[] = [];
   for (const ann of annotations) {
-    const resolved = resolveAnchor(ann.anchor, content);
-    if (!resolved || resolved.end <= resolved.start) continue;
-    ranges.push({ ...resolved, annotation: ann });
+    const resolved = resolveAnnotationAnchor(ann, blocks, {}, content);
+    if (!resolved.resolved || resolved.end <= resolved.start) continue;
+    ranges.push({ start: resolved.start, end: resolved.end, annotation: ann });
   }
   const spans = inlines.filter((s) => s.end > s.start && s.start < content.length && s.end > 0);
 

@@ -63,12 +63,13 @@ export function ReaderView() {
   const [restored, setRestored] = useState(false);
   const lastSaveRef = useRef(0);
 
-  /** 打开文档时载入批注 */
+  /** 打开文档时载入批注，并把旧格式锚点迁移成"块内字符偏移"（只新增字段） */
   useEffect(() => {
     if (!currentDoc) return;
     setRestored(false);
     setPanel('none');
-    void loadAnnotations(currentDoc.id);
+    // 传 blocks 才会做迁移：没有当前正文就无法验证位置，宁可不迁移也不写错坐标
+    void loadAnnotations(currentDoc.id, currentDoc.blocks);
     return () => clearAnnotations();
   }, [currentDoc?.id, loadAnnotations, clearAnnotations, currentDoc]);
 
@@ -176,6 +177,10 @@ export function ReaderView() {
       await addAnnotation({
         blockId: block.id,
         blockContent: block.content,
+        // 0-based 块下标 → 定位符的 block 段（见 types/content.ts 的 base 表）
+        blockIndex: selection.blockIndex,
+        // 1-based 页码；md/txt/epub 没有页码就不传，定位符里也不会出现假的 page:1
+        pageIdx: block.metadata.pageNumber,
         type,
         color: defaultColor,
         content: withNote ? (prompt('写下你的笔记') ?? '') : undefined,
