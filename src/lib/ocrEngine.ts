@@ -41,6 +41,14 @@ import {
   type MissedInkRegion,
   type RetryCropPlan,
 } from '@/lib/ocrInkRegions';
+// 「会不会把页面像素送出去」的面积闸门与它的旁挂记录（见该模块顶部）：
+// 它是**发送决定**的一部分，所以放在本文件而不是 ocrInkRegions 里 ——
+// 那条路只是候选来源之一。
+import {
+  admitOutboundFormulaCandidate,
+  clearOutboundFormulaSkips,
+  OUTBOUND_FORMULA_MAX_REGION_AREA_RATIO,
+} from '@/lib/outboundFormulaGate';
 import {
   alternateBandBox,
   buildInkGrid,
@@ -424,6 +432,15 @@ class OcrEngine {
     const toPageFrame = factor < 0.999 ? 1 / factor : 1;
     // 每页开始前清空「取不到字符框」的原因记录，否则会跨页累积
     clearCharBoxSkips();
+    /**
+     * 「被外发面积闸门挡下的公式候选」也是**按页**的记录，**同一时机**清空：
+     * 不清就会跨页累积，用户导出的那一页里会混进上一页的坐标。
+     *
+     * 清空发生在下面调用 `enhanceFormulaRegions` 之前，而导出结构
+     * （`buildOcrStructure`）发生在那之后 —— 所以本页被挡下的候选
+     * 在用户复制出来的 JSON 里一定读得到。
+     */
+    clearOutboundFormulaSkips();
     /**
      * 第二意见的证据同样**按页**清空（worker 留着不销毁，见
      * `clearTesseractEvidence` 的说明）：证据挂在词上，词换了就再也
@@ -1093,9 +1110,24 @@ class OcrEngine {
    * "P{X=x,Y=y}=p²(1-p)^(x+y-2)" → "PI{X=2,Y=y}=p"A−p"".
    * SimpleTex specializes in formula OCR and returns accurate LaTeX.
    *
-   * ⚠️ 这是全应用**唯一**会把文档内容送出本机的路径，因此受
-   * `settingsStore.formulaOcrEnabled` 控制，且该开关**默认关闭**。
-   * 关闭时直接返回原始结果 —— 不发起任何网络请求。
+   * ⚠️ **默认不外发；只有在你显式开启下面这三条时才有例外。** 本应用共有
+   * **三条**会把文档内容送出本机的路径，本方法走的是第一条（清单真源是
+   * `lib/outboundPaths.ts` 的 `OUTBOUND_PATH_SPECS`，并由「设置 → 隐私」
+   * 面板直接渲染 —— 声明与实现同一个出处，不会各自漂移）：
+   *   ① `settingsStore.formulaOcrEnabled`（**本方法**，默认 `false`）——
+   *      把页面上裁剪出的公式区域（`{ image }`，base64 PNG）发给 SimpleTex；
+   *   ② `settingsStore.cloudTranslationConsent`（默认 `false`）—— 把正在
+   *      阅读的段落正文（`{ text }`）发给 DeepL / OpenAI；
+   *   ③ `settingsStore.ttsCloudConsent`（默认 `false`）—— 把正在朗读的
+   *      段落正文（`{ text }`）发给 Azure 语音。
+   * 关闭时直接返回原始结果 —— 不发起任何网络请求（真正执行上传的
+   * `recognizeFormula` 里还有一道自己的防线，见那个函数）。
+   *
+   * ⚠️ 这里原本写着「这是全应用**唯一**会把文档内容送出本机的路径」——
+   * 那句话与 `HANDOFF.md` §1 T2 同源，**是错的**，代价是这个审计缺口被
+   * 低估成三分之一（另两条因此长期没被按同一套标准审视，其中云端语音
+   * 还曾经默认开启）。同一处口径已在 `formulaOcrService.ts` 顶部、
+   * `lib/outboundPaths.ts` 与 `HANDOFF.md` 改过，这里是最后一处漏网的。
    *
    * `missedInkRegions` 是「图像上有墨迹、却没有词覆盖」的区域
    * （见 `lib/ocrInkRegions.ts`）。它们必须**并进候选**，否则会出现
@@ -1119,9 +1151,53 @@ class OcrEngine {
     const regions = mergeInkCandidates(textRegions, missedInkRegions, words);
     if (!regions.length) return words;
 
+    /**
+     * ⚠️ **外发面积闸门**（本次补上的那个缺口，见 `lib/outboundFormulaGate.ts`）。
+     *
+     * 为什么必须在这里、而不在 `mergeInkCandidates` 里：候选有**两条来源**
+     * （词聚类 + 漏识别区域），而后者此前只有 `minCells ≥ 3` 与
+     * `minInkRatio ≥ 0.03` 两条过滤、**没有任何面积上限** —— 实测整页墨迹
+     * （整页识别失败 / 整页插图）时交出去的那块可以是**整页**。放在合并
+     * 之后，两条来源一起管住；放在这里还意味着判决早于 `cropCanvas`
+     * （分配画布）与 `recognizeFormula`（发请求），被挡下的候选不花任何
+     * 编码与网络成本。
+     *
+     * 判决用的页面尺寸取 `imageData` —— `recognizePage` 已把词框与区域坐标
+     * 统一换算到它这个坐标系（那里的 `toPageFrame`），所以「占页面比例」
+     * 与本地重试的 `RETRY_MAX_REGION_AREA_RATIO` 是同一口径。
+     *
+     * 被挡下的候选不会静默消失：`admitOutboundFormulaCandidate` 顺手把它
+     * 记进按页清空的旁挂记录，由 `buildOcrStructure` 导出成
+     * `outboundFormulaSkips`（用户能看见、能复制出来）。
+     */
+    const admissions = regions.map((region) => ({
+      region,
+      admission: admitOutboundFormulaCandidate({
+        bbox: region.bbox,
+        source: region.fromInk ? 'missed-ink' : 'word-cluster',
+        text: region.originalText,
+        pageWidth: imageData.width,
+        pageHeight: imageData.height,
+      }),
+    }));
+    const sendable = admissions.filter((a) => a.admission.allowed).map((a) => a.region);
+    const blocked = admissions.filter((a) => !a.admission.allowed);
+    if (blocked.length) {
+      console.warn(
+        `[ocrEngine] ${blocked.length}/${regions.length} 个公式候选**没有**发往 SimpleTex：` +
+          `覆盖页面超过 ${(OUTBOUND_FORMULA_MAX_REGION_AREA_RATIO * 100).toFixed(0)}%` +
+          `（最大一个 ${(Math.max(...blocked.map((b) => b.admission.coverage)) * 100).toFixed(1)}%）` +
+          ` —— 那个尺寸更像整页插图或整页识别失败，不值得把接近整页的像素送出本机。` +
+          `明细见导出结构的 outboundFormulaSkips`,
+      );
+    }
+    if (!sendable.length) return words;
+
     console.info(
-      `[ocrEngine] 公式候选 ${regions.length} 个（词聚类 ${textRegions.length} 个 + ` +
-        `漏识别区域补入 ${regions.filter((r) => r.fromInk).length} 个），尝试 SimpleTex 增强`,
+      `[ocrEngine] 公式候选 ${sendable.length} 个（词聚类 ${textRegions.length} 个 + ` +
+        `漏识别区域补入 ${sendable.filter((r) => r.fromInk).length} 个` +
+        (blocked.length ? `，另有 ${blocked.length} 个被面积闸门挡下` : '') +
+        `），尝试 SimpleTex 增强`,
     );
 
     const canvas = ensureCanvas(imageData);
@@ -1129,7 +1205,9 @@ class OcrEngine {
 
     const enhanced = [...words];
 
-    for (const region of regions) {
+    // ⚠️ 这里迭代的是 `sendable`（过了面积闸门的那批），**不是** `regions` ——
+    // 写成 `regions` 就会出现「日志说挡下了、实际照样发出去」这种最难查的不一致。
+    for (const region of sendable) {
       try {
         const crop = cropCanvas(canvas, region.bbox);
         if (!crop) continue;
@@ -1226,8 +1304,9 @@ class OcrEngine {
    * ═══════════════════════════════════════════════════════════════
    *
    * 这里只驱动本地 ONNX 引擎，与 `formulaOcrEnabled` 无关 ——
-   * 那个开关管的是 SimpleTex（全应用唯一会把内容送出本机的路径），
-   * 本函数既不读它、也不碰任何网络 API。
+   * 那个开关管的是 SimpleTex（**三条**会把文档内容送出本机的路径之一，
+   * 清单见 `lib/outboundPaths.ts`），本函数既不读它、也不碰任何网络 API，
+   * 因此**不在**那三条里。
    *
    * 渐进增强：取不到画布、裁剪失败、某块推理抛错 —— 都只是那一块
    * 没救回，`words` 与改动前逐字节相同。
@@ -1416,7 +1495,8 @@ interface FormulaRegion {
  * 两条路径会找到**同一块**内容：一页公式识别得较差但仍有低置信度词时，
  * 词聚类会圈出一块区域，而图像判定也会把这块「覆盖不足的墨迹」圈出来。
  * 不去重就会对同一块内容发**两次**网络请求 ——
- * 这是全应用唯一会把内容送出本机的路径，多发一次是实打实的隐私与费用成本。
+ * 这是三条会把文档内容送出本机的路径之一（清单见 `lib/outboundPaths.ts`），
+ * 多发一次是实打实的隐私与费用成本。
  *
  * 用「重叠面积 ÷ 较小者面积」而不是 IoU：图像候选的框通常比词聚类的框
  * 更紧（词框可能只盖住公式的一部分），IoU 会因此偏小、漏判重复。
@@ -1623,7 +1703,16 @@ function cropCanvas(
 // ── 漏识别区域「放大重试」的参数（见 `retryMissedInkLocally`） ──────────────
 /** 区域任一边小于这个值（像素）就不试：那是表格线/噪声，不是丢失的内容 */
 const RETRY_MIN_SIDE = 24;
-/** 区域面积超过页面的这个比例就不试：那是插图或整页失败，不是一个「洞」 */
+/**
+ * 区域面积超过页面的这个比例就不试：那是插图或整页失败，不是一个「洞」。
+ *
+ * ⚠️ 会**外发**的那条候选路用的是**另一个**常量
+ * （`OUTBOUND_FORMULA_MAX_REGION_AREA_RATIO`，见 `lib/outboundFormulaGate.ts`）。
+ * 数值现在一样（0.3），但两者**不要合并**：这里的越界只是少花一次本地推理
+ * （还有 8MP 总预算兜底），那边的越界是**像素永久离开本机** ——
+ * 合成一个常量意味着将来有人为了多救一块而放宽这个数，会**顺带**
+ * 把隐私上界也放宽一倍。
+ */
 const RETRY_MAX_REGION_AREA_RATIO = 0.3;
 /** 一页最多重试几处（按面积从大到小取） */
 const RETRY_MAX_REGIONS = 8;

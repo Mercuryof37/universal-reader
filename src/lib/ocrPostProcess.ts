@@ -1233,6 +1233,211 @@ export function renderLayoutMetricsLine(report: LayoutPageReport): string {
 }
 
 /**
+ * **文档级**版面接入汇总 —— 把逐页的 `LayoutPageReport` 累加成一个总数。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么需要它（逐页报告为什么不够）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * `renderLayoutMetricsLine` 是**每页一行**。一本 30 页的书于是产出 30 行
+ * `layout-metrics`，而「这本书里版面模型一共摘掉了多少行、有没有重排过、
+ * 标题判定被它改了多少次」这三个问题，只能靠人拿 grep/脚本在外面求和 ——
+ * 也就是说：**没有人在真实运行里真的会得到这三个数**。
+ *
+ * 更糟的是「一页都没接入」与「接入了但什么都没改」在逐页视角下难以区分：
+ * 前者是**一行都不打**，后者是**打一行全 0**。这两件事的下一步动作完全
+ * 相反（查模型有没有加载 vs 查模型判得对不对），而它们在汇总里必须分得开。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 口径（写清楚，否则这些数会被读成「精度」）
+ * ═══════════════════════════════════════════════════════════════
+ *
+ *  · 只统计**真的交到手上**的页报告。⚠️ 注意 `applyLayoutToLines` 在
+ *    没有区域（模型没取到 / 推理失败 / 用户关掉了开关）时**也会交出一份
+ *    「全 0」的报告** —— 所以「有没有接入版面」**不能**靠
+ *    `removedByLayout === 0` 反推，那一条判据同时覆盖
+ *    「没有模型」与「有模型但一行都没摘」。两者的区分在 `pagesWithLayout`
+ *    （见下），而**不是**在 `pages`；
+ *  · `pages` 是交付了报告的页数（= 走完 `ocrResultToBlocks` 的页）；
+ *  · `pagesWithLayout` 是其中**真的拿到了版面区域**的页数。
+ *    `pagesWithLayout === 0` 才是「一次都没接入」，此时
+ *    `pages` 可能仍然很大 —— 这正是必须把两个数分开的原因；
+ *  · `lines` 是各页 `lineCount` 之和，也就是**进入版面判定的行数**，
+ *    不是文档总行数（被 `filterHeaderFooter` 提前摘掉的行不在这里）；
+ *  · `removedByLayout` 是**版面模型额外摘掉**的行数（几何启发式漏掉的），
+ *    它的上限由模型决定，不由本模块任何阈值决定；
+ *  · `decisions` **只累加真的接入过版面的页**：短路那一路交出来的
+ *    `uncovered` 是 0（不是「全都覆盖到了」），累加进来会让
+ *    「模型没跑」看起来像「模型覆盖得很全」；
+ *  · **它回答什么、不回答什么**：回答「版面模型在这份文档里实际改动了
+ *    多少」；**不回答**「它改得对不对」—— 那需要标注，
+ *    是 `evaluateLayoutPredictions` 的事（见 `layout-metrics` 的同款说明）。
+ *
+ * ⚠️ 本接口是**加在 `ocrPostProcess` 上的最小必要字段**，
+ * 与 `LayoutPageReport` 同属 T2/T3 的落点。`ocrStructure` 的导出契约
+ * 归 **T5**，本次**一个字段都没有加**（汇总走 `OcrParseResult` 与界面）。
+ */
+export interface LayoutDocumentSummary {
+  /** 交付了版面报告的页数（走完 `ocrResultToBlocks` 的页） */
+  pages: number;
+  /**
+   * 其中**真的拿到了版面区域**的页数。
+   * `pagesWithLayout === 0` = 「版面分析一次都没接入」——
+   * 这不是「接入了但没改动」，两者下一步动作相反。
+   */
+  pagesWithLayout: number;
+  /** 最后一页的页码，便于与「第几页开始没接入」对照；没有报告时为 `null` */
+  lastPageNum: number | null;
+  /** 各页 `lineCount` 之和（进入版面判定的行数） */
+  lines: number;
+  /** 各页 `removedByLayout` 之和（版面**额外**摘掉的行数） */
+  removedByLayout: number;
+  /** 逐类别求和：版面摘掉的每一行算在哪个类别上 */
+  removedByLabel: Record<string, number>;
+  /** 有**任意一页**因版面信息而重排了阅读顺序 */
+  reorderedAny: boolean;
+  /** 重排过阅读顺序的**页数** —— 比布尔值更能说明影响面 */
+  reorderedPages: number;
+  /** 各页 `decisionSummary` 逐项求和 */
+  decisions: {
+    same: number;
+    differ: number;
+    layoutCaught: number;
+    geometricOnly: number;
+    uncovered: number;
+  };
+  /** T3：标题判定的逐规则计数求和（哪些规则真的改变了哪一次判定） */
+  headingUse: Record<string, number>;
+}
+
+/**
+ * 建一个**文档级累加器**：`(report) => void`，直接传给
+ * `applyLayoutToLines` 的 `onLayoutApplication`（经 `ocrResultToBlocks`
+ * 第 6 个参数转交）。
+ *
+ * ═══════════════════════════════════════════════════════════════
+ * 为什么是「工厂 + 闭包」而不是一个接收数组的纯函数
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * 因为**逐页报告在产生的那一刻就该被累加**，而不是先攒一个数组再求和：
+ * 那本 833 页的书会把 833 份 `decisionRows`（每页二十来行）全留在内存里，
+ * 只为在最后算几个整数。闭包只保留那几个整数。
+ *
+ * 代价是「累加」这件事发生在闭包里、外部看不见中间态 —— 所以它
+ * **必须**配套一个可读出口（`renderLayoutSummaryLine` 与
+ * `OcrParseResult.layoutSummary`），否则就又变成「写进闭包等于没写」。
+ *
+ * ⚠️ 返回的是**同一个对象引用**，调用方可以边跑边读（界面/进度回调
+ * 都能拿到当前值）。不要把它 JSON 序列化到一半又继续累加。
+ *
+ * @param pageNumOf 取「这份报告是哪一页的」。**刻意做成必填参数**，
+ *   而不是可选、更不是从报告里读：`LayoutPageReport` 的字段契约归
+ *   T2/T3（本次不为汇总去动它），而**报告里没有页码**。
+ *   做成可选的话，漏传的表现是 `lastPageNum` 恒为 `null` ——
+ *   那看起来像「页码未知」，而真实原因是**参数没传**，
+ *   两者在汇总里分不开。必填参数让漏传在类型检查时就报错。
+ */
+export function createLayoutSummaryAccumulator(pageNumOf: () => number): {
+  /** 传给 `onLayoutApplication` 的回调 */
+  onPage: (report: LayoutPageReport) => void;
+  /** 到目前为止的汇总（**同一个引用**，会继续被更新） */
+  summary: LayoutDocumentSummary;
+} {
+  const summary: LayoutDocumentSummary = {
+    pages: 0,
+    pagesWithLayout: 0,
+    lastPageNum: null,
+    lines: 0,
+    removedByLayout: 0,
+    removedByLabel: {},
+    reorderedAny: false,
+    reorderedPages: 0,
+    decisions: { same: 0, differ: 0, layoutCaught: 0, geometricOnly: 0, uncovered: 0 },
+    headingUse: {},
+  };
+
+  const onPage = (report: LayoutPageReport): void => {
+    summary.pages++;
+    // 页码**现取**而不是存一份：`pageNum` 在循环里每页都在变，
+    // 而这个回调是跨页复用的同一个闭包 —— 捕获一次就会把整份文档
+    // 都记成第一页的页码（这正是把「哪一页」做成读数的风险所在）。
+    summary.lastPageNum = pageNumOf();
+    summary.lines += report.lineCount;
+
+    /**
+     * ⚠️ 「这一页有没有真的接入版面信息」必须**单独判**，不能靠
+     * `removedByLayout > 0` 之类的**结果**去反推。
+     *
+     * 理由是本文件里那条短路：模型缺席时 `applyLayoutToLines` 直接返回
+     * 一份「全 0」的报告，而这份报告**照样会被交出来**（每一条出口都
+     * 调用回调）。于是「没有模型」与「有模型但一行都没摘」在结果上
+     * 长得一模一样 —— 两者都让 `removedByLayout` 为 0。
+     *
+     * 唯一的区分在 `decisionSummary`：有区域时它由
+     * `compareLayoutAndGeometricDecisions` **真的逐行算出来**
+     * （`total` = 行数）；短路时它是 `summarizeLayoutDecisions([])`，
+     * `total` 恒为 0。
+     *
+     * ⚠️ 这条判据是**实测**出来的，不是推断的：先按「回调只在有区域时
+     * 触发」写，跑出来才发现模型缺席时回调也会进（见交付说明里的
+     * 那条断言失败：`expected 1 to be +0`）。
+     */
+    const layoutApplied = report.decisionSummary.total > 0;
+    if (layoutApplied) summary.pagesWithLayout++;
+
+    summary.removedByLayout += report.removedByLayout;
+    for (const [label, n] of Object.entries(report.removedByLabel)) {
+      summary.removedByLabel[label] = (summary.removedByLabel[label] ?? 0) + n;
+    }
+    if (report.reordered) {
+      summary.reorderedAny = true;
+      summary.reorderedPages++;
+    }
+    /**
+     * 逐行对照的计数**只累加真的接入过版面的页**：短路那一路交出来的
+     * `uncovered` 是 0（不是「全都覆盖到了」），把它加进来会让
+     * 「模型没跑」看起来像「模型覆盖得很全」。
+     */
+    if (!layoutApplied) return;
+    const d = report.decisionSummary;
+    summary.decisions.same += d.same;
+    summary.decisions.differ += d.differ;
+    summary.decisions.layoutCaught += d.layoutCaught;
+    summary.decisions.geometricOnly += d.geometricOnly;
+    summary.decisions.uncovered += d.uncovered;
+    for (const [rule, n] of Object.entries(report.headingUse)) {
+      summary.headingUse[rule] = (summary.headingUse[rule] ?? 0) + n;
+    }
+  };
+
+  return { onPage, summary };
+}
+
+/**
+ * 文档级汇总 → **单行、机器可读**的日志，格式与 `renderLayoutMetricsLine`
+ * 刻意保持一致（固定前缀 + 单行 JSON）。
+ *
+ * ⚠️ 前缀与逐页那行**不同**（`layout-summary` vs `layout-metrics`），
+ * 这样 `grep 'layout-metrics'` 仍然只拿到逐页行、`grep 'layout-summary'`
+ * 只拿到文档行 —— 两者的字段集不同，混在一个前缀下会让「这行是哪一级的」
+ * 变成靠字段猜。
+ */
+export function renderLayoutSummaryLine(summary: LayoutDocumentSummary): string {
+  return `[ocrPostProcess] layout-summary ${JSON.stringify({
+    pages: summary.pages,
+    pagesWithLayout: summary.pagesWithLayout,
+    lastPageNum: summary.lastPageNum,
+    lines: summary.lines,
+    removedByLayout: summary.removedByLayout,
+    removedByLabel: summary.removedByLabel,
+    reorderedAny: summary.reorderedAny,
+    reorderedPages: summary.reorderedPages,
+    decisions: summary.decisions,
+    headingUse: summary.headingUse,
+  })}`;
+}
+
+/**
  * 用**版面模型的区域**取代几何启发式：页眉页脚判定 + 阅读顺序 + 标题类别。
  *
  * ═══════════════════════════════════════════════════════════════

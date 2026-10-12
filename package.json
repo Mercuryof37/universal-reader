@@ -20,6 +20,7 @@
     "fetch-tess-assets": "node scripts/fetch-tess-assets.mjs",
     "icons": "node scripts/make-icons.mjs",
     "verify-dist": "node scripts/verify-dist.mjs",
+    "eval:layout": "node scripts/eval-layout.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },

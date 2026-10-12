@@ -4,6 +4,7 @@ import { deleteDocument, listDocuments, loadDocument, saveDocument, type Documen
 import { parseFiles, isScannedPdfError } from '@/parsers';
 import { errorReport, describeUnknownError } from '@/lib/diagnostics';
 import { resolvePageLimit, type OcrLang, type OcrProgress } from '@/lib/ocrTypes';
+import type { LayoutDocumentSummary } from '@/lib/ocrPostProcess';
 import {
   clearOcrAttempt,
   clearOcrStage,
@@ -39,8 +40,25 @@ interface LibraryState {
     metaAuthor: string;
   } | null;
   ocrProgress: OcrProgress | null;
-  /** 上次 OCR 的结果摘要：成功的页数与被跳过的页数 */
-  ocrSummary: { pagesProcessed: number; pagesSkipped: number; failures: number[] } | null;
+  /**
+   * 上次 OCR 的结果摘要：成功的页数与被跳过的页数。
+   *
+   * `layoutSummary` 是 T2 的**文档级版面汇总**（见 `LayoutDocumentSummary`）：
+   * 逐页的 `layout-metrics` 只能回答「这一页」，而「这本书里版面模型一共
+   * 改了多少」此前没有任何读点。它**不参与任何判定**，只用于在界面上
+   * 如实告诉用户「版面模型到底有没有在工作、改动了多少」。
+   *
+   * ⚠️ `layoutSummary.pagesWithLayout === 0` 是「一次都没接入」，
+   * 不是「接入了但没改动」—— 不能拿 `pages` 当判据（模型缺席时
+   * 回调照样会进、`pages` 照样很大）。两种情况的下一步动作相反，
+   * 界面上必须分开说。
+   */
+  ocrSummary: {
+    pagesProcessed: number;
+    pagesSkipped: number;
+    failures: number[];
+    layoutSummary: LayoutDocumentSummary;
+  } | null;
   /**
    * 上一页的**原始识别结构**（词框、字号、成行结果、最终块），已序列化成
    * JSON 字符串，供「复制识别结构」按钮使用。
@@ -292,6 +310,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
           pagesProcessed: result.pagesProcessed,
           pagesSkipped: result.pagesSkipped,
           failures: result.failures.map((f) => f.pageNum),
+          layoutSummary: result.layoutSummary,
         },
       });
     } catch (err) {

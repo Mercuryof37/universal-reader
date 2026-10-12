@@ -33,6 +33,14 @@ import {
   type AttachedChars,
   type CharSizeTable,
 } from '@/lib/ocrCharBoxes';
+// 被「外发面积闸门」挡下的公式候选（`ocrEngine` 写、这里读）。
+// ⚠️ 只 import 这个**叶子模块**，不要 import `lib/ocrEngine` ——
+// 那个模块会在顶层拉起 ONNX 运行时（`ort.env.wasm...`），
+// 把整条导出链路拖进一个几十 MB 的依赖里。
+import {
+  getOutboundFormulaSkips,
+  type OutboundFormulaSkip,
+} from '@/lib/outboundFormulaGate';
 // 版面分析的结果码。**只取类型与「结果 → 导出字段」两个纯函数** ——
 // 本文件不读 `getPageLayoutAnalysis()` 那个模块级记录，理由见下面 `layout` 字段。
 import {
@@ -240,6 +248,33 @@ export interface OcrStructure {
   wordsWithChars: number;
   /** 没拿到字符框的词及各自的原因（`ocrCharBoxes` 的三个失败出口之一） */
   charBoxSkips: { text: string; reason: string }[];
+  /**
+   * 被**外发面积闸门**挡下的公式候选（`lib/outboundFormulaGate.ts`）——
+   * 也就是「找到了、但因为它太大而**没有**发往 SimpleTex」的那些区域。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * 为什么它必须能被看见
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 闸门挡下的后果是「这块内容没有被公式增强救回来」，而用户看到的
+   * 现象与「公式增强没开启」「SimpleTex 没认出来」**完全一样**：
+   * 那道题里仍然少一块。没有这个字段，他只能猜 —— 而「原因写进了
+   * 看不见的地方」正是本项目吃过两次亏的那个坑（见 `charBoxSkips`
+   * 与 `ocrCharBoxes.ts` 里 `recordCharBoxSkip` 上方的说明）。
+   *
+   * 记录里给的是**可读的结论**：占比、上限、页面尺寸、以及这意味着什么，
+   * 不需要回源码查表。
+   *
+   * ⚠️ 形状与 `charBoxSkips` 一致，但**缺席语义不同**：
+   *   · `charBoxSkips` 恒存在（空数组也是一个结论：每个词都拿到了字符框）；
+   *   · 本字段**只在真的挡下过候选时出现**，没有挡下时整个字段缺席。
+   * 这么定是为了一条更硬的不变量：`pageLayoutInvariant.test.ts` 要求
+   * 「无版面信息时导出与接入前**逐字节相同**」，无条件写一个空数组会让
+   * 那份 golden 失效。代价要说清：**「挡下了 0 个」与「公式增强根本没跑
+   * （开关关着）」在这份导出里分不出来** —— 两者的区别要去 `layout`
+   * 与词表里找线索。这是有意的取舍，不是遗漏。
+   */
+  outboundFormulaSkips?: OutboundFormulaSkip[];
   /** 成行结果 */
   lines: OcrStructureLine[];
   linesTotal: number;
@@ -618,6 +653,12 @@ export function buildOcrStructure(input: {
     keptLines.push(entry);
   }
 
+  /**
+   * 被外发面积闸门挡下的候选。**只取一次**（读两次会得到两份不同的副本，
+   * 而且让「有没有挡下」这个判断看起来像两个独立事实）。
+   */
+  const outboundFormulaSkips = getOutboundFormulaSkips();
+
   return {
     kind: 'universal-reader/ocr-structure',
     version: 1,
@@ -672,6 +713,13 @@ export function buildOcrStructure(input: {
      * `OcrStructure.layout` 的注释（这是本次任务要「看得见」的那个字段）。
      */
     ...(input.layout ? { layout: layoutOf(input.layout) } : {}),
+    /**
+     * 被**外发面积闸门**挡下的公式候选。**空数组时整个字段缺席** ——
+     * 理由（以及这个取舍的代价）写在 `OcrStructure.outboundFormulaSkips`
+     * 上方的长注释里：无条件写空数组会让
+     * `pageLayoutInvariant.test.ts` 的逐字节 golden 失效。
+     */
+    ...(outboundFormulaSkips.length ? { outboundFormulaSkips } : {}),
   };
 }
 

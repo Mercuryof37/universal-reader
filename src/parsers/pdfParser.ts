@@ -13,7 +13,12 @@ import {
   shouldCheckpoint,
 } from '@/lib/ocrTypes';
 import type { OcrLang, OcrProgress } from '@/lib/ocrTypes';
-import { ocrResultToBlocks } from '@/lib/ocrPostProcess';
+import {
+  createLayoutSummaryAccumulator,
+  ocrResultToBlocks,
+  renderLayoutSummaryLine,
+} from '@/lib/ocrPostProcess';
+import type { LayoutDocumentSummary } from '@/lib/ocrPostProcess';
 import { analyzePageLayout } from '@/lib/layoutAnalysis';
 import type { OcrStructure } from '@/lib/ocrStructure';
 
@@ -434,6 +439,23 @@ export interface OcrParseResult {
   pagesSkipped: number;
   /** 失败的页及原因 */
   failures: OcrPageFailure[];
+  /**
+   * **文档级**版面接入汇总（T2 累加器；见 `LayoutDocumentSummary`）。
+   *
+   * ⚠️ 与 `pagesProcessed` 等字段不同，它**不参与任何判定**，也**不进
+   * 导出的识别结构**（`ocrStructure` 的契约归 T5）—— 它是一个**诊断出口**：
+   * 逐页的 `layout-metrics` 只能回答「这一页」，而「这本书里版面模型一共
+   * 改了多少」在此之前没有任何读点。
+   *
+   * ⚠️ **判「有没有接入版面」要看 `layoutSummary.pagesWithLayout`，
+   * 不是 `pages`**：模型缺席时 `applyLayoutToLines` 也会交出一份
+   * 「全 0」报告，所以 `pages` 在两种情况下都可能很大。
+   * `pagesWithLayout === 0` 才是「一次都没接入」（模型没取到 / 推理失败 /
+   * 关掉了开关），此时页眉页脚与阅读顺序全部走几何启发式。
+   * 两种情况的下一步动作相反（查模型有没有加载 vs 查模型判得对不对），
+   * 界面上必须分开说 —— 这也是这条注释存在的理由。
+   */
+  layoutSummary: LayoutDocumentSummary;
 }
 
 /**
@@ -514,7 +536,24 @@ export async function ocrParsePdf(
       sizeBytes: fileSize,
     });
 
+  /**
+   * ═══════════════════════════════════════════════════════════════
+   * 文档级版面汇总：把逐页报告累加成一个总数
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 累加器建在循环**外面**（它要跨页累积），页码经 `currentPageNum`
+   * **现取** —— 见 `createLayoutSummaryAccumulator` 的 `pageNumOf` 说明：
+   * 捕获 `pageNum` 的值会把整份文档都记成第一页。
+   *
+   * 回调**每次都会进**（`applyLayoutToLines` 的每一条出口都交报告，
+   * 包括「模型缺席」那条短路）—— 所以「这一页有没有真的接入版面」
+   * 由累加器**自己判**（见 `decisionSummary.total`），不靠这里挑。
+   */
+  let currentPageNum = 0;
+  const layoutTotals = createLayoutSummaryAccumulator(() => currentPageNum);
+
   for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
+    currentPageNum = pageNum;
     onProgress?.({ pageNum, total: totalPages, status: 'recognizing' });
 
     let pageCanvas: HTMLCanvasElement | undefined;
@@ -685,6 +724,26 @@ export async function ocrParsePdf(
           // 版面分析的结果码进导出 —— 用户看不到控制台，
           // 「页眉被多滤掉一行到底是不是版面模型干的」只能靠它回答。
           layoutOutcome,
+          /**
+           * ⭐ T2 文档级汇总的接线点：每页一份 `LayoutPageReport`，
+           * 在这里被累加进 `layoutTotals.summary`。
+           *
+           * ⚠️ 传的是**回调**（`layoutTotals.onPage`），不是把汇总本身
+           * 传进去 —— `ocrResultToBlocks` 只负责「这一页发生了什么」，
+           * 「整份文档累计发生了什么」是调用方的事。这一行是两者之间
+           * 唯一边界，所以它刻意保持成一个函数引用。
+           *
+           * ⚠️ 第 6 个参数**缺席**时行为与接线前逐字节相同
+           * （回调是可选参数，不传就一个分支都不进）。
+           *
+           * ⚠️ **覆盖率如实说明**：把这一行摘掉（变异 8）后
+           * **1051 条既有用例全绿** —— 也就是说这一行**没有测试守着**。
+           * 理由是本文件跑在真的 PDF + 真的 OCR 引擎 + 真的版面模型上，
+           * 单元测试里起不来；能测的那一段（回调 → 累加器）已经由
+           * `layoutDocumentSummary.test.ts` 的「接线」一组从另一端钉住了。
+           * 谁要动这一行，请手动确认 `OcrParseResult.layoutSummary` 有值。
+           */
+          layoutTotals.onPage,
         );
         if (blocks.length) {
           allDrafts.push(...blocks);
@@ -801,7 +860,28 @@ export async function ocrParsePdf(
     sizeBytes: fileSize,
   });
 
-  return { document: resultDoc, pagesProcessed, pagesSkipped, failures };
+  /**
+   * 文档级汇总的**出口**。刻意放在成功收尾这一段：
+   * 中途抛错时不会有这一行（那次任务没有「文档级结论」可言）。
+   *
+   * ⚠️ 只在 `pagesWithLayout > 0` 时打。条件用 `pagesWithLayout` 而**不是**
+   * `pages`：模型缺席时回调照样会进（一份「全 0」报告），
+   * 用 `pages > 0` 判断的话每次 OCR 都会打出一行全 0 的汇总，
+   * 而那行会被读成「版面模型跑了、一行都没抓到」——
+   * 事实是**它一次都没接入**。不打这一行比打一行误导性的更诚实，
+   * 也让「没有版面信息时输出逐字节相同」这条不变量在**日志层面**成立。
+   */
+  if (layoutTotals.summary.pagesWithLayout > 0) {
+    console.info(renderLayoutSummaryLine(layoutTotals.summary));
+  }
+
+  return {
+    document: resultDoc,
+    pagesProcessed,
+    pagesSkipped,
+    failures,
+    layoutSummary: layoutTotals.summary,
+  };
 }
 
 /** 把"提取路径"的分布汇总成一行，便于一眼判断是不是结构问题 */

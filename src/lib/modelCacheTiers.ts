@@ -32,36 +32,32 @@
  * · **不在导入路径上做任何事**。所有副作用都在显式调用的函数里。
  *
  * ═══════════════════════════════════════════════════════════════
- * ⚠️ 尚未接线：`ensureModelTierAssets` 目前**没有运行时调用点**
+ * ✅ 接线状态：运行期调用点在 `src/lib/pwa.ts`
  * ═══════════════════════════════════════════════════════════════
- *
- * 状态说清楚，免得读的人以为它已经在跑：
  *
  * | 能力 | 状态 |
  * |---|---|
  * | 缓存身份按档位区分（`modelCacheName`） | ✅ 已生效 —— `vite.config.ts` 的路由直接用它 |
- * | 下载前的容量预检查 | ✅ 构建期已生效（`scripts/fetch-ocr-models.mjs`）；<br>⚠️ 运行期**只实现、未接线** |
- * | 旧档位缓存清理 | ⚠️ **只实现、未接线** |
+ * | 下载前的容量预检查 | ✅ 构建期（`scripts/fetch-ocr-models.mjs`）+ ✅ 运行期 |
+ * | 旧档位缓存清理 | ✅ 运行期 |
  *
- * 没接线的原因不是漏了，而是**没有合适的地方**：
- * · 档位取决于「版面模型是否可用」，而那个能力的检测在
- *   `src/lib/layoutAnalysis.ts`（`loadLayoutSession`），该文件本轮**不许改**；
- * · 本项目**没有**设置面板里的档位开关（档位是能力推出来的，不是用户选的）；
- * · `src/lib/pwa.ts` 是唯一现成的启动钩子（它已经在那里调
- *   `seedNavigationFallback()`），但它**不在**本任务允许改动的文件清单里。
- *
- * **接线方式（一行，留给下一轮或档位开关落地时用）**：
+ * 运行期那一侧由 `src/lib/modelTierBoot.ts` 的 `bootModelTierAssets()` 承担，
+ * 调用点是 `src/lib/pwa.ts` 的 `useRegisterSW({ onRegisteredSW })` ——
+ * 与既有的 `seedNavigationFallback()` 并列，一行：
  *
  * ```ts
- * // src/lib/pwa.ts 的 useRegisterSW({ onRegisteredSW() { … } }) 里，
- * // 与 seedNavigationFallback() 并列：
- * void ensureModelTierAssets(resolveQualityTier({ layoutModel: <能力检测结果> }));
+ * void bootModelTierAssets();   // 档位由 detectLayoutCapability() 推出来，不在调用点写死
  * ```
  *
- * 它**不是**「先下载再判断」：`ensureModelTierAssets` 的第一步就是
- * `cleanupStaleModelCaches` + `preflightModelTier`，拦住时一个字节都不取。
- * 在被调用之前，运行期行为与改动前**完全一致**（模型仍由那条 CacheFirst
- * 路由按需取），所以本轮的改动没有引入任何运行期副作用。
+ * 它**不是**「先下载再判断」：第一步就是 `cleanupStaleModelCaches` +
+ * `preflightModelTier`，拦住时一个字节都不取。启动路径不许被它弄挂，
+ * 所以那一层还兜住了本文件没包 try/catch 的两处（`storage.open()` /
+ * `cache.match()`）以及「当前离线」这一种情形。
+ *
+ * ⚠️ 接线没有动任何名字或 URL，仍然成立的不变量是：
+ * **默认档位下缓存身份与改动前逐字相同**（裸名 `ocr-models`，四个资产 URL 不变）。
+ * 这条不变量两半各有一组用例钉着 —— 库这一侧在
+ * `src/lib/modelCacheTiers.test.ts`，接线那一侧在 `src/lib/modelTierBoot.test.ts`。
  */
 
 /**

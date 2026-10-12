@@ -410,7 +410,7 @@ export const NOT_EXCLUDED_SPECS: readonly NotExcludedSpec[] = [
     outboundPaths: ['formulaOcrEnabled'],
     payloadKeys: ['image'],
     why:
-      '公式增强开启时，ocrEngine.enhanceFormulaRegions 把候选区域用 cropCanvas 裁出来、编码成 PNG、以 base64 放进 {image} 发到第三方 SimpleTex。所以「页面图像不外发」是**错的**，排除清单里没有这一项。⚠️ 而且裁剪块的**面积没有上界**：词聚类那条路的框由公式候选算出；「漏识别墨迹区域」那条路（lib/ocrInkRegions.ts 的 detectMissedInkRegions）只按格子数与墨迹比例过滤，**没有任何面积上限** —— 满页墨迹（整页识别失败、整页插图）时返回的区域可以覆盖接近整页。唯一的上界是字节数：formulaOcrService 的 MAX_IMAGE_SIZE = 2_000_000。',
+      '公式增强开启时，ocrEngine.enhanceFormulaRegions 把候选区域用 cropCanvas 裁出来、编码成 PNG、以 base64 放进 {image} 发到第三方 SimpleTex。所以「页面图像不外发」是**错的**，排除清单里没有这一项。⚠️ 面积上界：**以前没有**（本项目核实过：800×1000 全墨迹页面 + 一个 16×16 词框 → 最大候选覆盖 100.0% 页面，而且真的被发了出去）；现在**发送决定**之前有一道面积闸门 —— `lib/outboundFormulaGate.ts` 的 OUTBOUND_FORMULA_MAX_REGION_AREA_RATIO = 0.3，被挡下的候选记进导出结构的 outboundFormulaSkips（用户看得见）。⚠️ 但它**仍然不能**进排除清单：闸门只是把上界从「整页」压到「三成页面」，「页面像素不外发」这句话依旧为假；而且那条**检测**路（lib/ocrInkRegions.ts 的 detectMissedInkRegions）本身仍然不设面积上限，上界只存在于会外发的那条路上。字节数上界是另一道：formulaOcrService 的 MAX_IMAGE_SIZE = 2_000_000。',
   },
   {
     key: 'blockText',

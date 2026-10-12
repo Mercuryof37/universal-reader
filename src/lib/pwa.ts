@@ -25,6 +25,7 @@
 import { useState } from 'react';
 import { useRegisterSW } from 'virtual:pwa-register/react';
 
+import { bootModelTierAssets } from '@/lib/modelTierBoot';
 import { seedNavigationFallback } from '@/lib/pwaOffline';
 import { noteReloadReason } from '@/lib/sessionDiagnostics';
 import { useLibraryStore } from '@/store/libraryStore';
@@ -76,6 +77,26 @@ export function usePwa(): PwaState {
     onRegisteredSW() {
       // 注册成功后趁在线把页面骨架写进导航缓存，补上离线冷启动的空档
       void seedNavigationFallback();
+      /**
+       * 同一个时机让**当前质量档位**的模型资产就位
+       * （`cleanupStaleModelCaches` → `preflightModelTier` → 逐个下载）。
+       *
+       * 为什么放在这里：这是本项目**唯一**现成的启动钩子，而模型资产是
+       * 「装上就能离线读」的前置条件 —— 不预取的话，用户必须先在联网状态下
+       * 真的跑过一次 OCR，那些文件才会进缓存。
+       *
+       * 三条边界都在 `bootModelTierAssets` 里兜住了，所以这一行**不需要**
+       * 参与启动判定：它不 await、不抛、结果只变成一条可读的记录
+       * （`getModelTierBootRecord()` / `renderModelTierBootReport()` /
+       * 文档库里的横幅）。预检查拦住 ⇒ 一个字节都不取；
+       * 拿不到存储配额 ⇒ 不拦；清理失败 ⇒ 只告警。
+       *
+       * ⚠️ 刻意**不在这里传档位**：档位由 `detectLayoutCapability()` 推出来
+       * （`VITE_OCR_LAYOUT` 关掉时才走 fast 档），在调用点写死会让
+       * 「缓存身份 = 当前档位」这句话变成假的。`modelTierBoot.test.ts`
+       * 会把「调用点不许写死档位」这条钉住。
+       */
+      void bootModelTierAssets();
     },
     /**
      * 新版本接管时的刷新时机。

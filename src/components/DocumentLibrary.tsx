@@ -1,7 +1,14 @@
-import { useState } from 'react';
+import { useState, useSyncExternalStore } from 'react';
 import { FileText, Trash2, BookOpen, AlertTriangle, X } from 'lucide-react';
 import { useLibraryStore } from '@/store/libraryStore';
 import { FileUploadZone } from '@/components/FileUploadZone';
+import {
+  getModelTierBootRecord,
+  modelTierBootBannerTitle,
+  modelTierBootNoteworthy,
+  renderModelTierBootReport,
+  subscribeModelTierBoot,
+} from '@/lib/modelTierBoot';
 import {
   dismissDiagnostics,
   getDiagnosticsSignature,
@@ -12,6 +19,7 @@ import {
   getReloadCount,
   isDiagnosticsDismissed,
 } from '@/lib/sessionDiagnostics';
+import { renderLayoutSummaryLine } from '@/lib/ocrPostProcess';
 
 const FORMAT_LABEL: Record<string, string> = {
   markdown: 'MD',
@@ -74,6 +82,34 @@ export function DocumentLibrary({ onOpen }: { onOpen?: () => void }) {
   );
   const showDiagnostics =
     (reloadCount > 1 || interrupted !== null) && dismissedSignature !== signature;
+
+  /**
+   * 模型资产就位（启动钩子 `bootModelTierAssets`）的结论。
+   *
+   * ═══════════════════════════════════════════════════════════════
+   * 为什么必须显示出来，而不是只 `console.warn`
+   * ═══════════════════════════════════════════════════════════════
+   *
+   * 那次运行发生在 Service Worker 注册成功之后，而**它的失败恰恰会让
+   * 「装上就能离线读」这个卖点失效** —— 用户看到的现象只是「断网时识别不了」，
+   * 与「这个浏览器本来就不支持」长得一模一样。
+   *
+   * 而这个项目的用户多半在手机 / iOS Safari 上，**没有 DevTools 可看**
+   * （见 `sessionDiagnostics.ts` 顶部那段同样的理由）。所以结论必须
+   * 出现在界面上，并且能一键复制成可上报的文本。
+   *
+   * ⚠️ 只有「值得让人知道」的结果才显示（见 `modelTierBootNoteworthy`）：
+   * 正常路径一条都不弹 —— 每次都弹「一切正常」会训练用户无视横幅，
+   * 真正要命的那条也就跟着看不见了。安静不等于没记录：
+   * `getModelTierBootRecord()` 在任何情况下都拿得到完整结论。
+   */
+  const modelBoot = useSyncExternalStore(
+    subscribeModelTierBoot,
+    getModelTierBootRecord,
+    // 服务端快照（本项目不做 SSR，给一个稳定值即可满足签名）
+    () => null,
+  );
+  const [bootCopyState, setBootCopyState] = useState<'idle' | 'done' | 'failed'>('idle');
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 p-6">
@@ -140,6 +176,44 @@ export function DocumentLibrary({ onOpen }: { onOpen?: () => void }) {
         </Banner>
       )}
 
+      {modelBoot && modelTierBootNoteworthy(modelBoot) && (
+        <Banner tone="warn">
+          <p className="font-medium">{modelTierBootBannerTitle(modelBoot)}</p>
+          <p className="mt-1">{modelBoot.detail}</p>
+          <p className="mt-1 text-[11px] opacity-80">
+            质量档位：{modelBoot.tierLabel}（{modelBoot.tier}）· 缓存：{modelBoot.cacheName}
+            {modelBoot.failed.length > 0 && ` · 下载失败 ${modelBoot.failed.length} 个`}
+            {modelBoot.cleaned.length > 0 && ` · 已清理旧档位缓存 ${modelBoot.cleaned.length} 个`}
+          </p>
+          {/*
+            复制出口：用户没有控制台，而这条结论里带着判断用的**原始数字**
+            （单文件上限、已用 / 配额、逐项 URL）。不给他一个复制按钮，
+            这些数字就永远留在他的浏览器里 —— 与 `ocrStructure` 同一个理由。
+          */}
+          <div className="mt-2 border-t border-amber-400/40 pt-2">
+            <button
+              type="button"
+              onClick={() => {
+                void (async () => {
+                  const ok = await copyTextToClipboard(renderModelTierBootReport(modelBoot));
+                  setBootCopyState(ok ? 'done' : 'failed');
+                })();
+              }}
+              className="rounded-lg border border-amber-500/50 px-2.5 py-1 text-xs font-medium transition-colors hover:bg-amber-500/15"
+            >
+              复制模型资产诊断
+            </button>
+            <p className="mt-1 text-[11px] opacity-80">
+              {bootCopyState === 'done'
+                ? '已复制到剪贴板。把它发给开发者，就能看出是哪一步没准备好。'
+                : bootCopyState === 'failed'
+                  ? '复制失败：浏览器拒绝了剪贴板操作。请改用 https 打开本页，或按 F12 在控制台里执行 __modelTierBoot()。'
+                  : '这份文本说明模型资产走到哪一步、卡在哪里，不含正文内容，也不会联网。'}
+            </p>
+          </div>
+        </Banner>
+      )}
+
       {ocrSummary && (
         <Banner tone="warn" onClose={cancelOcr}>
           <p className="font-medium">OCR 完成：成功识别 {ocrSummary.pagesProcessed} 页</p>
@@ -191,6 +265,70 @@ export function DocumentLibrary({ onOpen }: { onOpen?: () => void }) {
               </p>
             </div>
           )}
+
+          {/*
+            ═══════════════════════════════════════════════════════════
+            T2 文档级版面汇总 —— 逐页数字在这里第一次变成「这本书的结论」
+            ═══════════════════════════════════════════════════════════
+
+            为什么要有这一块：逐页的 `layout-metrics` 每页打一行，
+            一本 30 页的书就是 30 行，而「这本书里版面模型一共改了多少」
+            此前没有任何读点 —— 也就是说这个数在真实运行里**没人得到过**。
+
+            ⚠️ 刻意把「一次都没接入」与「接入了但没改动」分成两句不同的话：
+            前者要查模型有没有加载（或用户关没关开关），后者要查模型判得对不对。
+            这两种情况的下一步动作相反，所以不能用一句「版面改动 0 行」糊过去。
+
+            ⚠️ 判据是 `pagesWithLayout`（**真的拿到区域的页数**），不是 `pages`：
+            模型缺席时 `applyLayoutToLines` 也会交出一份「全 0」报告，
+            所以 `pages` 在两种情况下都可能很大 —— 拿它当判据会把
+            「没接入」误报成「接入了但没改动」。
+          */}
+          <div className="mt-2 border-t border-amber-400/40 pt-2">
+            {ocrSummary.layoutSummary.pagesWithLayout === 0 ? (
+              <p className="text-[11px] opacity-80">
+                版面分析本次<strong>一次都没接入</strong>（模型未取到 / 推理失败 / 已被关闭），
+                页眉页脚与阅读顺序全部走几何启发式 —— 这不是「版面模型没改动」。
+              </p>
+            ) : (
+              <>
+                <p className="text-[11px] opacity-90">
+                  版面分析：接入 {ocrSummary.layoutSummary.pagesWithLayout} 页
+                  {ocrSummary.layoutSummary.pages > ocrSummary.layoutSummary.pagesWithLayout &&
+                    `（共 ${ocrSummary.layoutSummary.pages} 页有版面报告）`}
+                  ，额外摘掉页面家具 {ocrSummary.layoutSummary.removedByLayout} 行
+                  {Object.keys(ocrSummary.layoutSummary.removedByLabel).length > 0 &&
+                    `（${Object.entries(ocrSummary.layoutSummary.removedByLabel)
+                      .map(([label, n]) => `${label}×${n}`)
+                      .join('、')}）`}
+                  ，重排阅读顺序 {ocrSummary.layoutSummary.reorderedPages} 页，
+                  标题判定被改动{' '}
+                  {Object.values(ocrSummary.layoutSummary.headingUse).reduce((a, b) => a + b, 0)} 次。
+                </p>
+                <p className="mt-1 text-[11px] opacity-80">
+                  这是<strong>这一本书的总数</strong>（逐页明细仍在控制台的 layout-metrics 行里）。
+                  它只说明版面模型改动了多少，<strong>不说明改得对不对</strong> ——
+                  后者需要人工标注，见 npm run eval:layout。
+                </p>
+                {/* 单行 JSON：与 `renderLayoutSummaryLine` 完全同一份文本，
+                    因此界面上复制的与日志里出现的**逐字节相同** */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    void (async () => {
+                      const ok = await copyTextToClipboard(
+                        renderLayoutSummaryLine(ocrSummary.layoutSummary),
+                      );
+                      setCopyState(ok ? 'done' : 'failed');
+                    })();
+                  }}
+                  className="mt-2 rounded-lg border border-amber-500/50 px-2.5 py-1 text-xs font-medium transition-colors hover:bg-amber-500/15"
+                >
+                  复制版面汇总（单行 JSON）
+                </button>
+              </>
+            )}
+          </div>
         </Banner>
       )}
 
