@@ -75,7 +75,8 @@ describe('识别结构导出：字段与行引用', () => {
   it('每个词都带文本、bbox、字高与由 bbox 算出的高度', () => {
     const { structure } = capture([w('设', 40, 88, 20, 20), w('函数', 70, 90, 18, 40)]);
 
-    expect(structure.kind).toBe('universal-reader/ocr-structure');
+    expect(structure.schema).toBe('universal-reader/ocr-structure');
+    expect(structure.schemaVersion).toBe(1);
     expect(structure.pageNum).toBe(1);
     expect(structure.wordsTotal).toBe(2);
     expect(structure.words).toHaveLength(2);

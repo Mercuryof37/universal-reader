@@ -9,6 +9,15 @@
  * 只能证明「今天的代码符合我今天的预期」，证明不了「与接入前逐字节相同」。
  * 而后者是本次改动唯一的不变量（见 `pageLayoutInvariant.test.ts`）。
  *
+ * ⚠️ **T5 之后它怎么用**（`GOLDEN_STRUCTURE_JSON` 本身**不改**，一个字节都不改）：
+ * 导出从 T5 起带六个信封字段（`schema` / `schemaVersion` / `producer` /
+ * `document` / `contract` / `compatibility`），所以「整份导出 = 这个字符串」
+ * 已不可能成立。不变量因此换成**判定部分**逐字节相同：
+ * 这里扣掉旧信封（`kind` / `version` / `buildId`）剩下的字节
+ * （见 `ocrStructureContract.golden.ts` 的 `LEGACY_DECISION_JSON`）
+ * 必须等于新导出扣掉新信封之后的字节。
+ * `GOLDEN_STRUCTURE_JSON` 因此是那份不变量的**唯一原始来源**，谁都不许改它。
+ *
  * 重新生成：
  *   cd universal-reader
  *   node ../scripts-out/gen-golden.mjs src/lib/pageLayoutInvariant.golden.ts

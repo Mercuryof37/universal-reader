@@ -34,7 +34,15 @@ import type { OcrPageResult } from '@/lib/ocrTypes';
  * 预期」，证明不了「与接入前相同」—— 那正是本项目已经出现过 5 次的
  * 「假保护」形态。
  */
-import { FIXTURE_WORDS, GOLDEN_BLOCKS_JSON, GOLDEN_STRUCTURE_JSON } from './pageLayoutInvariant.golden';
+import { FIXTURE_WORDS, GOLDEN_BLOCKS_JSON } from './pageLayoutInvariant.golden';
+import {
+  CONTRACT_FIELD_ORDER,
+  GOLDEN_V2_STRUCTURE_JSON,
+  LEGACY_DECISION_JSON,
+  LEGACY_ENVELOPE_KEYS,
+  decisionJsonOf,
+  splitEnvelope,
+} from './ocrStructureContract.golden';
 
 /**
  * 一份固定的单页识别结果：页眉 + 三行正文（含一处上标、`hasScripts: true`）+ 页脚。
@@ -71,8 +79,56 @@ describe('不变量：无版面信息时输出与接入前逐字节相同', () =
     });
 
     const actual = captured!;
-    // 逐字节比对：新增字段缺席时，导出必须与改动前的导出完全相同
-    expect(JSON.stringify(actual)).toBe(GOLDEN_STRUCTURE_JSON);
+    /**
+     * ═══════════════════════════════════════════════════════════════
+     * T5 之后，这条断言换成「**判定部分**逐字节相同」
+     * ═══════════════════════════════════════════════════════════════
+     *
+     * 旧的不变量是「整份导出 = 改动前的真实输出」。T5 有意给导出加了
+     * 六个信封字段（`schema` / `schemaVersion` / `producer` / `document` /
+     * `contract` / `compatibility`），所以「整份相同」**不可能**再成立 ——
+     * 但**它当初要保护的东西一个字都没变**：正文与判据数据。
+     *
+     * 于是这里把它拆成可判定的两半（`splitEnvelope`）：
+     *   · `LEGACY_DECISION_JSON` = 旧 golden 扣掉**旧**信封
+     *     （`kind` / `version` / `buildId`）后的字节；
+     *   · `decisionJsonOf(actual)` = 新导出扣掉**新**信封后的字节。
+     * 两者必须逐字节相同。
+     *
+     * ⚠️ 为什么这样**没有**弱化断言：旧 golden 与新导出**本来就是**
+     * 同一份 `FIXTURE_WORDS` 跑出来的，而旧信封恰好就是新信封里
+     * 那三个对应物（`kind`→`schema`、`version`→`schemaVersion`、
+     * `buildId`→`producer.version`）。扣掉它们之后剩下的键集合
+     * 两边**完全相同**，所以这是一次**等强度的逐字节比对**，
+     * 覆盖面一点没少。
+     */
+    expect(decisionJsonOf(actual)).toBe(LEGACY_DECISION_JSON);
+
+    /**
+     * ⚠️ 反面：新的身份键**必须**在，而旧的三个键**必须不在**。
+     *
+     * 少了这一条，上面那次比对在「两边都扣掉了各自的信封」之后
+     * 仍然可能对一个**没有信封**的载荷成立 —— 那样 T5 就白做了。
+     */
+    for (const key of LEGACY_ENVELOPE_KEYS) {
+      expect(key in actual, `旧键 ${key} 不该再出现在导出里（T5 用 schema 双键取代了它）`).toBe(
+        false,
+      );
+    }
+    const { envelope } = splitEnvelope(actual);
+    expect(Object.keys(envelope)).toEqual([
+      'schema',
+      'schemaVersion',
+      'producer',
+      'document',
+      'contract',
+      'compatibility',
+    ]);
+
+    // 同一份真实输出与「信封 + 判定部分」的完整快照对比：顺带钉住键顺序
+    expect(JSON.stringify(actual)).toBe(GOLDEN_V2_STRUCTURE_JSON);
+    // 快照里的字段声明顺序 = 契约里的顺序（读者从上往下读的顺序）
+    expect((actual.contract as { fields: string[] }).fields).toEqual(CONTRACT_FIELD_ORDER);
 
     /**
      * ⚠️ 还要钉住「golden 真的覆盖到了 `hasScripts` 两条分支」。
@@ -110,7 +166,7 @@ describe('不变量：无版面信息时输出与接入前逐字节相同', () =
     const { layout, ...withoutLayout } = actual;
 
     // 加一个失败码绝不该改动正文
-    expect(JSON.stringify(withoutLayout)).toBe(GOLDEN_STRUCTURE_JSON);
+    expect(decisionJsonOf(withoutLayout)).toBe(LEGACY_DECISION_JSON);
     // 而「试过但失败」这一次必须看得见，且带上含义与下一步动作
     expect(layout).toMatchObject({
       used: false,
@@ -134,7 +190,7 @@ describe('不变量：无版面信息时输出与接入前逐字节相同', () =
 
     const actual = captured!;
     const { layout, ...withoutLayout } = actual;
-    expect(JSON.stringify(withoutLayout)).toBe(GOLDEN_STRUCTURE_JSON);
+    expect(decisionJsonOf(withoutLayout)).toBe(LEGACY_DECISION_JSON);
     expect(layout).toMatchObject({
       used: true,
       code: 'none',

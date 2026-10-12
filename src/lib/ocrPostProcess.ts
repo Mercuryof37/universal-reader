@@ -601,6 +601,12 @@ function applyPiecewiseRecovery(lines: OcrLine[], allWords: OcrWord[]): OcrLine[
  *   不合并的理由：区域是**数据**、结果是**元数据**，前者参与判定、后者只进导出。
  *   把两者塞进一个参数会让「有 outcome 但没 regions」这种合法状态无法表达。
  *   **本参数不影响任何判定** —— 它只在 `onStructure` 里落成 `layout` 字段。
+ * @param isFullDocument 这份导出是否覆盖**全文**（MinerU 的 `is_full_document`）。
+ *   **不传 = `false`**：本函数导出的永远是**一页**，而「一页 = 全文」只有
+ *   单页文档才成立。默认取保守方向，意味着「忘了传」时读者只会**低估**
+ *   结论的适用范围，不会误以为这一页能代表整份文档。
+ *   它只进导出（`document.isFullDocument`），**不影响任何判定**：
+ *   与 `layoutOutcome` 同一条纪律 —— 元数据不参与正文。
  */
 export function ocrResultToBlocks(
   result: OcrPageResult,
@@ -609,6 +615,7 @@ export function ocrResultToBlocks(
   layoutRegions?: readonly LayoutRegion[],
   layoutOutcome?: LayoutAnalysisOutcome,
   onLayoutApplication?: (report: LayoutPageReport) => void,
+  isFullDocument?: boolean,
 ): Omit<ContentBlock, 'id'>[] {
   // 关键兜底：拿不到词级坐标时，用纯文本也要产出内容。
   // 否则就会出现"识别出 7058 字却报告什么都没识别到"这种荒唐结果。
@@ -1023,6 +1030,12 @@ export function ocrResultToBlocks(
          * 也因此能在不跑 OCR 的前提下构造这个字段。
          */
         layout: layoutOutcome,
+        /**
+         * 覆盖范围（`document.isFullDocument`）。**不传就按 `false` 处理**
+         * （见 `isFullDocument` 的参数说明）—— 「一页 = 全文」只有单页
+         * 文档才成立，所以默认必须是保守的那一个方向。
+         */
+        isFullDocument,
       }),
     );
   }

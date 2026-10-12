@@ -1323,7 +1323,7 @@ onnx —— 第 1 页：原始尺寸 → 送入推理（1667×2223） · 设备�
 
 | 字段 | 怎么读 |
 |---|---|
-| `buildId` | **这份导出是哪一次构建跑出来的**。由 `vite.config.ts` **每次构建注入**（`new Date().toISOString()`）。**没有它，就分不清「修复没生效」与「你还没拿到修复」** |
+| `producer.version` | **这份导出是哪一次构建跑出来的**。由 `vite.config.ts` **每次构建注入**（`new Date().toISOString()`）。**没有它，就分不清「修复没生效」与「你还没拿到修复」**。⚠️ **T5 起改名**：这一行原先叫 `buildId`，现在生产版本只在这一处出现（见 §9.1） |
 | `wordsWithChars` | 拿到字符框的词数。**`0` = 字符级这一步根本没跑成**（识别器建不起来等）；**非 0 但文本里没有 `^{}` = 跑了、判据没命中** —— **这是两个不同的问题** |
 | `words[].chars` | 该词的字符级框。⚠️ **字段缺失 ≠ 字段为空**：缺失说明这一步没跑成，与「跑了但没框」不是一回事（`ocrStructure.ts` 里为此写了长注释） |
 | `charBoxSkips` | **每个没拿到字符框的词，以及它停在哪一个出口**（含**重新识别得到的文本**、期望文本、两个长度）。每页开始前清空，否则会跨页累积 |
@@ -1431,7 +1431,11 @@ const canonical = (s: string): string =>
 - ⚠️ **判据没有变**：这一轮**没有**放松任何阈值。中线符号那次（§5.12.8）是**补一条可推导的条件**，
   这次是**换一种对账方式**；「少一点覆盖，绝不产出错的坐标」这条原则不变。
 
-#### 5.12.11 一个**独立待查**的缺陷：连续两次导出拿到**同一个 `buildId`**
+#### 5.12.11 一个**独立待查**的缺陷：连续两次导出拿到**同一个构建标识**
+
+> ⚠️ **字段改名（T5）**：本节说的那个字符串现在叫 **`producer.version`**，
+> 不再是顶层的 `buildId`（生产版本只留一处，见 §9.1）。
+> 每条判据的含义与本节写的一字不差，只是位置与名字变了。
 
 - **现象**【用户导出】：`42dd59f` 上线后，用户连续两次导出的 `buildId` **完全相同**
   —— 也就是说，**用户浏览器仍在跑旧构建**。
@@ -2312,16 +2316,94 @@ node scripts/analyze-pdf-objects.mjs "book.pdf"
 
 | 你想知道 | 看哪个字段 | 结论 |
 |---|---|---|
-| 我拿到的是哪一版 | `buildId` | 两次导出**相同** ⇒ **你的浏览器还在跑旧构建**，先解决刷新再谈别的（§5.12.11） |
+| 我拿到的是哪一版 | `producer.version` —— **T5 起由它取代 `buildId`** | 两次导出**相同** ⇒ **你的浏览器还在跑旧构建**，先解决刷新再谈别的（§5.12.11） |
 | 字符级这一步跑了没有 | `wordsWithChars` | `0` ⇒ **没跑成**（识别器建不起来 / 前置条件不满足）；非 0 ⇒ 跑了 |
 | 跑了，为什么没判出上标 | `words[].chars` + `lines[].stats` + `thresholds` | 有字符框 ⇒ 把 `heightRatio` / `centerShift` 与 `thresholds` 放一起比，判据松紧一目了然。⚠️ **字段缺失 = 这一步没跑成**，与「框为空」是两件事 |
 | 逐字符置信度到底有没有 | `chars[].confidence` + `charConfidencesComplete` | ⭐ **这两个字段是这一轮最该先看的东西**（§5.13.6 / §5.13.7）。`charConfidencesComplete: false` ⇒ **至少一位缺值**，那位会**退回几何判据**；**全 `null` 与「值低」是两件完全不同的事** —— 前者说明那道门没信息，后者才是「这个字符不可信」。**在一个 `confidence` 值都没有的情况下讨论「这个维度有没有用」，就是在用假设验证假设** |
 | 机制 5 为什么接受 / 拒绝了 | 把候选的**像素高度**与**同页同字符的最大像素高度**相除，和 `0.8` 比 | 机制 5 的判据是**页级比值**（§5.13.9）。⚠️ **必须用像素高度** —— `InkMeasurement.h` 是**归一化**高度（分母是**本词裁剪高**），跨词不可比：实测同一个 `=` 在两份裁剪里能差 **1.9 倍**，混算会把该拒的变成该收的。⚠️ **这两个数目前还不在导出里**，要看只能按 §9 上面那几个字段自己算（这也是 R10 第 3 条要补的字段） |
-| 某个词为什么没有字符框 | `charBoxSkips` | 直接给出**停在哪一个出口**（尺寸不合适 / 裁剪失败 / 未解出字符 / 与词文本不一致），**并带上重新识别得到的文本** |
+| 某个词为什么没有字符框 | `charBoxSkips` | 直接给出**停在哪一个出口**（尺寸不合适 / 裁剪失败 / 未解出字符 / 与文本不一致），**并带上重新识别得到的文本** |
+| 这份导出我到底能不能读 | `schema` + `schemaVersion` | **两个键联合判定**，见 §9.1。数字相同不等于同一种格式 |
 
 > ⚠️ **两条纪律**：① 导出里**没有** `chars` 字段 ≠「字符框为空」；
-> ② 拿到导出后**先看 `buildId`**，再讨论任何行为 —— 否则很可能在分析一个
+> ② 拿到导出后**先看 `producer.version`**，再讨论任何行为 —— 否则很可能在分析一个
 > **用户根本没在跑的版本**。这个坑刚踩过（§5.12.11），代价是整整两轮猜测。
+
+---
+
+### 9.1 ⭐ 导出契约：`schema` 双键，以及「改版本号 ≠ 迁移」（T5，**已落地**）
+
+`src/lib/ocrStructure.ts` 的导出**从 T5 起**用 **`schema` + `schemaVersion` 双键**
+识别载荷。旧键 `kind` / `version` / 顶层 `buildId` **已删除**（不是并存）。
+
+#### 规则（**这是治理规则，不是实现细节**）
+
+> ⚠️ **读取本导出时，必须用 `schema` + `schemaVersion` 两个键联合判定格式，
+> 不得只看 `schemaVersion` 的数字。**
+>
+> ⚠️ **改版本号不等于迁移。**「能被读」/「被自动迁移」/「能重导出所有格式」
+> 是**三个独立主张**，必须分别对待，**不得由一个推出另一个**。
+
+依据（MinerU，**只借鉴设计，未引入其任何代码**）：
+
+- 【已核实】`reference/output_files/`：「JSON consumers identify the payload through the
+  **serialized `schema` and `schema_version` keys**」；⚠️「**Do not identify a document
+  type from its version number alone.**」；以及「The schema identity is named `schema_id`
+  as a **Python attribute**, but it **serializes as `schema`**」——**序列化出来的键名才是契约**。
+- 【已核实】`reference/migration_4/`：「**changing a version number alone does not
+  migrate a payload**」；三种主张「treat them independently instead of inferring one
+  from another」；4.0 对旧数据的处置是——带当前标识但校验失败的载荷
+  **不会被当作旧格式重试**，旧格式**只由专用 Doclib 缓存读取器在内存里转换**、
+  **不扩展到其他入口**、**不重写历史文件**。
+- ⚠️ 由此推出本项目的一条纪律：**任何按旧格式写的兼容打算一定落空** ——
+  所以本项目的做法是**不做隐式兼容**，旧载荷由 `parseOcrStructure` **显式降级**。
+
+#### 几个标识各回答一个问题（**职责不重叠，都要保留**）
+
+| 字段 | 回答的问题 | 变了意味着什么 |
+|---|---|---|
+| `schema` | **这是什么**（格式族身份） | 载荷根本是另一种东西 ⟹ **必须拒绝** |
+| `schemaVersion` | **这份 JSON 该怎么读** | 字段增减/语义变化 ⟹ 按该版本读 |
+| `producer.version` | **哪一个生产程序产出的** | 代码换了一版；**不等于**格式变了 |
+| `document.isFullDocument` | **这份导出覆盖了多少内容** | 只影响结论的**适用范围** |
+
+⚠️ `producer.version` 是生产版本的**唯一出现处**（MinerU：「The producing version is
+`metadata.producer.version`, **not a duplicate product extension field**」）——
+所以顶层 `buildId` 被合并掉了：两处各存一份构建标识迟早会漂移成两个不同的答案。
+
+#### 读取方会怎样（**实测，不是设计意图**）
+
+`parseOcrStructure(payload)` 三个出口，各有稳定原因码（`ocrStructure.contract.test.ts` 30 条用例钉住）：
+
+| 载荷 | 出口 | 原因码 |
+|---|---|---|
+| `schema` + `schemaVersion: 1` 都对 | `current`（严格读取） | — |
+| `schemaVersion: 1` 但 `schema` 不同 | **`rejected`** | `wrong_schema_id` |
+| `schema` 对、版本认不出（含 `0`、`2`） | **`rejected`** | `unknown_schema_version` |
+| 上一代格式（只有 `kind` + `version`） | **`downgraded`**（判成第 0 版） | `legacy_kind` |
+| 既无 `schema` 也无 `kind` / 非对象 / 坏 JSON | **`rejected`** | `unknown_payload` / `not_an_object` |
+
+⚠️ 降级时**不补默认值**：旧载荷的 `producer` / `document` / `contract` / `compatibility`
+**不会被填成空值**，因为「能不能按这个 schema 解析」正是旧格式回答不了的问题 ——
+补出来的默认值会被下游当成事实。
+
+#### 「没有字段 ≠ 字段为空」怎么保住的
+
+契约里每个字段都声明了**可缺省性**（产物里的 `contract.optionalFields`）：
+
+- `optional: true`（`canvasHeight` / `outboundFormulaSkips` / `layout`）⟹
+  **要么不在，要么在且非空**。缺席因此携带信息（没量到 / 一个都没挡下 / 没试过）；
+- 其余的字段**恒在**，可以是空数组 —— `charBoxSkips: []` 就是一个结论
+  （每个词都拿到了字符框）。
+
+⚠️ 这两条**没有被压平**：测试对**真实载荷**逐条核对「`optional` 字段一旦出现即非空」，
+另有正反两条用例把同一个载荷里的两种约定分别钉住。见 R10 第 3 条与 §5.12.7 的字段表。
+
+#### 唯一一处顺带修掉的不一致（**要如实记**）
+
+`canvasHeight` 此前是**无条件写**的，于是「值恰好是 `undefined`」在对象里**存在**、
+`JSON.stringify` 之后又**消失** —— 同一个字段在内存里与在导出里两种形状。
+T5 改成「拿不到时整个字段缺席」，与契约声明一致。
+⚠️ `pageLayoutInvariant` 的逐字节 golden 走的是传了 `1400` 那条路径，**不受影响**。
 
 ### 真实文件回归测试
 

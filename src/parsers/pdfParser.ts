@@ -500,6 +500,29 @@ export async function ocrParsePdf(
   // 页数计算与 store 共用同一个函数，避免两处口径不一致导致进度条与实际处理量对不上
   const totalPages = resolvePageLimit(doc.numPages, maxPages);
 
+  /**
+   * 这份识别是否覆盖**整份文档**（导出里的 `document.isFullDocument`，T5）。
+   *
+   * 判据是**调用方有没有给页数上限**，不是「这次处理了几页」：
+   *   · 没给 `maxPages` → 上面那个 `resolvePageLimit` 返回的就是 `doc.numPages`，
+   *     这次识别覆盖全文 → `true`；
+   *   · 给了 `maxPages`（例如「试跑 10 页」）→ 导出里那一页**不能**代表整份文档，
+   *     结论只能推到那几页 → `false`。
+   *
+   * ⚠️ 为什么是「调用方有没有给上限」而不是 `totalPages === doc.numPages`：
+   * 两种写法在大多数情况下同真同假，但 `maxPages` 恰好**大于**总页数时
+   * 前者说「用户想跑完整本」、后者说「上限没起作用」—— 而导出要回答的是
+   * 「读者能把结论推到多远」，那由**用户有没有要求只跑一部分**决定。
+   *
+   * ⚠️ **覆盖率如实说明**：本文件跑在真的 PDF + 真的 OCR 引擎上，单元测试里
+   * 起不来 —— 所以「`maxPages` → 这一行 → `document.isFullDocument`」这条
+   * 链路的**后半段**（`isFullDocument` → `buildOcrStructure` → 产物字段）
+   * 由 `ocrStructure.contract.test.ts` 从另一端钉住，而**这一行本身没有测试
+   * 守着**（与本文件里 `layoutTotals.onPage` 那一行同样的处境）。
+   * 谁要动这一行，请手动确认导出里 `document.isFullDocument` 的值。
+   */
+  const isFullDocument = maxPages === undefined;
+
   // OCR 引擎按需加载：PaddleOCR 依赖的 ONNX Runtime WASM 约 28MB、模型约 30MB，
   // 体积依然很大，只有真的执行 OCR 时才需要它。
   const { ocrEngine, analyzeCanvasInk } = await import('@/lib/ocrEngine');
@@ -744,6 +767,15 @@ export async function ocrParsePdf(
            * 谁要动这一行，请手动确认 `OcrParseResult.layoutSummary` 有值。
            */
           layoutTotals.onPage,
+          /**
+           * T5：这份导出覆盖**全文**还是只覆盖了一部分。
+           *
+           * 与第 6 个参数一样，它**只进导出**（`document.isFullDocument`），
+           * 不参与任何判定 —— 上面每一条「不传即与接入前逐字节相同」的
+           * 结论都仍然成立。放在最后追加，是为了不动既有的六个位置：
+           * 那些位置每一个都在别处写着「不传就怎样」的契约。
+           */
+          isFullDocument,
         );
         if (blocks.length) {
           allDrafts.push(...blocks);

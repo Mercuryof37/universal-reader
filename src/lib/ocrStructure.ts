@@ -16,6 +16,64 @@
  * 「人能看懂、也能直接量」的形状，并**控制体积**（见 `buildOcrStructure`）。
  *
  * ⚠️ 纯本地：这里只做数据整理，不发起任何网络请求，也不写入 IndexedDB。
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * 【读取契约】判断一份导出的格式，**必须用 `schema` + `schemaVersion` 两个键联合判定**
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * ⚠️ **不得只看 `schemaVersion` 的数字。** 数字相同而 `schema` 不同的载荷
+ * **不是**同一族格式，按数字猜着读就会把两种不同的东西当成一种。
+ *
+ * ───────────────────────────────────────────────────────────────────────
+ * 依据（MinerU `reference/output_files/`，**只借鉴设计，未引入任何其代码**）
+ * ───────────────────────────────────────────────────────────────────────
+ *
+ *  · 原文：「JSON consumers identify the payload through the **serialized
+ *    `schema` and `schema_version` keys**」——**两个键一起**才是身份；
+ *  · 原文：「⚠️ **Do not identify a document type from its version number alone.**」
+ *  · 原文：「The schema identity is named `schema_id` as a **Python attribute**,
+ *    but it **serializes as `schema`**」—— 序列化出来的键名才是契约，
+ *    内部属性名不是。本项目的对应物：导出里的键名就是契约（`schema`），
+ *    TypeScript 侧的常量名（`OCR_STRUCTURE_SCHEMA`）只是它的副本。
+ *  · 原文（`reference/migration_4/`）：「**changing a version number alone does
+ *    not migrate a payload**」，且「"Can be read" / "migrated automatically" /
+ *    "can re-export every format" 是**三个独立主张**，必须分别对待，
+ *    不得由一个推出另一个。」
+ *
+ * ───────────────────────────────────────────────────────────────────────
+ * 与旧键 `kind` / `version` 的关系：**替换，不是并存**
+ * ───────────────────────────────────────────────────────────────────────
+ *
+ * `schema` **取代** `kind`、`schemaVersion` **取代** `version`，旧键**已从导出里删除**。
+ * 三条理由：
+ *
+ *  1. ⭐ **并存会制造一个假的兼容层。** MinerU 的原文写得很直白：
+ *     ⚠️「**任何按旧格式写的兼容打算一定落空**」（`reference/migration_4/`：
+ *     4.0 只对**专用 Doclib 缓存读取器**做内存内转换，**不扩展到其他入口**，
+ *     也**不重写历史文件**）。留下两个身份键，等于让读取方以为
+ *     「按 `kind` 也能认出来」——而那正是它**不该**做的推断。
+ *  2. **本项目没有存量格式包袱。** `kind`/`version` 从未被任何读取方解析过
+ *     （全仓库只有本文件写它、`ocrStructure.test.ts` 断言过它一次），
+ *     所以「换名」的真实代价是**零**，而收益是键名与 MinerU 契约对齐。
+ *  3. **旧键在旧载荷里仍然是可识别的信号** —— 见 `parseOcrStructure`：
+ *     带 `kind: 'universal-reader/ocr-structure'` 的载荷会被判成
+ *     **上一代格式（`schemaVersion: 0`）**，走**显式降级**分支。
+ *     注意这是「**识别出旧格式**」，不是「旧格式还能按新 schema 读」：
+ *     后一种正是第 1 条要避免的假兼容。
+ *
+ * ───────────────────────────────────────────────────────────────────────
+ * 四个标识各回答一个问题（**职责不重叠，都要保留**）
+ * ───────────────────────────────────────────────────────────────────────
+ *
+ *  | 字段 | 回答的问题 | 变了意味着什么 |
+ *  |---|---|---|
+ *  | `schema` | **这是什么**（格式族身份） | 载荷根本是另一种东西，**必须拒绝** |
+ *  | `schemaVersion` | **这份 JSON 该怎么读**（格式版本） | 字段的增减/语义变化，按该版本读 |
+ *  | `producer.version` | **哪一个生产程序产出的** | 代码换了一版；**不等于格式变了** |
+ *  | `document.isFullDocument` | **这份导出覆盖了多少内容** | 只影响「结论的适用范围」 |
+ *
+ * ⚠️ 最后一列的三个「不等于」是本契约存在的理由：`producer.version` 变了
+ * **不代表** `schemaVersion` 变了，反之亦然（MinerU：「改版本号不等于迁移」）。
  */
 import type { ContentBlock } from '@/types/content';
 import type { OcrWord } from '@/lib/ocrTypes';
@@ -51,6 +109,431 @@ import {
   type LayoutOutcomeCode,
   type LayoutSkipCodeInfo,
 } from '@/lib/layoutAnalysis';
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * T5 · 导出契约：**schema 双键** + 载荷自描述 + 兼容性说明
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * 读取契约写在文件头注释里（那里是接手者一定会看到的位置）。
+ * 本节是那份契约的**可执行副本**：所有键名、可缺省性、版本变更记录
+ * 都在这里定义一次，由 `(structure as OcrStructureContract)` 那一行
+ * **编译期校验**它与 `OcrStructure` 逐键一一对应（漏一个 `tsc -b` 就红）。
+ *
+ * ⚠️ 为什么必须是「定义一次 + 编译期对齐」，而不是在导出函数里手写这些列表：
+ * 手写列表会与真实载荷**漂移**，而漂移之后 `contract.fields` 会变成一句
+ * 「听起来很确定」的假话 —— 而读取方正是靠它判断「缺的字段是"没有"
+ * 还是"这一版没有"」。本项目已经在「两份同类实现迟早漂移」这条上
+ * 栽过多次（见 `buildCharSizeTable` 那段注释），这里不再加一处。
+ */
+
+/** 本导出格式的身份。**读取方必须与 `schemaVersion` 联合判定**，见文件头注释 */
+export const OCR_STRUCTURE_SCHEMA = 'universal-reader/ocr-structure';
+
+/**
+ * 当前格式版本。
+ *
+ * | 版本 | 状态 | 身份键 |
+ * |---|---|---|
+ * | **1** | **当前**：`schema` + `schemaVersion` 双键 | `schema` |
+ * | 0 | **上一代**：只有 `kind` + `version`（无 `schema`） | `kind` |
+ *
+ * ⚠️ `0` **不会**被写出来 —— 它只用于**识别旧载荷**（见 `parseOcrStructure`）。
+ * 旧载荷自称 `version: 1`，但那与本表的 `1` **不是同一件事**：
+ * 数字相同、身份键不同。这正是「不得只看版本号」在本项目里的**具体形态**。
+ */
+export const OCR_STRUCTURE_SCHEMA_VERSION = 1;
+
+/** 上一代格式的身份串（只在**识别**旧载荷时用到，绝不由本文件写出） */
+export const OCR_STRUCTURE_LEGACY_KIND = 'universal-reader/ocr-structure';
+
+/**
+ * 生产程序名。**只定义一次**（`envelopeOf` 与快照文件都引用它）——
+ * 与「生产版本只放一处」同一条纪律：名字在四个地方各写一遍，
+ * 改名时必漏一个，而漏掉的那个会让读取方把同一份数据认成两个来源。
+ */
+export const OCR_STRUCTURE_PRODUCER_NAME = 'universal-reader';
+
+/**
+ * 本导出格式自带的**字段可缺省性**声明。
+ *
+ * ⚠️ 它不是 JSON Schema、不引入任何依赖：只回答一个二值问题 ——
+ * 「按当前格式，这个字段**一定会在**吗？」
+ *
+ *  · `optional: true`  ⟹ **一定不在**或**在且非空**，二者之一。
+ *    于是「字段缺席」一定携带信息（这一步没跑成 / 没试过 / 一个都没挡下），
+ *    而不是「可能是空集合」这种读不出结论的状态。
+ *  · `optional` 缺省（= 必填）⟹ **永远在**。它可以是空数组 ——
+ *    `charBoxSkips: []` 就是一个结论（每个词都拿到了字符框）。
+ *
+ * ⭐ 这正是「**没有字段 ≠ 字段为空**」这条既有约定在契约里的落点：
+ * 契约**不把两者压平**，而是把它们编码成**可判定的**属性，并配一条
+ * 由 `buildOcrStructure` 的既有输出**直接证明**的测试
+ * （`optional: true` 的字段一旦出现就必须非空）。
+ */
+export interface OcrStructureField {
+  /** 一句话说明这个字段是什么（给人看，不是判据） */
+  what: string;
+  /** `true` = 该字段只在其内容有意义时才出现，出现即非空 */
+  optional?: true;
+}
+
+/** 字段名 → 声明。`OcrStructureContract` 要求它与 `OcrStructure` 逐键对齐 */
+export type OcrStructureFieldMap = Record<string, OcrStructureField>;
+
+/**
+ * 当前格式的全部字段。**每个键都必须存在** ——
+ * 因此「某个字段忘了写进契约」是一个**编译错误**，不是一次静默遗漏。
+ *
+ * ⚠️ **刻意没有索引签名**（`[k: string]: …`）。第一版有，代价是：
+ * `keyof` 会被放宽成 `string`，于是「契约里多写一个界面上不存在的字段」
+ * **编译不报错**（变异 M16 实测 exit 0）。而那种多写的字段会让
+ * `contract.fields` 声明一个永远不会出现的字段 —— 读者据此判断
+ * 「缺的字段是这一版没有」时就会得出**错误结论**。
+ * 所以「逐键扩宽」那一步挪到了 `OcrStructureFieldMap` 上（见 `contractOf`）。
+ */
+export interface OcrStructureContract {
+  schema: OcrStructureField;
+  schemaVersion: OcrStructureField;
+  producer: OcrStructureField;
+  document: OcrStructureField;
+  contract: OcrStructureField;
+  compatibility: OcrStructureField;
+  pageNum: OcrStructureField;
+  canvasHeight: OcrStructureField;
+  dominantFontSize: OcrStructureField;
+  thresholds: OcrStructureField;
+  words: OcrStructureField;
+  wordsTotal: OcrStructureField;
+  wordsWithChars: OcrStructureField;
+  charBoxSkips: OcrStructureField;
+  outboundFormulaSkips: OcrStructureField;
+  lines: OcrStructureField;
+  linesTotal: OcrStructureField;
+  blocks: OcrStructureField;
+  truncated: OcrStructureField;
+  layout: OcrStructureField;
+}
+
+/**
+ * 契约的唯一来源。
+ *
+ * 顺序 = 导出里的键顺序 = 读者从上往下读的顺序（身份 → 生产程序 →
+ * 覆盖范围 → 自描述 → 兼容性 → 这一页的实测数据）。
+ */
+export const OCR_STRUCTURE_CONTRACT = {
+  schema: { what: '本载荷的格式身份；与 schemaVersion 联合判定，不得只看版本号' },
+  schemaVersion: { what: '本载荷的格式版本；回答「该按哪一版读」，不回答「这是什么」' },
+  producer: { what: '生产程序的名字与版本；生产版本**只此一处**，不在别处重复' },
+  document: { what: '这份导出覆盖了多少内容（是否整份文档）—— 只影响结论的适用范围' },
+  contract: { what: '载荷自描述：本格式声明了哪些字段、哪些可以在缺席时仍有意义' },
+  compatibility: { what: '本版相对上一版改了什么、有没有破坏性变化（写入时即固化）' },
+  pageNum: { what: '页码（从 1 开始）' },
+  canvasHeight: {
+    what: '画布高度（像素）；判页眉页脚用的就是它。**整页尺寸没量到时缺席**',
+    optional: true,
+  },
+  dominantFontSize: { what: '全页「正文字高」估计（出现次数最多且占比足够高的那个字高）' },
+  thresholds: { what: '本次识别**实际生效**的阈值，与上面的实测数据同处一份 JSON' },
+  words: { what: '词表（受体积预算截断，截掉多少见 truncated）' },
+  wordsTotal: { what: '本页词总数（截断前）—— 与 words.length 的差就是被裁掉的数量' },
+  wordsWithChars: {
+    what: '拿到字符级框的词数；0 = 字符级定位这一步没跑成（与「字段不存在」含义不同）',
+  },
+  charBoxSkips: { what: '没拿到字符框的词及各自的原因；**空数组也是一个结论**' },
+  outboundFormulaSkips: {
+    what: '被外发面积闸门挡下的公式候选；**一个都没挡下时整个字段缺席**',
+    optional: true,
+  },
+  lines: { what: '成行结果（受体积预算截断；wordIndices 指向 words 的下标）' },
+  linesTotal: { what: '成行总数（截断前）' },
+  blocks: { what: '最终内容块（含 ^{} / _{} 还原后的文本）' },
+  truncated: { what: '体积控制的如实说明：被裁掉多少、以及预算本身是多少' },
+  layout: {
+    what: '本页版面分析的结果；**没接版面分析时整个字段缺席**（「没试过」不是「试过但为空」）',
+    optional: true,
+  },
+} as const satisfies OcrStructureContract;
+
+/** 编译期对齐：契约的键集合必须与 `OcrStructure` 的键集合**完全相同** */
+type AssertSameKeys<A, B extends Record<keyof A, unknown>> = keyof B extends keyof A
+  ? keyof A extends keyof B
+    ? true
+    : { 缺少字段声明: Exclude<keyof A, keyof B> }
+  : { 多写了不存在的字段: Exclude<keyof B, keyof A> };
+/**
+ * ⚠️ 上面那一行才是完整的「键集合相同」检查 —— 它**两个方向都管**：
+ *  · 界面有了、契约没写 ⟹ 报 `缺少字段声明`；
+ *  · 契约写了、界面上没有 ⟹ 报 `多写了不存在的字段`。
+ *
+ * 这个检查能成立的前提是 `OcrStructureContract` **没有索引签名**
+ * （否则 `keyof` 被放宽成 `string`，第二个方向永远为真）。
+ */
+export type OcrStructureContractAligned = AssertSameKeys<
+  OcrStructureContract,
+  typeof OCR_STRUCTURE_CONTRACT
+>;
+
+/**
+ * 生产程序标识。
+ *
+ * ⚠️ 依据 MinerU 明文：「The producing version is `metadata.producer.version`,
+ * **not a duplicate product extension field**」—— 生产版本**只放一处**。
+ * 所以本导出里**没有**第二个「构建标识」字段：旧版的顶层 `buildId`
+ * 已**合并进这里**（见 `compatibility.changedFields`），
+ * 两个字段各存一份构建标识迟早会给出两个不同的答案。
+ */
+export interface OcrStructureProducer {
+  /** 程序名（本项目即产品名） */
+  name: string;
+  /**
+   * 生产程序版本。取值由 `vite.config.ts` 注入的 `__BUILD_ID__`
+   * （每次构建不同，因此能唯一对应一次部署）。
+   *
+   * ⚠️ 它是**程序版本**，不是**格式版本**：程序换一版不代表这份 JSON
+   * 该怎么读变了。后者只看 `schemaVersion`。
+   */
+  version: string;
+}
+
+/** 这份导出覆盖了多少内容（MinerU 的 `is_full_document`） */
+export interface OcrStructureDocument {
+  /**
+   * `true` = 覆盖全文；`false` = 只覆盖了一部分（本项目常见：只导出了第一页）。
+   *
+   * ⚠️ 与 `producer.version` 一样，这个字段只回答「结论能推到多远」：
+   * `false` 时**不能**从这一页的数据推断整份文档的性质。
+   */
+  isFullDocument: boolean;
+}
+
+/**
+ * 某一个字段「相对上一版怎么了」。
+ *
+ * `breaking` 的判据（刻意的窄定义）：**上一版的读取方读到这一版会拿到
+ * 不同的意思或直接解析失败**。加字段、加可选字段一律不算破坏性。
+ */
+export interface OcrStructureFieldChange {
+  field: string;
+  /** `true` = 上一次的读取方**不能再**按老办法读；`false` = 纯增量 */
+  breaking: boolean;
+  /** 为什么（给人看）。**破例性变化必须写清「旧读取方会怎样」** */
+  why: string;
+}
+
+/**
+ * 本版相对上一版的变更记录。
+ *
+ * ⚠️ **它是写进产物里的**，不是只写在 HANDOFF 里 —— 拿到一份 JSON 的人
+ * 不该为了知道「上一版长什么样」去翻仓库。依据同上：MinerU 把
+ * 「能被读 / 被自动迁移 / 能重导出」三种主张分开写进契约，
+ * 本项目把「这一版加了什么、有没有破坏性」写进产物，是同一条原则。
+ */
+export interface OcrStructureCompatibility {
+  /** 上一版的格式版本；没有上一版时为 `null`（本格式的第一版） */
+  previousSchemaVersion: number | null;
+  /** 本版相对上一版是否含**破坏性**变化（任一 changedFields.breaking 为真） */
+  breaking: boolean;
+  /** 逐字段说明改了什么 —— 包括**删掉的**字段 */
+  changedFields: OcrStructureFieldChange[];
+}
+
+/**
+ * 载荷自描述。
+ *
+ * ⚠️ 为什么不从载荷本身**现推**字段列表：那样得到的是一句同义反复
+ * （「载荷里有这些键」当然成立）。这里的 `fields` 是**声明**，
+ * 它要说的是「**按当前格式，这些字段本该在**」—— 于是「声明了但不在」
+ * 才是可判定的事实（测试正是这么用的）。
+ */
+export interface OcrStructureSelfDescription {
+  /** 本格式声明的字段（顺序 = 契约里的顺序） */
+  fields: string[];
+  /** 声明为**可在缺席时仍有意义**的字段（子集） */
+  optionalFields: string[];
+}
+
+/**
+ * 兼容性记录：**本格式第一版**，所以 `previousSchemaVersion: null`。
+ *
+ * ───────────────────────────────────────────────────────────────────────
+ * 为什么 `changedFields` 是**从契约机械推导**的，而不是手写一张清单
+ * ───────────────────────────────────────────────────────────────────────
+ *
+ * 手写清单一共有两种失效方式，本项目两种都见过：
+ *  ① **漏**（加了字段忘了记录）——列表看起来很确定，实际上是残缺的；
+ *  ② **漂移**（重构改了字段名，清单还是旧的）——读者被指向一个不存在的字段。
+ * 所以这里反过来：**清单的骨架由 `Object.keys(OCR_STRUCTURE_CONTRACT)` 生成**，
+ * 人手只填两件机器答不了的事 ——「是不是破坏性的」与「为什么」。
+ *
+ * 于是「加了字段忘了记录」变成了**不可能**：字段一进契约就必然出现在
+ * 兼容性记录里，测试还会要求每个被删掉的旧键都有一条 `breaking: true`
+ * （`ocrStructure.contract.test.ts`）。
+ *
+ * ⚠️ 代价要说清：`why` 因此变短了（每个字段一句话）。完整的来龙去脉在
+ * 文件头注释与 `HANDOFF.md` 里，**产物里只放「读者做决定需要的那一句」**。
+ */
+/**
+ * 人手要填的**两张小表**之一：每个契约字段「是不是破坏性变化 + 为什么」。
+ *
+ * ⚠️ 导出是刻意的：`ocrStructure.contract.test.ts` 用它核对
+ * 「契约里每个字段都有记录」—— `Record<string, …>` 的索引签名会
+ * 让漏写一个键**不报编译错**，所以那道核对只能落在测试里。
+ */
+export const CONTRACT_FIELD_CHANGES: Record<string, { breaking: boolean; why: string }> = {
+  schema: { breaking: false, why: '格式身份键（取代旧版的 kind）' },
+  schemaVersion: { breaking: false, why: '格式版本键（取代旧版的 version；两者数值同为 1，但身份键不同）' },
+  producer: { breaking: false, why: '生产程序名 + 版本（取代旧版顶层 buildId；生产版本只留一处）' },
+  document: { breaking: false, why: '这份导出覆盖了多少内容（是否全文）' },
+  contract: { breaking: false, why: '载荷自描述：声明了哪些字段、哪些可以在缺席时仍有意义' },
+  compatibility: { breaking: false, why: '本条记录本身（本版相对上一版的变更）' },
+  pageNum: { breaking: false, why: '既有字段，语义不变' },
+  canvasHeight: { breaking: false, why: '既有字段，语义不变（整页尺寸没量到时缺席）' },
+  dominantFontSize: { breaking: false, why: '既有字段，语义不变' },
+  thresholds: { breaking: false, why: '既有字段，语义不变' },
+  words: { breaking: false, why: '既有字段，语义不变' },
+  wordsTotal: { breaking: false, why: '既有字段，语义不变' },
+  wordsWithChars: { breaking: false, why: '既有字段，语义不变' },
+  charBoxSkips: { breaking: false, why: '既有字段，语义不变（空数组是结论，字段恒在）' },
+  outboundFormulaSkips: { breaking: false, why: '既有字段，语义不变（没挡下时整个字段缺席）' },
+  lines: { breaking: false, why: '既有字段，语义不变' },
+  linesTotal: { breaking: false, why: '既有字段，语义不变' },
+  blocks: { breaking: false, why: '既有字段，语义不变' },
+  truncated: { breaking: false, why: '既有字段，语义不变' },
+  layout: { breaking: false, why: '既有字段，语义不变（没接版面分析时整个字段缺席）' },
+};
+
+/**
+ * 上一版里**存在、本版已删除**的键。
+ *
+ * ⚠️ 这几条是本格式对读取方的**全部破坏性变化**，必须显式列出：
+ * 「删了什么」是读者最需要知道、而产物本身**看不出来**的事 ——
+ * 看不到一个不存在的字段，与「这一版把它删了」从载荷上无法区分。
+ */
+const REMOVED_FIELDS: OcrStructureFieldChange[] = [  {
+    field: 'kind',
+    breaking: true,
+    why: '已删除，由 schema 取代。⚠️ 按旧格式写的读取方会拿到 undefined —— 不做隐式兼容',
+  },
+  {
+    field: 'version',
+    breaking: true,
+    why: '已删除，由 schemaVersion 取代。⚠️ 不得只看版本号：旧载荷同样自称 version: 1',
+  },
+  {
+    field: 'buildId',
+    breaking: true,
+    why: '已删除，由 producer.version 取代。⚠️ 生产版本只放一处，两处迟早漂移成两个答案',
+  },
+];
+
+/**
+ * 本版相对上一版的变更记录。
+ *
+ * 顺序：**先删后增**（读者最需要先知道「我原来在读的键没了」）。
+ *
+ * 导出是刻意的：`ocrStructureContract.golden.ts` 用它推导快照，
+ * 于是「契约里的说明文字改了、快照没跟上」这件事不可能发生 ——
+ * 两处引用的是**同一个函数**，而不是同一段被抄了两遍的字节。
+ */
+export function ocrStructureCompatibility(): OcrStructureCompatibility {
+  const changedFields: OcrStructureFieldChange[] = [
+    ...REMOVED_FIELDS,
+    ...Object.keys(OCR_STRUCTURE_CONTRACT).map((field) => ({
+      field,
+      breaking: CONTRACT_FIELD_CHANGES[field]?.breaking === true,
+      why: CONTRACT_FIELD_CHANGES[field]?.why ?? '新增字段（未在 CONTRACT_FIELD_CHANGES 里说明）',
+    })),
+  ];
+  return {
+    previousSchemaVersion: null,
+    breaking: changedFields.some((c) => c.breaking),
+    changedFields,
+  };
+}
+
+/** 本文件的写入侧用它构造信封；读取侧用它判定「声明了哪些字段」 */
+function contractOf(): OcrStructureSelfDescription {
+  const fields = Object.keys(OCR_STRUCTURE_CONTRACT);
+  // 收窄成声明类型后再读 `optional`：`as const satisfies` 保留的是**每个键
+  // 各自**的字面量类型，联合类型上没有 `optional` 这个属性。
+  const declared: OcrStructureFieldMap = OCR_STRUCTURE_CONTRACT;
+  return {
+    fields,
+    optionalFields: fields.filter((f) => declared[f]?.optional === true),
+  };
+}
+
+/**
+ * 本格式的**自描述**（声明了哪些字段、哪些可以在缺席时仍有意义）。
+ *
+ * 它既进产物（`contract` 字段），也由快照文件引用 —— 两处引用的是
+ * **同一份**数据，所以「契约改了、快照没跟上」不可能发生。
+ */
+export const OCR_STRUCTURE_SELF_DESCRIPTION: OcrStructureSelfDescription = contractOf();
+
+/**
+ * 自描述的**指纹**（JSON 文本的长度 + 一份确定性的 32 位校验和）。
+ *
+ * ⚠️ 为什么需要一个指纹：`contract.fields` 只装**字段名**，说明文字
+ * （`what`）不进产物。于是「改了说明文字」这件事在导出里**看不出来**，
+ * 而它恰恰是读取方理解契约的唯一线索 —— 一句悄悄改掉的说明
+ * （例如把「缺席 = 没试过」改成「缺席 = 已知为空」）不会被任何测试发现。
+ *
+ * 这个指纹把「说明文字」也钉住：改了就会红，而红了之后**必须显式
+ * 更新这个常量**（那一下正是「说明为什么改」的时机）。
+ *
+ * ⚠️ 它**不是**安全设施，只是为了让改动无法静默通过 ——
+ * 用 FNV-1a 而非加密散列是刻意的：这里要的是「便宜且确定」。
+ */
+export function ocrStructureSelfDescriptionFingerprint(): string {
+  /**
+   * ⚠️ 哈希的**输入是契约本身**（含每一条 `what` 说明文字），不是
+   * 进产物的那份自描述 —— 后者只装字段名，对它取指纹等于没取
+   * （第一版就是这么写的，变异 M11 照样绿）。
+   */
+  const json = JSON.stringify(OCR_STRUCTURE_CONTRACT);
+  return `${json.length}:${fnv1a32(json)}`;
+}
+
+/** 确定性 32 位散列（FNV-1a）。只用于「有没有变」，不用于安全用途 */
+function fnv1a32(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    // × 16777619，用移位避免超出 32 位整数精度
+    hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0');
+}
+
+/**
+ * 导出载荷开头的**信封**：格式身份 + 生产程序 + 覆盖范围 + 自描述 + 兼容性。
+ *
+ * 抽成一个函数而不是内联，是为了让 `fixedCost`（体积预算里那部分固定开销）
+ * 与真实载荷**用同一个算式**：内联两遍就会漂移，而漂移的表现是
+ * 「预算算小了、导出超了 `charBudget`」这种只在极端页面上才现形的问题。
+ */
+function envelopeOf(isFullDocument: boolean): {
+  schema: typeof OCR_STRUCTURE_SCHEMA;
+  schemaVersion: typeof OCR_STRUCTURE_SCHEMA_VERSION;
+  producer: OcrStructureProducer;
+  document: OcrStructureDocument;
+  contract: OcrStructureSelfDescription;
+  compatibility: OcrStructureCompatibility;
+} {
+  return {
+    schema: OCR_STRUCTURE_SCHEMA,
+    schemaVersion: OCR_STRUCTURE_SCHEMA_VERSION,
+    producer: {
+      name: OCR_STRUCTURE_PRODUCER_NAME,
+      // ⚠️ **生产版本的唯一出现处**（见 `OcrStructureProducer` 的注释）
+      version: typeof __BUILD_ID__ === 'string' ? __BUILD_ID__ : 'unknown',
+    },
+    document: { isFullDocument },
+    contract: OCR_STRUCTURE_SELF_DESCRIPTION,
+    compatibility: ocrStructureCompatibility(),
+  };
+}
 
 /** 一个词在页面上的原始形态（字段名刻意取短，便于阅读与对比） */
 export interface OcrStructureWord {
@@ -200,10 +683,31 @@ export interface OcrStructureLine {
 
 /** 整页结构：这就是「复制识别结构」按钮复制出去的东西 */
 export interface OcrStructure {
-  kind: 'universal-reader/ocr-structure';
-  version: 1;
-  /** 构建标识（每次构建不同）—— 用来判断这份导出是哪一版跑出来的 */
-  buildId: string;
+  /* ── T5 信封：格式身份 → 生产程序 → 覆盖范围 → 自描述 → 兼容性 ── */
+  /**
+   * 格式身份。**必须与 `schemaVersion` 联合判定**（见文件头注释的读取契约）。
+   *
+   * ⚠️ 它取代了旧版的 `kind` 字段：旧键**已删除**，不是并存。
+   * 带 `kind` 的旧载荷由 `parseOcrStructure` 显式降级（`schemaVersion: 0`），
+   * 不走「看起来像就解析」。
+   */
+  schema: typeof OCR_STRUCTURE_SCHEMA;
+  /**
+   * 格式版本。取值 `1`。
+   *
+   * ⚠️ 它取代了旧版的 `version` 字段。旧载荷**同样自称 `version: 1`** ——
+   * 数字一样而身份键不同，这正是「不得只看版本号」在本项目里的具体形态：
+   * `{ version: 1 }` 与 `{ schemaVersion: 1 }` **不是**同一种格式。
+   */
+  schemaVersion: typeof OCR_STRUCTURE_SCHEMA_VERSION;
+  /** 生产程序名 + 版本。**生产版本的唯一出现处**（旧版顶层 `buildId` 已并入） */
+  producer: OcrStructureProducer;
+  /** 这份导出覆盖了多少内容（是否整份文档） */
+  document: OcrStructureDocument;
+  /** 载荷自描述：本格式声明了哪些字段、哪些可以在缺席时仍有意义 */
+  contract: OcrStructureSelfDescription;
+  /** 本版相对上一版改了什么、有没有破坏性变化 */
+  compatibility: OcrStructureCompatibility;
   pageNum: number;
   /** 画布高度（像素）；判页眉页脚时用的是它 */
   canvasHeight?: number;
@@ -246,7 +750,14 @@ export interface OcrStructure {
   wordsTotal: number;
   /** 拿到字符级框的词数；0 表示字符级定位这一步没跑成 */
   wordsWithChars: number;
-  /** 没拿到字符框的词及各自的原因（`ocrCharBoxes` 的三个失败出口之一） */
+  /**
+   * 没拿到字符框的词及各自的原因（`ocrCharBoxes` 的三个失败出口之一）。
+   *
+   * ⚠️ **恒存在**，`[]` 也是一个结论（每个词都拿到了字符框）——
+   * 与 `outboundFormulaSkips` / `layout` 的缺席语义**刻意不同**，
+   * 三者的可缺省性由 `contract.optionalFields` 如实声明，
+   * 并由 `ocrStructure.contract.test.ts` 拿真实载荷逐条核对。
+   */
   charBoxSkips: { text: string; reason: string }[];
   /**
    * 被**外发面积闸门**挡下的公式候选（`lib/outboundFormulaGate.ts`）——
@@ -409,6 +920,16 @@ export function buildOcrStructure(input: {
   canvasHeight?: number;
   dominantFontSize: number;
   words: OcrWord[];
+  /**
+   * 这份导出是否覆盖**全文**（MinerU 的 `is_full_document`）。
+   *
+   * ⚠️ **默认 `false`**（保守方向）：本函数导出的永远是**一页**，
+   * 而「一页 = 全文」只有单页文档才成立。默认 `false` 意味着
+   * 「忘了传」时读者只会**低估**结论的适用范围，不会误以为
+   * 这一页的数据能代表整份文档 —— 反过来就是一次会误导人的乐观默认。
+   * 由 `pdfParser` 在「没有 `maxPages` 上限」时显式传 `true`。
+   */
+  isFullDocument?: boolean;
   /** 成行结果。`wordIndices` 引用的是 `words` 的下标 */
   lines: {
     text: string;
@@ -626,9 +1147,15 @@ export function buildOcrStructure(input: {
   // 顺序刻意是「词表 → 行明细」：要定上下标阈值，最需要的是一页全部词的
   // 高度与位置；行明细是二次加工的结果，缺一部分不影响定量。
   // 而 `thresholds` / `dominantFontSize` / `blocks` 不参与取舍，永远完整。
+  //
+  // ⚠️ T5 起，信封（`envelopeOf`）也算进固定开销 —— 与真实返回值用
+  // **同一个算式**：`JSON.stringify` 的键顺序在这里不参与判定（只量长度），
+  // 所以「信封 + 这几个字段」就是最终载荷里不参与取舍的那一部分。
+  // 信封只有几百字符，对 16 万预算无实质影响，但算漏它就等于
+  // `truncated.charBudget` 与实际产出对不上账。
+  const envelope = envelopeOf(input.isFullDocument ?? false);
   const fixedCost = JSON.stringify({
-    kind: 'universal-reader/ocr-structure',
-    version: 1,
+    ...envelope,
     pageNum: input.pageNum,
     canvasHeight: input.canvasHeight,
     dominantFontSize: round(input.dominantFontSize),
@@ -660,24 +1187,36 @@ export function buildOcrStructure(input: {
   const outboundFormulaSkips = getOutboundFormulaSkips();
 
   return {
-    kind: 'universal-reader/ocr-structure',
-    version: 1,
     /**
-     * 构建标识。**这一行是为了不让"你跑的是哪一版"变成猜测。**
+     * ═══════════════════════════════════════════════════════════════
+     * T5 信封。**放在最前面**是有意的：读者从上往下读到的第一个东西
+     * 就是「这是什么、该按哪一版读、能不能读」——
+     * 而不是先读几千行词表、读到最后才发现格式不认得。
+     * ═══════════════════════════════════════════════════════════════
      *
-     * 实测撞上过：修复已部署（`1deb6c1`，Cloudflare Pages 与 verify 均 success），
-     * 但用户导出的结构里仍是修复前的行为（等号被包成 `$^{=}$`）——
-     * 唯一解释是浏览器还在用上一版构建（Service Worker 停在中间那一版）。
+     * ⚠️ `envelope` 是在上面算 `fixedCost` 时**同一个对象**
+     * （同一个 `envelopeOf(...)` 调用），这里 spread 展开，
+     * 所以「预算里算的信封」与「实际写出的信封」不可能不一致。
      *
-     * 没有这个字段时，我分不清「修复没生效」与「你还没拿到修复」，
-     * 而那两者的下一步动作完全相反：前者要继续改代码，
-     * 后者只要刷新。把它写进导出，一眼就能分辨。
-     *
-     * 取值由 `vite.config.ts` 注入（每次构建不同），因此能唯一对应一次部署。
+     * ⚠️ 信封里**没有**「构建标识」的第二个副本：旧版的顶层 `buildId`
+     * 已并入 `producer.version`（依据：MinerU「生产版本只放一处」）。
+     * 那一个字符串仍然回答「你跑的是哪一版」——§5.12.11 那条待查缺陷
+     * 要用的判据一个都没少，只是换了位置与名字。
      */
-    buildId: typeof __BUILD_ID__ === 'string' ? __BUILD_ID__ : 'unknown',
+    ...envelope,
     pageNum: input.pageNum,
-    canvasHeight: input.canvasHeight,
+    /**
+     * 画布高度。**拿不到时整个字段缺席**（不是写 `undefined`、更不是写 0）。
+     *
+     * ⚠️ T5 顺手修掉的一处不一致：此前它是无条件写的，于是
+     * 「`canvasHeight: undefined`」在对象里**存在**、`JSON.stringify` 之后
+     * 又**消失** —— 同一个字段在内存里与在导出里是两种形状，而
+     * `contract.optionalFields` 声明的是「可在缺席时仍有意义」。
+     * 现在两者一致：**不在**就是不在，导出与对象同形。
+     * （`pageLayoutInvariant` 的 golden 走的是传了 1400 那条路径，
+     *   所以逐字节不变量不受影响。）
+     */
+    ...(input.canvasHeight !== undefined ? { canvasHeight: input.canvasHeight } : {}),
     dominantFontSize: round(input.dominantFontSize),
     thresholds: thresholdsOf(input.thresholds),
     words: keptWords,
@@ -723,10 +1262,195 @@ export function buildOcrStructure(input: {
   };
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * T5 · **读取侧**：判定一份载荷能不能按本格式解析
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * 只有写入侧的契约是**不可验证的**：写了双键，但没有任何代码按双键判定，
+ * 那么「两个键都要有」就只是一句注释。下面这三个函数是同一份契约的
+ * **读取侧实现**，它们的三个出口正好对应 MinerU 兼容性矩阵的三行：
+ *
+ * | 载荷 | 处置 | 本项目的出口 |
+ * |---|---|---|
+ * | 带**当前** `schema` 标识、`schemaVersion` 本版认识 | **严格读取** | `current` |
+ * | 上一代格式（只有 `kind` + `version`，无 `schema`） | 仅**显式降级**，不按新格式读 | `downgraded` |
+ * | `schemaVersion` 相同但 `schema` 不同 / 认不出的版本 | **拒绝** | `rejected` |
+ *
+ * ⚠️ 第三行是本次任务的核心负向用例（T5 验收标准 2）。MinerU 的原文：
+ * 「带当前标识但**校验失败**的载荷**不会被当作旧格式重试**」——
+ * 所以「像」不够，`schema` 必须**逐字符相等**。
+ */
+
+/** 拒绝 / 降级的稳定原因码。**按码分支，不要按 message 分支** */
+export type OcrStructureParseCode =
+  /** 不是对象 / 没有键 —— 连「是什么」都答不了 */
+  | 'not_an_object'
+  /** 有 `schema` 键，但它不是本格式（**只看版本号就会在这里读错**） */
+  | 'wrong_schema_id'
+  /** `schema` 对，但 `schemaVersion` 不是本版认识的数字 */
+  | 'unknown_schema_version'
+  /** 没有 `schema`，但带着上一代的 `kind` —— 能识别出它是旧格式 */
+  | 'legacy_kind'
+  /** 没有 `schema` 也没有 `kind` —— 无从判断，当作未知 */
+  | 'unknown_payload';
+
+/** 降级时逐条列出「这一版没有、所以读不到」的东西 */
+export interface OcrStructureDowngradeNote {
+  /** 读者的版本 */
+  from: number;
+  /** 能按哪一版读 */
+  to: number;
+  /** 按 `to` 版读会**拿不到**的字段（当前格式新引入的） */
+  unavailableFields: string[];
+  /** 为什么降级是安全的（而不是「猜着读」） */
+  why: string;
+}
+
+/** 判定结果。三个出口**互斥**，且都带稳定原因码 */
+export type OcrStructureParseResult =
+  | {
+      ok: true;
+      status: 'current';
+      /** 唯一的成功出口：这份载荷就是本格式本版本 */
+      payload: OcrStructure;
+    }
+  | {
+      ok: true;
+      status: 'downgraded';
+      code: 'legacy_kind';
+      /** 旧载荷原文（**不按新格式解读**，见 `unavailableFields`） */
+      payload: Record<string, unknown>;
+      note: OcrStructureDowngradeNote;
+    }
+  | {
+      ok: false;
+      status: 'rejected';
+      code: Exclude<OcrStructureParseCode, 'legacy_kind'>;
+      /** 给人看的解释（**不是判据**） */
+      message: string;
+    };
+
+/** `Object.keys` 拿不到数组/字符串的键，先做一层类型收窄 */
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+/**
+ * 判定一份载荷（对象或 JSON 文本）能否按本格式解析。
+ *
+ * ⚠️ **两个键联合判定**，这是本函数的全部要点：
+ *
+ *  1. 先看 `schema`（**是什么**）—— 不等就是另一种东西，直接 `rejected`，
+ *     **绝不**因为 `schemaVersion` 恰好等于本版就去读它；
+ *  2. `schema` 正确后再看 `schemaVersion`（**第几版**）—— 认不出就拒绝；
+ *  3. 两个键都没有、但有旧版的 `kind` → **显式降级**（`schemaVersion: 0`），
+ *     并把「按 0 版读会少什么」列出来。
+ *
+ * 传字符串时自己 `JSON.parse`，解析失败也走 `rejected`（原因码 `not_an_object`）——
+ * 这一条是给「用户粘贴回来的 JSON」用的。
+ */
+export function parseOcrStructure(input: unknown): OcrStructureParseResult {
+  let raw: unknown = input;
+  if (typeof input === 'string') {
+    try {
+      raw = JSON.parse(input);
+    } catch {
+      return {
+        ok: false,
+        status: 'rejected',
+        code: 'not_an_object',
+        message: '这不是合法 JSON，无法判断格式。',
+      };
+    }
+  }
+
+  const obj = asRecord(raw);
+  if (!obj) {
+    return {
+      ok: false,
+      status: 'rejected',
+      code: 'not_an_object',
+      message: `载荷不是对象（拿到 ${Array.isArray(raw) ? 'array' : typeof raw}），无法判断格式。`,
+    };
+  }
+
+  const schema = obj['schema'];
+  if (typeof schema === 'string') {
+    /**
+     * ⚠️ **关键分支**：有 `schema` 键但值不是本格式 ⟹ 拒绝。
+     *
+     * 这里刻意**不看** `schemaVersion` 的数字 —— 那正是 MinerU
+     * 「Do not identify a document type from its version number alone」
+     * 要禁止的推断。数字相同只说明「作者碰巧用了同一个数字」。
+     */
+    if (schema !== OCR_STRUCTURE_SCHEMA) {
+      return {
+        ok: false,
+        status: 'rejected',
+        code: 'wrong_schema_id',
+        message:
+          `schema 是 ${JSON.stringify(schema)}，本格式是 ${JSON.stringify(OCR_STRUCTURE_SCHEMA)}；` +
+          `schemaVersion=${JSON.stringify(obj['schemaVersion'])} 相同的载荷**也不**按本格式解析（不得只看版本号）。`,
+      };
+    }
+
+    // `schema` 正确之后才轮到版本号
+    if (obj['schemaVersion'] !== OCR_STRUCTURE_SCHEMA_VERSION) {
+      return {
+        ok: false,
+        status: 'rejected',
+        code: 'unknown_schema_version',
+        message:
+          `schema 正确，但 schemaVersion=${JSON.stringify(obj['schemaVersion'])} ` +
+          `不是本版认识的 ${OCR_STRUCTURE_SCHEMA_VERSION} —— 拒绝按本版解析（不猜字段布局）。`,
+      };
+    }
+
+    return { ok: true, status: 'current', payload: obj as unknown as OcrStructure };
+  }
+
+  /**
+   * 没有 `schema`。旧格式的判据是**它自己的身份键** `kind` ——
+   * 这也是「两个键都要有」的反面：旧载荷**只有**一对旧键。
+   *
+   * ⚠️ 注意它自称的 `version` 是 `1`，与 `schemaVersion: 1` 数字相同。
+   * 把数字当身份，就会在这里把旧载荷读成新载荷 —— 本分支存在的意义
+   * 就是让那件事**不可能**发生。
+   */
+  if (obj['kind'] === OCR_STRUCTURE_LEGACY_KIND) {
+    return {
+      ok: true,
+      status: 'downgraded',
+      code: 'legacy_kind',
+      payload: obj,
+      note: {
+        from: typeof obj['version'] === 'number' ? obj['version'] : 0,
+        to: 0,
+        unavailableFields: ['schema', 'schemaVersion', 'producer', 'document', 'contract', 'compatibility'],
+        why:
+          '按上一代格式（kind + version）读：它的判定数据（words / lines / blocks / thresholds）' +
+          '与当前格式**同名同义**，所以那一部分可以读；' +
+          '⚠️ 但信封字段（生产者版本、是否全文、自描述、兼容性）在那一代**根本不存在**，' +
+          '不得当成「空」或「默认值」填补 —— 它们回答的是「能不能按这个 schema 解析」，' +
+          '而那正是旧格式无法回答的问题。',
+      },
+    };
+  }
+
+  return {
+    ok: false,
+    status: 'rejected',
+    code: 'unknown_payload',
+    message: '既没有 schema 键，也没有可识别的 kind 键 —— 无从判断格式，拒绝解析。',
+  };
+}
+
 /**
  * 结果 → 导出字段。
  *
- * 教训来自 `charBoxSkips` 与 `buildId` 这两处：诊断信息必须是**可读的结论**，
+ * 教训来自 `charBoxSkips`、`producer.version`（旧称 `buildId`）这两处：诊断信息必须是**可读的结论**，
  * 而不是「一个需要回源码查表才知道什么意思的码」。用户不会去翻 GitHub，
  * 所以该码的**含义**与**下一步动作**跟着一起进导出。
  *
