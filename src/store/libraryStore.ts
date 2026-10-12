@@ -4,6 +4,7 @@ import { deleteDocument, listDocuments, loadDocument, saveDocument, type Documen
 import { parseFiles, isScannedPdfError } from '@/parsers';
 import { errorReport, describeUnknownError } from '@/lib/diagnostics';
 import { resolvePageLimit, type OcrLang, type OcrProgress } from '@/lib/ocrTypes';
+import { bootModelTierAssets } from '@/lib/modelTierBoot';
 import type { LayoutDocumentSummary } from '@/lib/ocrPostProcess';
 import {
   clearOcrAttempt,
@@ -221,6 +222,57 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
   startOcr: async (lang, maxPages) => {
     const pending = get().scannedPdfPending;
     if (!pending) return;
+
+    /**
+     * ═══════════════════════════════════════════════════════════════
+     * 「首次 OCR 意图」的判据 —— **就是这一行**（改动前它在 `pwa.ts` 的
+     * `onRegisteredSW` 里，SW 一注册就跑，首访固定 34.59 MiB）
+     * ═══════════════════════════════════════════════════════════════
+     *
+     * 为什么是这里，而不是更早或更晚：
+     *
+     * · **不是「导入了一份 PDF」**：`scannedPdfPending` 只是「这份 PDF 没文字层，
+     *   要不要识别？」的**提问**。用户可能点「取消」，也可能先导入别的文件 ——
+     *   那一步之后 OCR 未必发生，此时下载就等于把 34.59 MiB 押在一个问号上。
+     * · **不是「打开了一个 PDF」**：文字层 PDF 走的是 `pdfParser` 的常规路径，
+     *   一个模型字节都不需要。拿文件类型当判据会把「读文献」误判成「要 OCR」。
+     * · **是「用户按下开始识别」**：这是全应用**唯一**一处「OCR 一定会发生」的
+     *   承诺 —— `FileUploadZone` 的「开始识别」按钮 `void startOcr(...)`
+     *   （`src/components/FileUploadZone.tsx`）就是它的全部调用方，而本函数
+     *   一进来就已经确认 `scannedPdfPending` 非空、`lang` / `maxPages` 已选定。
+     *   再往后一步（`import('@/parsers/pdfParser')` → `ocrParsePdf` →
+     *   `ocrEngine.initialize()` → `PaddleOcrService.initialize()`）**太晚**：
+     *   那时引擎已经在取同样三个文件，预取就只是在抢带宽，而不是「先就位」。
+     *
+     * ⚠️ 刻意**不 await**（`void`），两个理由都不是风格问题：
+     *   ① 本行在 `set({ ocrProgress: { status: 'initializing' } })` 与
+     *      `import('@/parsers/pdfParser')` **之前**，所以预取能与引擎初始化的
+     *      准备工作真正重叠；但 34.59 MiB 在弱网上是几十秒，await 它等于让界面
+     *      卡在「开始识别」上，连「正在加载 OCR 引擎…」都出不来；
+     *   ② 引擎自己的 `initialize()` 紧跟其后（下一行就动态 import 解析器），
+     *      两者并发正合用；预取先跑完就命中缓存，跑不完也不比改动前更差。
+     *   `bootModelTierAssets()` **永不 reject**（`modelTierBoot.ts` 里所有失败
+     *   都已经变成一条 `ModelTierBootReport`），所以这里不会留下未处理的 rejection。
+     *
+     * ⚠️ 刻意**不传档位**：档位由 `detectLayoutCapability()` 推出来
+     * （`VITE_OCR_LAYOUT` 关掉时才走 fast 档），在调用点写死会让
+     * 「缓存身份 = 当前档位」这句话变成假的。`modelTierBoot.test.ts`
+     * 把「调用点不许写死档位」这条钉着（两个调用点各钉一次）。
+     *
+     * ⚠️ 这次调用**只在这里**发生：在此之前没有任何其他调用点，
+     * 所以「`getModelTierBootRecord()` 返回 `null`」继续严格等价于
+     * 「模型资产就位一次都没跑过」—— 而它现在的含义是
+     * 「用户还没有表达过 OCR 意图」，而不是「页面还没加载完」。
+     * 四条可观测通道（进程内订阅 / sessionStorage / 可复制报告 /
+     * 文档库横幅）一个都没动。
+     *
+     * 幂等性不靠本文件里的标志位：第二次点「开始识别」时四个资产已在缓存里，
+     * `ensureModelTierAssets` 会 **`cache.match` 命中 ⇒ 一个字节都不取**
+     * （`preflightModelTier` 的 `items` 为空）。加一个「只跑一次」的模块级
+     * 标志只会引入一个新的失败态：第一次因离线被 `skipped` 之后，
+     * 联网重试会被自己的标志挡住，而用户看不出为什么模型一直下不下来。
+     */
+    void bootModelTierAssets();
 
     const total = resolvePageLimit(pending.pageCount, maxPages);
     set({

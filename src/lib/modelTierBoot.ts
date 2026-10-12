@@ -9,16 +9,25 @@
  * 实现齐了（`ensureModelTierAssets`），但它**没有任何运行时调用点** ——
  * 也就是说那三条能力此前只在构建期与单元测试里成立，用户机器上一次都没跑过。
  *
- * 接线点选在 `src/lib/pwa.ts` 的 `useRegisterSW({ onRegisteredSW })` 里，
- * 与既有的 `seedNavigationFallback()` 并列：那是本项目**唯一**现成的启动钩子
- * （见 `modelCacheTiers.ts` 文件头「尚未接线」那一节的说明）。
+ * 接线点选在**「用户第一次表达 OCR 意图」**那一刻 ——
+ * `src/store/libraryStore.ts` 的 `startOcr()` 里一行
+ * `void bootModelTierAssets();`（「开始识别」按钮的唯一出口）。
  *
- * 为什么不把这几行直接写在 `pwa.ts` 里（而是单独成文件）：
- * 与 `pwaOffline.ts` 同一个理由 —— `pwa.ts` 顶层 import 了
- * `virtual:pwa-register/react`，那个虚拟模块只在 Vite 构建/开发时存在，
- * vitest 里解析不了。于是「档位怎么推出来」「结果怎么记下来」这些
- * **真正会出错的部分**放进本文件，测试直接引用；`pwa.ts` 里只留一行
- * `void bootModelTierAssets();`。
+ * ⚠️ 它**曾经**接在 `src/lib/pwa.ts` 的 `useRegisterSW({ onRegisteredSW })` 里，
+ * 与 `seedNavigationFallback()` 并列。那个位置的后果是 **SW 一注册就预取
+ * 34.59 MiB**，哪怕用户只读 md/txt/epub、从不打开扫描件 —— 对一个阅读器
+ * 来说那是首访时替用户花的钱，也与本项目「**不预缓存模型**」的口径冲突
+ * （构建期不预取、运行时 CacheFirst，见 `HANDOFF.md` §1 T1）。
+ * 因此那次调用已连同它的 import 一起从 `pwa.ts` 移除，且**不许搬回去**：
+ * `modelTierBoot.test.ts` 有一组用例同时钉住「`pwa.ts` 不再碰模型资产」
+ * 与「`startOcr()` 真的调用了它」。
+ *
+ * 为什么不把这几行直接写在调用点（而是单独成文件）：
+ * 与 `pwaOffline.ts` 同一个理由 —— 调用点所在的模块
+ * （`pwa.ts` 顶层 import 了 `virtual:pwa-register/react`，那个虚拟模块只在
+ * Vite 构建/开发时存在，vitest 里解析不了；`libraryStore.ts` 则拖着
+ * IndexedDB 与解析器）都不是测试能轻松加载的东西。于是「档位怎么推出来」
+ * 「结果怎么记下来」这些**真正会出错的部分**放进本文件，测试直接引用。
  *
  * ═══════════════════════════════════════════════════════════════
  * 三条硬约束（本文件的存在理由）
@@ -45,10 +54,11 @@
  *    · `renderModelTierBootReport()` —— 可复制的逐项报告（含判断用的原始数字）；
  *    · `DocumentLibrary` 的横幅 —— 只有「值得让人知道」的结果才显示，正常路径不打扰。
  *
- * ⚠️ 与「首次访问」的关系：接线之后，SW 注册成功就会**预取**当前档位缺的那几个
- * 资产（standard 档合计约 34.6 MiB），而不是等用户第一次点「开始识别」。
- * 这是接线本身的目的（离线 OCR 在首访之后就能用），代价是首访流量；
- * 已缓存时 `ensureModelTierAssets` 只做 `match()`，**不会重下**。
+ * ⚠️ 与「首次访问」的关系：接线之后**首访不再预取任何模型资产**。
+ * 那 34.59 MiB 只在用户第一次按下「开始识别」时才取（`startOcr()`）；
+ * 在那之前 `getModelTierBootRecord()` 就是 `null`，含义是
+ * 「用户还没有表达过 OCR 意图」。已缓存时 `ensureModelTierAssets` 只做
+ * `match()`，**不会重下** —— 所以第二次识别不会再把 34.59 MiB 下一遍。
  */
 
 import { describeUnknownError } from '@/lib/diagnostics';
@@ -442,8 +452,9 @@ function publish(report: ModelTierBootReport): void {
 /**
  * 把**当前档位**的模型资产就位，并留下一条可读的结论。**永不 reject。**
  *
- * 这是 `pwa.ts` 在 SW 注册成功后调用的那一个（`void bootModelTierAssets();`）：
- * 不 await、不参与启动判定，任何结果都只变成 `ModelTierBootReport`。
+ * 这是**「用户第一次表达 OCR 意图」时调用的那一个**
+ * （`src/store/libraryStore.ts` 的 `startOcr()` 里 `void bootModelTierAssets();`）：
+ * 不 await、不参与任何判定，任何结果都只变成 `ModelTierBootReport`。
  *
  * 顺序由 `ensureModelTierAssets` 保证（清理 → 预检查 → 下载），
  * 本函数**只做三件它会漏掉的事**：

@@ -25,7 +25,6 @@
 import { useState } from 'react';
 import { useRegisterSW } from 'virtual:pwa-register/react';
 
-import { bootModelTierAssets } from '@/lib/modelTierBoot';
 import { seedNavigationFallback } from '@/lib/pwaOffline';
 import { noteReloadReason } from '@/lib/sessionDiagnostics';
 import { useLibraryStore } from '@/store/libraryStore';
@@ -77,26 +76,26 @@ export function usePwa(): PwaState {
     onRegisteredSW() {
       // 注册成功后趁在线把页面骨架写进导航缓存，补上离线冷启动的空档
       void seedNavigationFallback();
+
       /**
-       * 同一个时机让**当前质量档位**的模型资产就位
-       * （`cleanupStaleModelCaches` → `preflightModelTier` → 逐个下载）。
+       * ⚠️ 这里**刻意没有**模型资产预取。
        *
-       * 为什么放在这里：这是本项目**唯一**现成的启动钩子，而模型资产是
-       * 「装上就能离线读」的前置条件 —— 不预取的话，用户必须先在联网状态下
-       * 真的跑过一次 OCR，那些文件才会进缓存。
+       * 曾经这一行是 `void bootModelTierAssets();`，后果是 **SW 一注册就预取
+       * 四个资产、合计 34.59 MiB** —— 哪怕用户只读 md/txt/epub、永远不打开
+       * 扫描件。对一个**阅读器**来说那是首访时替用户花的钱，而应用此刻
+       * 还没证明自己有用；弱网/移动端上 34.59 MiB 是实在的代价，
+       * 而且它与本项目已确立的「**不预缓存模型**」口径直接冲突
+       * （构建期不预取、运行时 CacheFirst，见 `HANDOFF.md` §1 T1）。
        *
-       * 三条边界都在 `bootModelTierAssets` 里兜住了，所以这一行**不需要**
-       * 参与启动判定：它不 await、不抛、结果只变成一条可读的记录
-       * （`getModelTierBootRecord()` / `renderModelTierBootReport()` /
-       * 文档库里的横幅）。预检查拦住 ⇒ 一个字节都不取；
-       * 拿不到存储配额 ⇒ 不拦；清理失败 ⇒ 只告警。
+       * 现在改在**用户第一次表达 OCR 意图**时取 —— 落点是
+       * `src/store/libraryStore.ts` 的 `startOcr()`，紧跟
+       * `if (!pending) return;` 之后那一行 `void bootModelTierAssets();`
+       * （「开始识别」按钮的唯一出口）。判据与理由写在那里，不在这里重复。
        *
-       * ⚠️ 刻意**不在这里传档位**：档位由 `detectLayoutCapability()` 推出来
-       * （`VITE_OCR_LAYOUT` 关掉时才走 fast 档），在调用点写死会让
-       * 「缓存身份 = 当前档位」这句话变成假的。`modelTierBoot.test.ts`
-       * 会把「调用点不许写死档位」这条钉住。
+       * 所以本文件与模型资产**再无关系**：连 import 都不该留
+       * （留一个没人用的 import，会让「谁负责预取」这个问题看起来仍然
+       * 有第二个答案）。`modelTierBoot.test.ts` 有一条用例钉住这件事。
        */
-      void bootModelTierAssets();
     },
     /**
      * 新版本接管时的刷新时机。

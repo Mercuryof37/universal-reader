@@ -32,7 +32,7 @@
  * · **不在导入路径上做任何事**。所有副作用都在显式调用的函数里。
  *
  * ═══════════════════════════════════════════════════════════════
- * ✅ 接线状态：运行期调用点在 `src/lib/pwa.ts`
+ * ✅ 接线状态：运行期调用点在 `src/store/libraryStore.ts` 的 `startOcr()`
  * ═══════════════════════════════════════════════════════════════
  *
  * | 能力 | 状态 |
@@ -42,15 +42,20 @@
  * | 旧档位缓存清理 | ✅ 运行期 |
  *
  * 运行期那一侧由 `src/lib/modelTierBoot.ts` 的 `bootModelTierAssets()` 承担，
- * 调用点是 `src/lib/pwa.ts` 的 `useRegisterSW({ onRegisteredSW })` ——
- * 与既有的 `seedNavigationFallback()` 并列，一行：
+ * 调用点是**「用户第一次表达 OCR 意图」**那一刻 ——「开始识别」按钮的唯一
+ * 出口 `startOcr()`（`src/store/libraryStore.ts`），一行：
  *
  * ```ts
  * void bootModelTierAssets();   // 档位由 detectLayoutCapability() 推出来，不在调用点写死
  * ```
  *
+ * ⚠️ 它**曾经**接在 `src/lib/pwa.ts` 的 `onRegisteredSW` 里（与
+ * `seedNavigationFallback()` 并列）。那个位置等于「SW 一注册就预取
+ * 34.59 MiB」，哪怕用户只读 md/txt/epub —— 与本文件顶部那句已确立的口径
+ * 「**不预缓存模型**」直接冲突。已挪走，且不许搬回启动路径。
+ *
  * 它**不是**「先下载再判断」：第一步就是 `cleanupStaleModelCaches` +
- * `preflightModelTier`，拦住时一个字节都不取。启动路径不许被它弄挂，
+ * `preflightModelTier`，拦住时一个字节都不取。OCR 路径不许被它弄挂，
  * 所以那一层还兜住了本文件没包 try/catch 的两处（`storage.open()` /
  * `cache.match()`）以及「当前离线」这一种情形。
  *

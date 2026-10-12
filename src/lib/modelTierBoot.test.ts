@@ -47,9 +47,12 @@ import {
  * ⚠️ 两种刻意避开的假保护（本项目已经吃过 5 次以上）：
  *
  *   · **`toMatch(/名字/)` 匹配的是 import 而不是调用** ——
- *     所以「`pwa.ts` 到底调没调」这一条走的是**把回调体取出来真跑一遍**
- *     （`new Function` + 注入两个桩），删掉那一行调用就会红；
- *     而「那个名字是不是真的存在」另有一条独立的断言（名字 ↔ 导出的对应关系）。
+ *     所以「`onRegisteredSW` 到底调没调」这一条走的是**把回调体取出来真跑一遍**
+ *     （`new Function` + 注入两个桩）。这一轮它的验收方向**反过来了**
+ *     （那个回调现在**不许**再调），而这条纪律更要紧：反方向写成
+ *     `toMatch` 的话，在注释里提一句 `void bootModelTierAssets();` 就能骗绿它。
+ *     第 5 节里把「naive `toMatch` 会绿、真实执行的断言会红」这一对
+ *     **同时**写成了断言，见那一条用例的说明。
  *   · **读到同进程里别的用例改过的当前值** —— 所有依赖都从参数注入
  *     （桩 CacheStorage / 桩 fetch / 桩时钟 / 桩在线判定），
  *     唯一用到的全局是 `sessionStorage`，而它是本文件 `beforeEach` 里
@@ -183,15 +186,16 @@ describe('档位由「版面模型能不能用」推出来', () => {
 // ═══════════════════════════════════════════════════════════════
 
 describe('⚠️ 零副作用：默认档位下写进的缓存名与请求的 URL 与改动前逐字相同', () => {
-  it('按 pwa.ts 里那次调用的形态跑（只多三个测试桩）⇒ 裸名 ocr-models + 四个原样 URL', async () => {
+  it('按真实调用点的形态跑（只多三个测试桩）⇒ 裸名 ocr-models + 四个原样 URL', async () => {
     const { storage, puts, opened } = stubCaches();
     const { impl } = stubFetch();
 
     /**
      * ⚠️ 这里**不传** `capability`，也不传 `tier` —— 与
-     * `src/lib/pwa.ts` 里那句 `void bootModelTierAssets();` 的唯一差别
-     * 就是这三个桩（缓存 / 网络 / 配额）。也就是说这条用例跑的
-     * 正是用户机器上会跑的那条路径。
+     * `src/store/libraryStore.ts` 的 `startOcr()` 里那句
+     * `void bootModelTierAssets();` 的唯一差别就是这三个桩
+     * （缓存 / 网络 / 配额）。也就是说这条用例跑的
+     * 正是用户按下「开始识别」之后会跑的那条路径。
      */
     const report = await bootModelTierAssets({
       storage,
@@ -232,7 +236,7 @@ describe('⚠️ 零副作用：默认档位下写进的缓存名与请求的 UR
     expect(puts).toHaveLength(3);
   });
 
-  it('已在缓存里的资产不重复下载（第二次启动不会把 34.6 MiB 再下一遍）', async () => {
+  it('已在缓存里的资产不重复下载（第二次识别不会把 34.59 MiB 再下一遍）', async () => {
     const { storage } = stubCaches();
     const { impl, spy } = stubFetch();
 
@@ -592,7 +596,7 @@ describe('可观测：跑了没有、结果是什么', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// 5 · 接线本身：`pwa.ts` 的 SW 注册回调里真的调用了它
+// 5 · 接线本身：`pwa.ts` **不再**碰模型资产（预取已挪到首次 OCR 意图时）
 // ═══════════════════════════════════════════════════════════════
 
 const PWA_SRC = readFileSync(join(process.cwd(), 'src/lib/pwa.ts'), 'utf8');
@@ -614,6 +618,11 @@ const PWA_SRC = readFileSync(join(process.cwd(), 'src/lib/pwa.ts'), 'utf8');
  * ⚠️ 去注释**只去块注释**。刻意不用本仓库常见的那套「按行去 `//` 注释」：
  * 实测过它会把注释后面一整行代码一起吃掉（见 `modelCacheTiers.test.ts`
  * 里对这件事的记录），而这里少吃一行就变成「桩没被调用」这种**假红**。
+ *
+ * ⚠️ 上面的理由在这一轮**反过来用**：现在的验收方向是「这个回调**不许**
+ * 再调用它」。那种断言更容易写成假的 —— 在注释里提一句
+ * `void bootModelTierAssets();` 就能骗过 `toMatch`。所以抠源码这一步
+ * **不能省**：桩被执行了就是红，注释写了多少遍都不影响。
  */
 function onRegisteredSwBody(src: string): string {
   const at = src.indexOf('onRegisteredSW');
@@ -634,7 +643,14 @@ function onRegisteredSwBody(src: string): string {
   throw new Error('onRegisteredSW 的函数体没有收尾 —— 这段抠源码的逻辑要跟着更新');
 }
 
-/** 用两个桩把回调体跑起来 */
+/**
+ * 用两个桩把回调体跑起来。
+ *
+ * ⚠️ `bootModelTierAssets` 这个桩**必须留着**，哪怕 `pwa.ts` 已经不再 import 它：
+ * 它是「回调体里有没有人调它」的**探针**。把探针删掉，这条用例就会退化成
+ * 「源码里有没有这串字」—— 而那正是文件头点名要避开的那种假保护。
+ * 一个永远不会被调用的探针，和「没有人调用」是同一个事实。
+ */
 function runRegisteredSwHandler() {
   const body = onRegisteredSwBody(PWA_SRC);
   const seedNavigationFallback = vi.fn(async () => {});
@@ -663,102 +679,124 @@ function importedBindings(src: string, from: string): string[] {
   return [];
 }
 
-describe('接线：SW 注册成功后会去跑「模型资产就位」', () => {
-  it('回调体里**真的调用**了两个启动钩子（跑出来的，不是读出来的）', () => {
-    const { handler, seedNavigationFallback, bootModelTierAssetsMock } = runRegisteredSwHandler();
+describe('⚠️ 反方向：SW 注册成功**不再**预取模型资产（首访不下载 34.59 MiB）', () => {
+  it('回调体只调用导航兜底那一个 —— 模型资产就位的探针**一次都没被执行**', () => {
+    const { handler, seedNavigationFallback, bootModelTierAssetsMock, body } = runRegisteredSwHandler();
 
-    const returned = handler(seedNavigationFallback, bootModelTierAssetsMock);
-
-    expect(seedNavigationFallback, '导航兜底那一路被删了？').toHaveBeenCalledTimes(1);
-    expect(bootModelTierAssetsMock, '模型资产就位没有被调用 —— 接线断了').toHaveBeenCalledTimes(1);
-    // 不 await：注册回调不许被一次 34.6 MiB 的下载挡住
-    expect(returned).toBeUndefined();
-  });
-
-  it('调用点**不许写死档位**（写死会让「缓存身份 = 当前档位」变成假的）', () => {
-    const { handler, seedNavigationFallback, bootModelTierAssetsMock } = runRegisteredSwHandler();
     handler(seedNavigationFallback, bootModelTierAssetsMock);
 
-    const arg = bootModelTierAssetsMock.mock.calls[0]?.[0] as { tier?: unknown } | undefined;
-    expect(arg?.tier, 'pwa.ts 里写死了档位 —— 档位必须由能力推出来').toBeUndefined();
+    // 正方向先立住：导航兜底还在（别为了这一条把整个回调掏空）
+    expect(seedNavigationFallback, '导航兜底那一路被删了？').toHaveBeenCalledTimes(1);
+    // ⚠️ 反方向：这是「首访不下载」的**接线层**证明
+    expect(
+      bootModelTierAssetsMock,
+      'SW 注册时又开始预取模型资产了 —— 首访会重新变成 34.59 MiB',
+    ).not.toHaveBeenCalled();
+
+    /**
+     * ⚠️ 这一条是**自证的假保护对照组**（不是凑数）：
+     * 回调体里**确实**有 `bootModelTierAssets` 这串字（在解释为什么挪走的
+     * 注释里），所以 `toMatch(/bootModelTierAssets/)` 在这里**必然是绿的** ——
+     * 而上面那条真实执行的断言是红的（探针没被调用）。
+     * 两者放在一起，「匹配到注释/import 也算绿」这件事就不需要靠嘴说了。
+     * 去注释之后这串字必须消失 —— 否则说明它出现在真实代码里。
+     */
+    expect(body, '回调体里出现了真实的调用（注释已剔除）').not.toContain('bootModelTierAssets');
+    expect(PWA_SRC).toContain('bootModelTierAssets');
+  });
+
+  it('`pwa.ts` 里**没有死 import**（不留下「第二个看起来负责预取的地方」）', () => {
+    expect(importedBindings(PWA_SRC, '@/lib/modelTierBoot')).toEqual([]);
+    // 连模块说明符都不该出现
+    expect(PWA_SRC).not.toContain('@/lib/modelTierBoot');
+  });
+
+  it('⚠️ 自证「naive `toMatch` 会假绿」：真调用只剩一处，而字符串出现两次', () => {
+    /**
+     * ═══════════════════════════════════════════════════════════════
+     * 这条用例证明的是**测试方法本身可不可信**，不是产品行为
+     * ═══════════════════════════════════════════════════════════════
+     *
+     * 上一轮的血案：有人删掉了 `pwa.ts` 里那行调用、**只留 import 与注释**，
+     * 而 `expect(PWA_SRC).toMatch(/bootModelTierAssets\(/)` **照样全绿** ——
+     * 因为源码里还有那串字。本项目为此吃过 5 次以上的假保护。
+     *
+     * 这一轮那个判据换成了反向（「不许再调」），可**同样的陷阱一模一样**：
+     * 反向写法 `expect(src).not.toMatch(/bootModelTierAssets\s*\(/)` 会被
+     * **在注释里提一句 `void bootModelTierAssets();`** 打红 —— 那是**假红**，
+     * 而假红和假绿一样有毒：它会让人把注释改掉、把真正的检查删掉。
+     *
+     * 所以这里把「两个匹配器在同一份源码上给出**相反结论**」当场摆出来：
+     * 被检查的源码就是本仓库里的真实调用点（`startOcr` 里那一行），
+     * 它**确实**含有一处真实调用，而 naive 匹配器数出了**两处** ——
+     * 多出来的那一处是 import。于是「为什么必须去注释 + 去 import、
+     * 再数真实调用」这件事不需要靠嘴说。
+     *
+     * 注意这里**只写形态、不写具体哪个文件**（除了本仓库真实存在的那个
+     * 调用点）：断言是 `naive > real`，因为只要注释/import 里提到过一次名字，
+     * 这个不等式就恒成立 —— 这就是那个陷阱的一般形态。
+     */
+    const STORE_SRC = readFileSync(join(process.cwd(), 'src/store/libraryStore.ts'), 'utf8');
+    const name = 'bootModelTier' + 'Assets'; // 拼出来，免得这条用例自己被自己的匹配器数进去
+    const naive = new RegExp(String.raw`${name}\s*\(`, 'g');
+
+    /** 只去块注释（与 `onRegisteredSwBody` 同一手法，理由见那里的说明） */
+    const withoutComments = (src: string) => src.replace(/\/\*[\s\S]*?\*\//g, '');
+
+    const naiveHits = (src: string) => [...src.matchAll(naive)].length;
+    const realHits = (src: string) => {
+      const stripped = withoutComments(src)
+        // 去 import 行：具名导入里也会出现同一个名字
+        .split('\n')
+        .filter((line) => !/^\s*import\b/.test(line))
+        .join('\n');
+      return [...stripped.matchAll(naive)].length;
+    };
+
+    // 这个文件里恰好有一处真实调用 —— 它是本用例的基准，不是结论
+    expect(realHits(STORE_SRC), 'libraryStore.ts 里的真实调用计数变了').toBe(1);
+
+    // ⚠️ 同一条源码上的两个匹配器给出**不同的数**：naive 把注释也数进去了
+    expect(naiveHits(STORE_SRC), 'naive 匹配器没有数出多余的那一处 —— 陷阱没被复现').toBe(2);
+    expect(naiveHits(STORE_SRC)).toBeGreaterThan(realHits(STORE_SRC));
+
+    /**
+     * 而「只去 import、不去注释」**还是 2 处** —— 这一条才是关键：
+     * `libraryStore.ts` 里除了 import，注释里也把那次调用**原样抄了一遍**
+     * （`void bootModelTierAssets();`，用来解释「永不 reject」）。
+     * 也就是说**光去 import 不够**，必须连注释一起去掉，真实调用才露出来。
+     */
+    const importOnlyStripped = STORE_SRC.split('\n')
+      .filter((line) => !/^\s*import\b/.test(line))
+      .join('\n');
+    expect(naiveHits(importOnlyStripped), '只去 import 就该还剩 2 处（注释那一处）').toBe(2);
+
+    /**
+     * ⚠️ 反向的陷阱（这一轮新出现的形态）也一并钉住：`pwa.ts` 里**两处**
+     * 带括号的形态**全都**在解释「为什么挪走」的块注释里 —— 真实调用是 0。
+     *
+     * 于是：
+     *   · `expect(PWA_SRC).not.toMatch(/bootModelTierAssets\(/)` ⇒ **假红**
+     *     （它数到 2，可那两处都不是调用）；
+     *   · `expect(PWA_SRC).toMatch(/bootModelTierAssets\(/)` 在同一份源码上
+     *     ⇒ **假绿**（它也会数到 2，同样证明不了有调用）。
+     * 同一个匹配器**两个方向都错** —— 这就是「必须去注释 + 去 import，
+     * 再数真实调用」的理由，也是本文件第 5 节开头那段说明的实证。
+     */
+    expect(naiveHits(PWA_SRC), 'pwa.ts 里带括号的形态应当全部落在块注释里').toBe(2);
+    expect(realHits(PWA_SRC), 'pwa.ts 的真实调用（去注释去 import 后）必须是 0').toBe(0);
   });
 
   it('引入的名字确实指向 `modelTierBoot` 的导出（不是拼错的名字 / 本地同名函数）', () => {
-    // ① pwa.ts 从哪个模块、引入了哪些名字
-    expect(importedBindings(PWA_SRC, '@/lib/modelTierBoot')).toContain('bootModelTierAssets');
-    // ② 那个名字在模块里**真的存在**（本文件顶部那个 import 就是它）
+    /**
+     * 这一条钉的是**导出那一侧的契约**（`bootModelTierAssets` 这个名字真的存在），
+     * 与「谁调用它」无关 —— `pwa.ts` 已经不再是调用方，调用方现在是
+     * `src/store/libraryStore.ts` 的 `startOcr()`（那一侧由
+     * `src/store/ocrIntentPrefetch.test.ts` 端到端钉住）。
+     */
     expect(typeof bootModelTierAssets).toBe('function');
-    // ③ pwa.ts 里没有自己定义一份同名的东西（否则调用会悄悄走到本地那份）
+    // 调用点不许自己造一份同名的东西（那会让调用悄悄走到本地那份）
     expect(PWA_SRC).not.toMatch(/function\s+bootModelTierAssets\b/);
     expect(PWA_SRC).not.toMatch(/(const|let|var)\s+bootModelTierAssets\s*=/);
-  });
-
-  it('端到端：按 pwa.ts 的**真实调用形态**跑真实实现 ⇒ 裸名 ocr-models + 四个原样 URL', async () => {
-    /**
-     * 上面那条把 `bootModelTierAssets` 换成了桩（只能证明「调用了」）。
-     * 这一条换成**真函数**：回调体 → `bootModelTierAssets()`（无参数，
-     * 与 pwa.ts 里逐字相同的调用）→ `ensureModelTierAssets` → 真的打开缓存、
-     * 真的去 fetch。于是「接线之后到底写进了哪个缓存、取了哪些 URL」
-     * 是端到端跑出来的，而不是分段推断的。
-     *
-     * ⚠️ 这里确实碰了 `globalThis.caches` / `globalThis.fetch`
-     * （`ensureModelTierAssets` 的默认值就取它们），所以**用完立刻还原**，
-     * 并且不去读任何别人可能改过的值 —— 读到的只有本用例自己装的桩。
-     */
-    const body = onRegisteredSwBody(PWA_SRC);
-    // eslint-disable-next-line no-new-func -- 同上：只有执行回调体才验得到端到端
-    const handler = new Function('seedNavigationFallback', 'bootModelTierAssets', body) as (
-      seed: unknown,
-      boot: unknown,
-    ) => unknown;
-
-    // 这个进程不能处于「浏览器说离线」那一档，否则真实实现会直接跳过
-    expect((globalThis as { navigator?: { onLine?: boolean } }).navigator?.onLine).not.toBe(false);
-
-    const opened: string[] = [];
-    const puts: string[] = [];
-    const fetches: string[] = [];
-    const cachesStub = {
-      keys: async () => [] as string[],
-      delete: async () => true,
-      open: async (name: string) => {
-        opened.push(name);
-        return {
-          match: async () => undefined as Response | undefined,
-          put: async (url: string) => {
-            puts.push(url);
-          },
-        };
-      },
-    };
-
-    const originalCaches = Object.getOwnPropertyDescriptor(globalThis, 'caches');
-    const originalFetch = globalThis.fetch;
-    Object.defineProperty(globalThis, 'caches', {
-      value: cachesStub,
-      configurable: true,
-      writable: true,
-    });
-    globalThis.fetch = (async (input: unknown) => {
-      fetches.push(String(input));
-      return okResponse();
-    }) as unknown as typeof fetch;
-
-    try {
-      handler(vi.fn(async () => {}), bootModelTierAssets); // ← 第二个是真函数
-      // 回调体是 fire-and-forget（不 await），所以等它把四个都写完
-      await vi.waitFor(() => expect(puts, '接线之后一个字节都没写进缓存').toHaveLength(4), {
-        timeout: 3000,
-      });
-
-      expect(opened).toEqual(['ocr-models']);
-      expect(fetches).toEqual(UNCHANGED_URLS);
-      expect(getModelTierBootRecord()?.outcome).toBe('ok');
-      expect(getModelTierBootRecord()?.cacheName).toBe('ocr-models');
-    } finally {
-      if (originalCaches) Object.defineProperty(globalThis, 'caches', originalCaches);
-      else delete (globalThis as { caches?: unknown }).caches;
-      globalThis.fetch = originalFetch;
-    }
   });
 });
