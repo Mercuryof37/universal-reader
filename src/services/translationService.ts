@@ -78,6 +78,7 @@ function translateEndpoint(): string {
  */
 interface TranslatorInstance {
   translate: (text: string) => Promise<string>;
+  translateStreaming?: (text: string) => ReadableStream<string>;
   destroy?: () => void;
 }
 interface TranslatorApi {
@@ -86,6 +87,49 @@ interface TranslatorApi {
     sourceLanguage: string;
     targetLanguage: string;
   }) => Promise<TranslatorInstance>;
+}
+
+const browserTranslatorInstances = new Map<string, Promise<TranslatorInstance>>();
+
+function getBrowserTranslator(
+  api: TranslatorApi,
+  sourceLanguage: string,
+  targetLanguage: string,
+): Promise<TranslatorInstance> {
+  const key = `${sourceLanguage}->${targetLanguage}`;
+  let instance = browserTranslatorInstances.get(key);
+  if (!instance) {
+    instance = api.create({ sourceLanguage, targetLanguage }).catch((error) => {
+      browserTranslatorInstances.delete(key);
+      throw error;
+    });
+    browserTranslatorInstances.set(key, instance);
+  }
+  return instance;
+}
+
+function releaseBrowserTranslators(): void {
+  for (const instance of browserTranslatorInstances.values()) {
+    void instance.then((translator) => translator.destroy?.()).catch(() => undefined);
+  }
+  browserTranslatorInstances.clear();
+}
+
+/**
+ * Start opening a browser translation session synchronously from a user click.
+ * Chromium may require user activation for Translator.create(); the normal
+ * translation path then awaits language detection and IndexedDB first.
+ */
+export function prepareBrowserTranslator(text: string, targetLang: string): void {
+  const api = getBrowserTranslatorApi();
+  const sourceLanguage = normalizeLangTag(detectLanguage(text));
+  const targetLanguage = normalizeLangTag(targetLang);
+  if (!api || !sourceLanguage || !targetLanguage || sourceLanguage === targetLanguage) return;
+  void getBrowserTranslator(api, sourceLanguage, targetLanguage).catch(() => undefined);
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', releaseBrowserTranslators);
 }
 
 /** `Translator` 的姊妹 API（同一份规范）：用来拿到合法的源语言标签 */
@@ -196,22 +240,41 @@ export async function translateBlock(
   const inMemory = block.translations[targetLang];
   if (inMemory) return { translatedText: inMemory, engine, cached: true };
 
-  // 2. IndexedDB 缓存
+  return translateText(text, targetLang, options);
+}
+
+/** 翻译任意用户选中的文本，不要求先包装成完整文档块。 */
+export async function translateText(
+  sourceText: string,
+  targetLang: string,
+  options: { context?: string; engine?: TranslationEngine; signal?: AbortSignal } = {},
+): Promise<TranslationResult> {
+  const engine = options.engine ?? 'deepl';
+  const text = sourceText.trim();
+  if (!text) return { translatedText: '', engine, cached: false };
+
+  // 缓存表会在 v2 升级时清空；每次读取仍用完整原文做精确校验。
   const cached = await getCachedTranslation(text, targetLang);
   if (cached) return { translatedText: cached.text, engine: cached.engine as TranslationEngine, cached: true };
 
   // 3. 真正发起翻译
   const translatedText =
     engine === 'browser'
-      ? await translateWithBrowser(text, targetLang)
+      ? await translateWithBrowser(text, targetLang, options.signal)
       : await translateWithProxy({ ...options, text, targetLang, engine });
+
+  if (options.signal?.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
 
   await putCachedTranslation(text, targetLang, translatedText, engine);
 
   return { translatedText, engine, cached: false };
 }
 
-async function translateWithBrowser(text: string, targetLang: string): Promise<string> {
+async function translateWithBrowser(
+  text: string,
+  targetLang: string,
+  signal?: AbortSignal,
+): Promise<string> {
   const api = getBrowserTranslatorApi();
   if (!api) {
     throw new Error(
@@ -219,7 +282,17 @@ async function translateWithBrowser(text: string, targetLang: string): Promise<s
     );
   }
 
-  const sourceLanguage = await resolveSourceLanguage(text, targetLang);
+  const targetLanguage = normalizeLangTag(targetLang);
+  const heuristicSource = normalizeLangTag(detectLanguage(text));
+  const preparedSource =
+    heuristicSource && targetLanguage &&
+    browserTranslatorInstances.has(`${heuristicSource}->${targetLanguage}`)
+      ? heuristicSource
+      : null;
+  // If the click handler pre-created a session synchronously, use that same
+  // language decision. Re-detecting asynchronously could require a second
+  // Translator.create() after Chromium's transient user activation has expired.
+  const sourceLanguage = preparedSource ?? (await resolveSourceLanguage(text, targetLang));
   if (!sourceLanguage) {
     throw new Error(
       `这段文字看起来已经是「${targetLang}」，无需翻译。（浏览器内置翻译不支持「自动检测」源语言，所以这里先做了语言判定。）`,
@@ -233,17 +306,10 @@ async function translateWithBrowser(text: string, targetLang: string): Promise<s
     );
   }
 
-  /**
-   * `create()` 的失败要分类处理，不能一律当成"浏览器不支持"。
-   *
-   * 规范列出四种异常（`NotAllowedError` / `NotSupportedError` /
-   * `NetworkError` / `OperationError`），它们的**出路完全不同**：
-   * 把「模型还在下载，网断了」说成「浏览器太旧」，用户就会去换浏览器 ——
-   * 换了也没用。这是「诚实」在这个函数里的具体含义。
-   */
   let translator: TranslatorInstance;
   try {
-    translator = await api.create({ sourceLanguage, targetLanguage: targetLang });
+    // 页面内复用语言对会话，避免每个段落/选区都重新初始化浏览器模型。
+    translator = await getBrowserTranslator(api, sourceLanguage, targetLang);
   } catch (err) {
     const name = (err as Error)?.name;
     if (name === 'NotAllowedError') {
@@ -261,11 +327,27 @@ async function translateWithBrowser(text: string, targetLang: string): Promise<s
     );
   }
 
-  try {
-    return await translator.translate(text);
-  } finally {
-    translator.destroy?.();
+  if (signal?.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
+  if (text.length > 1200 && translator.translateStreaming) {
+    const reader = translator.translateStreaming(text).getReader();
+    const abort = () => void reader.cancel().catch(() => undefined);
+    signal?.addEventListener('abort', abort, { once: true });
+    let translated = '';
+    try {
+      while (true) {
+        if (signal?.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
+        const { value, done } = await reader.read();
+        if (signal?.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
+        if (done) break;
+        translated += value;
+      }
+      return translated;
+    } finally {
+      signal?.removeEventListener('abort', abort);
+      reader.releaseLock();
+    }
   }
+  return translator.translate(text);
 }
 
 /**

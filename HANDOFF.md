@@ -3035,6 +3035,17 @@ x  0.9953    +  0.9997    y  0.9205    −  0.957    2  0.9883
 > ⚠️ **三件事都做完之前，不要动判据。** 这一轮的全部价值在于「**让看不见的东西变得看得见**」；
 > 在数据回来之前改阈值，就是在重复 §5.13.5 与 §5.13.7 那两次已经付过学费的错误。
 
+### R13 · 翻译选区入口与浏览器本机长文路径（2026-10-12，工作树未提交）
+
+当前工作树正在实现用户确认的翻译方向，**尚未提交**。2026-10-12 已验证：`npm test` 为 **54 files / 1094 tests 全通过**；`npm run build` 与 `postbuild` 的 `verify-dist` 均通过。内置浏览器已打开本地工作树并成功导入、渲染 `samples/test-math.md`。翻译选区/浏览器内置 Translator 的行为仍未完成浏览器实测。
+
+1. `src/lib/db.ts` 将译文缓存键改为 `v2:` 前缀的 64 位 FNV-1a，并保存 `sourceText`；缓存命中时精确核对原文。Dexie 升至版本 2 时清除无法验证的旧缓存；书库、批注、阅读进度不迁移、不清除。
+2. `src/services/translationService.ts` 新增 `translateText()` 给任意选区复用同一引擎、缓存与隐私拦截；浏览器 Translator 实例按语言对复用，用户点击查译/开启全文翻译时先同步预热语言会话（Chromium 可能要求 user activation），页面隐藏/离开时释放；长于 1,200 字符的文本若支持 `translateStreaming()` 则走流式接口。云端请求仍只发送选中文本，不附带上下文。
+3. `src/components/ReaderView.tsx` 在原选区工具条加“查词 / 翻译”或“翻译选段”，以浮层展示译法并可复制。**当前词语“查词”只是站内翻译结果，不是词典释义**；词性、发音、例句仍未接入。引擎仍取设置中的当前选择，云端仍受 `cloudTranslationConsent` 控制。
+4. `src/components/TranslationPanel.tsx` 标明“浏览器内置（本机）”可用于长文，并说明首次模型下载及第三方扩展桥接边界。Chrome 官方的扩展消息接口需要目标扩展主动声明 `externally_connectable` 并允许本站；当前没有 Google 翻译扩展公开的站点调用协议，因此不尝试调用它的私有接口。大段免费翻译当前路径是站内 Translator API（受浏览器支持限制），不是调用 Google/沙拉查词扩展。
+5. **本机浏览器实测通道（2026-10-12 已连通，交互自动化仍偶发超时）**：内置浏览器运行在隔离网络中，`localhost:5173` 不指向工作区；用工作区网卡 IPv4 地址访问。新增 `npm run dev:browser`，先预处理本地资源，再在 `0.0.0.0:5174` 启动 Vite；从 `ipconfig` 读取当前 IPv4（本次为 `10.6.21.226`），浏览器打开 `http://<工作区IPv4>:5174/`。本次已实测页面读取、重载、导入 `samples/test-math.md` 并渲染正文。页面 DOM 读取用 Codex 内置浏览器的 Browser Use `domSnapshot()`；旧的 `cua.getTab(...).getAXState()` 会超时。**Playwright 定位器的点击/焦点操作仍可能在 CDP `Emulation.setFocusEmulationEnabled` 超时**，因此一次只发一个交互，随后单独读取 DOM 确认结果；超时后要先检查页面状态，操作可能已经完成。选区翻译的端到端浏览器交互尚未实测。**不要建立公网隧道**来绕过网络隔离。
+6. 后续接手先审阅上述 diff，再跑 `tsc -b`、翻译相关用例和 IndexedDB v1→v2 真浏览器迁移检查；重点确认大文档旧译文清空但其他数据保留、选区弹层交互，以及 Translator API 的流式返回行为。不要把尚未验证写成“可用”或“已上线”。
+
 ---
 
 ## 9. 诊断工具（排查问题时会用到）

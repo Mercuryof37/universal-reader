@@ -55,6 +55,10 @@ const RENDERER_SRC = {
     'utf8',
   ),
   ttsPanel: readFileSync(join(process.cwd(), 'src/components/TtsVoiceSelector.tsx'), 'utf8'),
+  privacyNotice: readFileSync(
+    join(process.cwd(), 'src/components/OutboundPrivacyNotice.tsx'),
+    'utf8',
+  ),
   viteConfig: readFileSync(join(process.cwd(), 'vite.config.ts'), 'utf8'),
   translationService: readFileSync(
     join(process.cwd(), 'src/services/translationService.ts'),
@@ -439,7 +443,7 @@ describe('④ 代价透明：三条路径的说明都写在同一处、并可被
     }
   });
 
-  it('设置面板渲染的就是这份清单（界面与代码事实同一出处）', () => {
+  it('数据处理须知弹窗渲染实时清单（界面与代码事实同一出处）', () => {
     /**
      * ⚠️ 断言不能只写 `toMatch(/listOutboundPaths/)`。
      *
@@ -454,25 +458,25 @@ describe('④ 代价透明：三条路径的说明都写在同一处、并可被
      *
      * 所以拆成两条**语义**断言：真的调用了它，且它的返回值被渲染出来。
      */
-    const src = RENDERER_SRC.translationPanel;
+    const src = RENDERER_SRC.privacyNotice;
     expect(src, '必须真的调用 listOutboundPaths()，不能只 import').toMatch(
       /=\s*useMemo\(\s*\(\)\s*=>\s*listOutboundPaths\(\)/,
     );
     expect(src, '外发清单必须被渲染出来（把返回值 map 成行）').toMatch(/paths\.map\(/);
   });
 
-  it('设置面板订阅了三个开关位（否则清单会停在打开设置那一刻）', () => {
-    const src = RENDERER_SRC.translationPanel;
+  it('须知弹窗订阅外发相关开关（状态变化后清单会更新）', () => {
+    const src = RENDERER_SRC.privacyNotice;
     expect(src).toMatch(/formulaOcrEnabled/);
     expect(src).toMatch(/cloudTranslationConsent/);
     expect(src).toMatch(/ttsCloudConsent/);
   });
 
-  it('云端翻译与云端语音的勾选框都在界面上，且都写了"发往哪里"', () => {
+  it('云端翻译与云端语音的授权项及须知都写明服务目的地', () => {
     expect(RENDERER_SRC.translationPanel).toMatch(/允许把正文发往云端翻译服务/);
-    expect(RENDERER_SRC.translationPanel).toMatch(/DeepL 或 OpenAI/);
+    expect(RENDERER_SRC.privacyNotice).toMatch(/DeepL 或 OpenAI/);
     expect(RENDERER_SRC.ttsPanel).toMatch(/允许把正文发往云端语音服务/);
-    expect(RENDERER_SRC.ttsPanel).toMatch(/Azure 语音服务/);
+    expect(RENDERER_SRC.privacyNotice).toMatch(/Azure 语音服务/);
   });
 
   it('旧文案「已配置云端代理就自动优先使用云端音色」必须已经不存在', () => {
@@ -717,7 +721,10 @@ describe('浏览器内置翻译：传给 API 的源语言必须是真的 BCP 47 
 
       await translateBlock(block, 'zh', { engine: 'browser' });
 
-      expect((calls.create[0] as { sourceLanguage?: string }).sourceLanguage).toBe('en');
+      // Translator sessions are shared across tests and language pairs, so a
+      // prior test may have already created en->zh. availability is still
+      // called for this request and records the source language actually used.
+      expect((calls.availability[0] as { sourceLanguage?: string }).sourceLanguage).toBe('en');
     } finally {
       delete (globalThis as Record<string, unknown>).Translator;
     }

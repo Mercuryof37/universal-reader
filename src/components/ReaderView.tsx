@@ -2,8 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
   Bookmark,
+  Copy,
   Languages,
   ListTree,
+  Loader2,
   Pause,
   Play,
   Settings2,
@@ -24,6 +26,11 @@ import { loadProgress, saveProgress } from '@/lib/db';
 import { buildStyledSegments, sliceSegments } from '@/lib/annotations';
 import { renderMath } from '@/lib/mathRender';
 import { buildHeadingAnchors, findHeadingIndex } from '@/lib/utils';
+import {
+  prepareBrowserTranslator,
+  translateText,
+  type TranslationEngine,
+} from '@/services/translationService';
 
 type SidePanel = 'none' | 'toc' | 'annotations' | 'settings';
 
@@ -60,6 +67,15 @@ export function ReaderView() {
 
   const [panel, setPanel] = useState<SidePanel>('none');
   const [selection, setSelection] = useState<BlockSelection | null>(null);
+  const [selectionTranslation, setSelectionTranslation] = useState<{
+    text: string;
+    result?: string;
+    loading: boolean;
+    error?: string;
+    engine?: string;
+  } | null>(null);
+  const selectionRequestId = useRef(0);
+  const selectionAbortRef = useRef<AbortController | null>(null);
   const [restored, setRestored] = useState(false);
   const lastSaveRef = useRef(0);
 
@@ -120,15 +136,21 @@ export function ReaderView() {
   /** 点击正文任意处关闭浮动工具条 */
   useEffect(() => {
     if (!selection) return;
-    const close = () => setSelection(null);
+    const close = () => {
+      selectionAbortRef.current?.abort();
+      selectionRequestId.current++;
+      setSelectionTranslation(null);
+      setSelection(null);
+    };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setSelection(null);
+      if (e.key === 'Escape') close();
     };
     window.addEventListener('mousedown', close);
     window.addEventListener('keydown', onKey);
     return () => {
       window.removeEventListener('mousedown', close);
       window.removeEventListener('keydown', onKey);
+      selectionAbortRef.current?.abort();
     };
   }, [selection]);
 
@@ -190,6 +212,67 @@ export function ReaderView() {
     },
     [selection, currentDoc, blocks, addAnnotation, defaultColor],
   );
+
+  const handleSelectionTranslate = useCallback(async () => {
+    if (!selection) return;
+    const settings = useSettingsStore.getState();
+    const engine = settings.defaultTranslationEngine;
+    const requestId = ++selectionRequestId.current;
+    selectionAbortRef.current?.abort();
+    const controller = new AbortController();
+    selectionAbortRef.current = controller;
+
+    if (!engine || !translation.engineUsable) {
+      setSelectionTranslation({
+        text: selection.text,
+        loading: false,
+        error: '当前没有可用的翻译引擎。请到「设置 → 双语对照」查看浏览器内置翻译或云端翻译的可用状态。',
+      });
+      return;
+    }
+
+    if (engine === 'browser') prepareBrowserTranslator(selection.text, targetLang);
+
+    setSelectionTranslation({ text: selection.text, loading: true, engine });
+    try {
+      const result = await translateText(selection.text, targetLang, {
+        engine: engine as TranslationEngine,
+        signal: controller.signal,
+      });
+      if (selectionRequestId.current !== requestId) return;
+      setSelectionTranslation({
+        text: selection.text,
+        result: result.translatedText,
+        loading: false,
+        engine: result.engine,
+      });
+    } catch (error) {
+      if (selectionRequestId.current !== requestId || (error as Error)?.name === 'AbortError') return;
+      setSelectionTranslation({
+        text: selection.text,
+        loading: false,
+        error: error instanceof Error ? error.message : String(error),
+        engine,
+      });
+    }
+  }, [selection, targetLang, translation.engineUsable]);
+
+  const handleCopySelectionTranslation = useCallback(async () => {
+    if (!selectionTranslation?.result) return;
+    await navigator.clipboard?.writeText(selectionTranslation.result);
+  }, [selectionTranslation]);
+
+  const prepareCurrentBrowserTranslation = useCallback(() => {
+    if (useSettingsStore.getState().defaultTranslationEngine !== 'browser') return;
+    const first = blocks.find(
+      (block) =>
+        block.type !== 'code' &&
+        block.type !== 'image' &&
+        !block.translations[targetLang] &&
+        block.content.trim().length >= 2,
+    );
+    if (first) prepareBrowserTranslator(first.content, targetLang);
+  }, [blocks, targetLang]);
 
   if (!currentDoc) return null;
 
@@ -266,7 +349,10 @@ export function ReaderView() {
 
         <button
           type="button"
-          onClick={() => useSettingsStore.getState().setShowTranslation(!showTranslation)}
+          onClick={() => {
+            if (!showTranslation) prepareCurrentBrowserTranslation();
+            useSettingsStore.getState().setShowTranslation(!showTranslation);
+          }}
           aria-label="切换译文"
           className={toolbarBtn(showTranslation)}
         >
@@ -313,7 +399,12 @@ export function ReaderView() {
                   onJumpAnchor={jumpToAnchor}
                   reportHeight={reportHeight}
                   onToggleSpeak={tts.toggle}
-                  onSelection={setSelection}
+                  onSelection={(nextSelection) => {
+                    selectionAbortRef.current?.abort();
+                    selectionRequestId.current++;
+                    setSelectionTranslation(null);
+                    setSelection(nextSelection);
+                  }}
                 />
               );
             })}
@@ -368,6 +459,7 @@ export function ReaderView() {
                       totalCount: blocks.length,
                       translateAll: translation.translateAll,
                       cancel: translation.cancel,
+                      prepareBrowserTranslation: prepareCurrentBrowserTranslation,
                     }}
                   />
                   <TtsVoiceSelector
@@ -391,29 +483,89 @@ export function ReaderView() {
 
       {/* ── 选区浮动工具条 ── */}
       {selection && (
-        <div
-          className="no-print fixed z-50 flex -translate-x-1/2 gap-1 rounded-lg border border-[var(--reader-border)] bg-[var(--reader-panel)] p-1 shadow-lg"
-          style={{ top: Math.max(8, selection.rect.top - 44), left: selection.rect.left }}
-          onMouseDown={(e) => e.stopPropagation()}
-        >
-          {(
-            [
-              ['highlight', '高亮'],
-              ['note', '记笔记'],
-              ['question', '提问'],
-              ['tag', '打标签'],
-            ] as const
-          ).map(([type, label]) => (
+        <>
+          <div
+            className="no-print fixed z-50 flex max-w-[95vw] -translate-x-1/2 flex-wrap gap-1 rounded-lg border border-[var(--reader-border)] bg-[var(--reader-panel)] p-1 shadow-lg"
+            style={{ top: Math.max(8, selection.rect.top - 44), left: selection.rect.left }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
             <button
-              key={type}
               type="button"
-              onClick={() => void handleAddAnnotation(type, type === 'note')}
-              className="rounded-md px-2 py-1 text-xs hover:bg-[var(--reader-bg)]"
+              onClick={() => void handleSelectionTranslate()}
+              className="rounded-md px-2 py-1 text-xs font-medium text-[var(--reader-accent)] hover:bg-[var(--reader-bg)]"
+              title="使用阅读器当前选定的翻译引擎；云端引擎仍受隐私授权控制"
             >
-              {label}
+              {selection.text.trim().length <= 32 && !/[。！？!?;；\n]/.test(selection.text)
+                ? '查词 / 翻译'
+                : '翻译选段'}
             </button>
-          ))}
-        </div>
+            {(
+              [
+                ['highlight', '高亮'],
+                ['note', '记笔记'],
+                ['question', '提问'],
+                ['tag', '打标签'],
+              ] as const
+            ).map(([type, label]) => (
+              <button
+                key={type}
+                type="button"
+                onClick={() => void handleAddAnnotation(type, type === 'note')}
+                className="rounded-md px-2 py-1 text-xs hover:bg-[var(--reader-bg)]"
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {selectionTranslation && (
+            <section
+              className="no-print fixed z-50 w-[min(92vw,26rem)] -translate-x-1/2 rounded-lg border border-[var(--reader-border)] bg-[var(--reader-panel)] p-3 text-sm shadow-xl"
+              style={{ top: Math.max(52, selection.rect.top + 12), left: selection.rect.left }}
+              onMouseDown={(e) => e.stopPropagation()}
+              aria-live="polite"
+            >
+              <header className="mb-2 flex items-center justify-between gap-2 text-xs text-[var(--reader-muted)]">
+                <span>
+                  {selection.text.trim().length <= 32 && !/[。！？!?;；\n]/.test(selection.text)
+                    ? '词语查译'
+                    : '选段翻译'}
+                  {selectionTranslation.engine && ` · ${selectionTranslation.engine}`}
+                </span>
+                <div className="flex items-center gap-2">
+                  {selectionTranslation.result && (
+                    <button type="button" onClick={() => void handleCopySelectionTranslation()} className="inline-flex items-center gap-1 hover:text-[var(--reader-fg)]">
+                      <Copy className="h-3.5 w-3.5" aria-hidden />复制
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    aria-label="关闭翻译结果"
+                    onClick={() => {
+                      selectionAbortRef.current?.abort();
+                      selectionRequestId.current++;
+                      setSelectionTranslation(null);
+                    }}
+                  >
+                    <X className="h-3.5 w-3.5" aria-hidden />
+                  </button>
+                </div>
+              </header>
+              <p className="mb-2 max-h-20 overflow-auto whitespace-pre-wrap text-xs text-[var(--reader-muted)]">{selectionTranslation.text}</p>
+              {selectionTranslation.loading ? (
+                <p className="flex items-center gap-2 text-xs text-[var(--reader-muted)]">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />正在翻译所选内容…
+                </p>
+              ) : selectionTranslation.error ? (
+                <p className="text-xs text-amber-700 dark:text-amber-300">{selectionTranslation.error}</p>
+              ) : (
+                <p className="whitespace-pre-wrap">{selectionTranslation.result}</p>
+              )}
+              {selectionTranslation.result && selectionTranslation.text.trim().length <= 32 && !/[。！？!?;；\n]/.test(selectionTranslation.text) && (
+                <p className="mt-2 text-[10px] text-[var(--reader-muted)]">显示的是目标语言译法；词性、词典释义和例句暂未接入。</p>
+              )}
+            </section>
+          )}
+        </>
       )}
 
       {/* ── 错误提示 ── */}

@@ -31,10 +31,12 @@ export interface BlockRow {
   toc: DocDocument['toc'];
 }
 
-/** 译文缓存表：键为 `${hash(原文)}:${targetLang}`，跨文档复用（同一句话不必重复调用付费 API） */
+/** 译文缓存表：按原文哈希与目标语言寻址，并保存原文用于精确校验；跨文档复用 */
 export interface TranslationRow {
   id: string;
   targetLang: string;
+  /** 缓存来源原文，用于在命中时做精确校验，避免哈希碰撞造成静默错译 */
+  sourceText: string;
   text: string;
   engine: string;
   createdAt: string;
@@ -59,14 +61,37 @@ class ReaderDatabase extends Dexie {
       progress: 'docId, updatedAt',
       translations: 'id, targetLang, createdAt',
     });
+
+    // v1 缓存只有 32 位哈希键，且没有原文可验证；不能安全迁移成新格式，清掉后按需重建。
+    this.version(2)
+      .stores({
+        documents: 'id, title, format, metadata.created, metadata.modified',
+        blocks: 'docId',
+        annotations: 'id, docId, blockId, type, createdAt',
+        progress: 'docId, updatedAt',
+        translations: 'id, targetLang, createdAt',
+      })
+      .upgrade((tx) => tx.table('translations').clear());
   }
 }
 
 export const db = new ReaderDatabase();
 
-/** 生成译文缓存键：把原文与目标语言一起哈希，避免超长键 */
+/** 生成 v2 译文缓存键：64 位哈希缩小碰撞概率，读取时仍必须校验原文 */
 export function translationKey(text: string, targetLang: string): string {
-  return `${hashString(text)}:${targetLang}`;
+  return `v2:${hashString64(text)}:${targetLang}`;
+}
+
+/** 64 位 FNV-1a；不是密码学哈希，安全性由缓存命中时的 sourceText 精确比较保证。 */
+export function hashString64(input: string): string {
+  let hash = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  const mask = 0xffffffffffffffffn;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= BigInt(input.charCodeAt(i));
+    hash = (hash * prime) & mask;
+  }
+  return hash.toString(16).padStart(16, '0');
 }
 
 /**
@@ -157,7 +182,9 @@ export async function getCachedTranslation(
   text: string,
   targetLang: string,
 ): Promise<TranslationRow | null> {
-  return (await db.translations.get(translationKey(text, targetLang))) ?? null;
+  const row = await db.translations.get(translationKey(text, targetLang));
+  // Hashes only select a candidate row. The original text is the authority.
+  return row?.sourceText === text ? row : null;
 }
 
 export async function putCachedTranslation(
@@ -169,6 +196,7 @@ export async function putCachedTranslation(
   await db.translations.put({
     id: translationKey(text, targetLang),
     targetLang,
+    sourceText: text,
     text: translated,
     engine,
     createdAt: new Date().toISOString(),

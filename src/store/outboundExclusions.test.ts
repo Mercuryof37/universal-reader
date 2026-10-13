@@ -604,6 +604,7 @@ describe('③ 抓真包：三条路径实际发出去的字段与清单逐字一
     vi.mocked(getCachedTranslation).mockResolvedValueOnce({
       id: 'cache-probe',
       targetLang: 'en',
+      sourceText: PROBE_BLOCK_TEXT,
       text: 'CACHED_TRANSLATION',
       engine: 'deepl',
       createdAt: '2026-01-01T00:00:00.000Z',
@@ -841,37 +842,26 @@ describe('⑦ 边界：以为不会外发、核实后发现有的事', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// ⑧ 设置面板渲染的就是这两份清单
+// ⑧ 设置页把数据处理说明收在可打开的须知里
 // ═══════════════════════════════════════════════════════════════
 
-describe('⑧ 设置面板渲染排除清单（界面与代码事实同一出处）', () => {
-  it('两份清单都是**真的被 map 出来渲染**，不是只 import 进来了事', () => {
-    const src = readText(join(ROOT, TRANSLATION_PANEL));
+describe('⑧ 设置面板通过链接展示数据处理须知', () => {
+  const noticePath = join(ROOT, 'src/components/OutboundPrivacyNotice.tsx');
 
-    // ⚠️ 不能写 `toMatch(/EXCLUDED_DATA_SPECS/)` —— 那会匹配到 import 语句。
-    // 上一轮实测（变异 M14）正是这样被"假绿"骗过一次。
-    expect(src, '必须真的把 EXCLUDED_DATA_SPECS 渲染成行').toMatch(/EXCLUDED_DATA_SPECS\.map\(/);
-    expect(src, '必须真的把 NOT_EXCLUDED_SPECS 渲染成行（边界要同屏）').toMatch(
-      /NOT_EXCLUDED_SPECS\.map\(/,
-    );
-    expect(src, '渲染排除清单的组件必须真的被挂上去').toMatch(/<ExcludedDataList\s*\/>/);
+  it('须知以弹窗呈现实时外发状态，并精简展示不外发项目', () => {
+    const src = readText(noticePath);
+    expect(src).toMatch(/role="dialog"/);
+    expect(src).toMatch(/aria-modal="true"/);
+    expect(src).toMatch(/paths\.map\(/);
+    expect(src).toMatch(/EXCLUDED_DATA_SPECS\.map\(/);
+    expect(src).toMatch(/\{item\.title\}/);
+    expect(src).not.toMatch(/item\.basis|item\.verify|item\.claim/);
   });
 
-  it('每一项的「依据」与「怎么验证」也被渲染出来（不只是声明）', () => {
-    // MinerU 给的是「不收集什么」；这里多给一层「凭什么这么说」。
-    const src = readText(join(ROOT, TRANSLATION_PANEL));
-    expect(src).toMatch(/item\.basis/);
-    expect(src).toMatch(/item\.verify/);
-    expect(src).toMatch(/item\.claim/);
-  });
-
-  it('排除清单**没有**开关（这些项本来就没有"关掉"这个动作）', () => {
-    const src = readText(join(ROOT, TRANSLATION_PANEL));
-    const listStart = src.indexOf('export function ExcludedDataList');
-    expect(listStart, '找不到 ExcludedDataList').toBeGreaterThan(-1);
-    const listSrc = src.slice(listStart, src.indexOf('function ExcludedDataRow'));
-    expect(listSrc, '排除清单里出现了 checkbox —— 那会暗示"默认是开的"').not.toMatch(
-      /type="checkbox"|<input/,
-    );
+  it('翻译与语音设置都能打开同一份须知', () => {
+    const translation = readText(join(ROOT, TRANSLATION_PANEL));
+    const speech = readText(join(ROOT, 'src/components/TtsVoiceSelector.tsx'));
+    expect(translation).toMatch(/<OutboundPrivacyNoticeLink\s*\/>/);
+    expect(speech).toMatch(/<OutboundPrivacyNoticeLink\s*\/>/);
   });
 });

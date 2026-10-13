@@ -8,6 +8,7 @@ import {
 import {
   TARGET_LANGUAGES,
   isBrowserTranslationAvailable,
+  prepareBrowserTranslator,
   translateBlock,
   withTranslation,
 } from '@/services/translationService';
@@ -160,8 +161,12 @@ export function useViewportTranslation(blocks: ContentBlock[]) {
   /** 一次性翻译全篇（用户明确要求导出或通读时用） */
   const translateAll = useCallback(() => {
     if (!blocks.length) return;
+    if (engine === 'browser') {
+      const first = blocks.find((block) => shouldTranslate(block, targetLang));
+      if (first) prepareBrowserTranslator(first.content, targetLang);
+    }
     translateRange(0, blocks.length);
-  }, [blocks, translateRange]);
+  }, [blocks, engine, targetLang, translateRange]);
 
   const cancel = useCallback(() => {
     abortRef.current?.abort();

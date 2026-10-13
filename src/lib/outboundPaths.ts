@@ -111,7 +111,7 @@ export const OUTBOUND_PATH_SPECS: readonly OutboundPathSpec[] = [
     key: 'cloudTranslationConsent',
     title: '云端翻译',
     detail:
-      '把正在阅读的段落正文发到自建 Worker，再转发给 DeepL 或 OpenAI 换取译文。为什么需要：浏览器内置翻译在多数浏览器上不可用，且质量不如云端。',
+      '把正在阅读的段落正文，或用户主动选中并点击查译的文字，发到自建 Worker，再转发给 DeepL 或 OpenAI 换取译文。选区查译只发送所选文字，不自动附带上下文。为什么需要：浏览器内置翻译在多数浏览器上不可用，且质量不如云端。',
   },
   {
     key: 'ttsCloudConsent',
@@ -414,11 +414,11 @@ export const NOT_EXCLUDED_SPECS: readonly NotExcludedSpec[] = [
   },
   {
     key: 'blockText',
-    title: '正在翻译 / 朗读的段落正文',
+    title: '正在翻译 / 朗读的正文片段',
     outboundPaths: ['cloudTranslationConsent', 'ttsCloudConsent'],
     payloadKeys: ['text', 'context'],
     why:
-      '云端翻译与云端语音发出去的就是 ContentBlock.content（hooks/useViewportTranslation.ts 与 hooks/useTtsReader.ts 各传一次）。所以「文档正文不外发」也是**错的**。这两条历史上还曾经是默认开启的（ttsPreference 的旧值 auto / resolveInitialEngine 的自动选 deepl），现在是显式 opt-in。',
+      '视口翻译与云端语音会发送当前段落正文（hooks/useViewportTranslation.ts 与 hooks/useTtsReader.ts）；选区查译只会发送用户主动选中的文字（components/ReaderView.tsx → services/translationService.ts），不会自动附带上下文。所以「文档正文不外发」也是**错的**。三条路径现在均有显式 opt-in。',
   },
   {
     key: 'systemVoiceName',
@@ -534,7 +534,7 @@ export const NETWORK_SITE_SPECS: readonly NetworkSiteSpec[] = [
     role: 'outbound',
     path: 'cloudTranslationConsent',
     count: 1,
-    what: 'POST 段落正文到自建 Worker',
+    what: 'POST 当前请求翻译的文本到自建 Worker（段落或选中文字）',
   },
   {
     file: 'src/services/ttsEngine.ts',

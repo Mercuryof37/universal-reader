@@ -1,18 +1,14 @@
-import { useMemo } from 'react';
-import { AlertTriangle, Languages, Loader2, ShieldCheck, Zap } from 'lucide-react';
+import { AlertTriangle, Languages, Loader2, Zap } from 'lucide-react';
 import { useSettingsStore } from '@/store/settingsStore';
+import { OutboundPrivacyNoticeLink } from '@/components/OutboundPrivacyNotice';
 import {
   TARGET_LANGUAGES,
-  listOutboundPaths,
   isBrowserTranslationAvailable,
 } from '@/services/translationService';
 import {
   detectBrowserTranslator,
   hasCloudTranslationConfig,
-  EXCLUDED_DATA_SPECS,
-  NOT_EXCLUDED_SPECS,
   type TranslationEngineId,
-  type OutboundPathStatus,
 } from '@/lib/outboundPaths';
 
 export interface TranslationControls {
@@ -21,6 +17,7 @@ export interface TranslationControls {
   totalCount: number;
   translateAll: () => void;
   cancel: () => void;
+  prepareBrowserTranslation: () => void;
 }
 
 /**
@@ -97,7 +94,10 @@ export function TranslationPanel({ controls }: { controls: TranslationControls }
         <input
           type="checkbox"
           checked={showTranslation}
-          onChange={(e) => setShowTranslation(e.target.checked)}
+          onChange={(e) => {
+            if (e.target.checked) controls.prepareBrowserTranslation();
+            setShowTranslation(e.target.checked);
+          }}
           className="h-4 w-4 accent-[var(--reader-accent)]"
         />
       </label>
@@ -131,7 +131,7 @@ export function TranslationPanel({ controls }: { controls: TranslationControls }
         >
           {engine === null && <option value="">无可用引擎</option>}
           <option value="browser" disabled={!browserOk}>
-            浏览器内置{browserOk ? '' : '（本浏览器不支持）'}
+            浏览器内置（本机）{browserOk ? '' : '（本浏览器不支持）'}
           </option>
           <option value="deepl" disabled={!cloudOk}>
             DeepL（代理）{cloudOk ? '' : '（未配置端点）'}
@@ -159,16 +159,12 @@ export function TranslationPanel({ controls }: { controls: TranslationControls }
         <span>
           <span className="font-medium">允许把正文发往云端翻译服务</span>
           <span className="block text-[var(--reader-muted)]">
-            打开后，正在阅读的<span className="font-medium">段落正文</span>会发到自建
-            Worker，再由它转发给 <span className="font-medium">DeepL 或 OpenAI</span>
-            换取译文。需要联网，正文会离开本机。
-            {!cloudOk && '（本次构建未配置 VITE_TRANSLATE_ENDPOINT，暂时无法开启。）'}
-            <span className="block">
-              默认关闭 —— 不打开就不会有任何正文被发出去；关掉它，译文会立即停止外发。
-            </span>
+            默认关闭。开启后，云端翻译会处理正在阅读的段落；选中查译只处理你选中的文字。
+            {!cloudOk && ' 当前版本未配置云端翻译服务。'}
           </span>
         </span>
       </label>
+      <div className="-mt-2 pl-6"><OutboundPrivacyNoticeLink /></div>
 
       <div className="flex items-center justify-between gap-2 pt-1 text-xs">
         <span className="text-[var(--reader-muted)]">
@@ -206,188 +202,9 @@ export function TranslationPanel({ controls }: { controls: TranslationControls }
       <p className="text-[11px] leading-relaxed text-[var(--reader-muted)]">
         默认只翻译你正在看的段落（± 缓冲），滚动到哪里翻到哪里，可随时停止以节省额度。
       </p>
-
-      <OutboundPathsAudit />
+      <p className="text-[11px] leading-relaxed text-[var(--reader-muted)]">
+        大段文本可使用浏览器内置翻译；小段文字可在阅读区选中后查译。
+      </p>
     </section>
-  );
-}
-
-/**
- * 「本机外发记录」——`HANDOFF.md` §1 T2 里那个「尚未收口」的审计视图。
- *
- * ═══════════════════════════════════════════════════════════════
- * 为什么它值得收口，以及为什么收在这里
- * ═══════════════════════════════════════════════════════════════
- *
- * 那个缺口此前被记成**一条**（公式 OCR），实际是**三条**（多出云端翻译
- * 与云端语音）。缺口之所以会翻三倍，根因是「有哪些外发路径」这件事
- * 只存在于文档里 —— 而文档不会随代码更新，所以每加一条路径，缺口就
- * 悄悄变大一次。
- *
- * 所以这里不重新写一份列表，而是渲染 `listOutboundPaths()`
- * （`services/translationService.ts`）—— 它读的是 `useSettingsStore`
- * 的**实时状态**。于是「显示出来的」与「实际生效的」在结构上不可能分叉：
- * 同一个函数既被界面渲染，也被测试断言。
- *
- * 成本可控（约 60 行、无新依赖、不改任何既有逻辑），所以做掉；
- * 若要把它做成"历史外发日志"（记录每次外发的时间与字数）则是另一个量级的
- * 改动（需要新的持久化表），本次不做 —— 见报告里的建议。
- */
-export function OutboundPathsAudit() {
-  /**
-   * 订阅三个开关位。
-   *
-   * ⚠️ 必须订阅，不能只调用 `listOutboundPaths()` 就完事：那个函数读的是
-   * `getState()`（不建立订阅），所以开关一变，界面**不会**重渲染 ——
-   * 于是「本机外发记录」会停在打开设置那一刻的旧状态。
-   * 一个会说谎的审计视图比没有审计视图更糟，所以这里显式订阅。
-   */
-  const formulaOcrEnabled = useSettingsStore((s) => s.formulaOcrEnabled);
-  const cloudTranslationConsent = useSettingsStore((s) => s.cloudTranslationConsent);
-  const ttsCloudConsent = useSettingsStore((s) => s.ttsCloudConsent);
-  const ttsPreference = useSettingsStore((s) => s.ttsPreference);
-
-  const paths = useMemo(
-    () => listOutboundPaths(),
-    // 依赖就是三个开关位 + 语音偏好（`enabled` 需要它）
-    [formulaOcrEnabled, cloudTranslationConsent, ttsCloudConsent, ttsPreference],
-  );
-  const anyOn = paths.some((p) => p.enabled);
-
-  return (
-    <div className="mt-1 flex flex-col gap-2 rounded-md border border-[var(--reader-border)] p-2.5">
-      <span className="flex items-center gap-1.5 text-xs font-medium">
-        {anyOn ? (
-          <AlertTriangle className="h-3.5 w-3.5 text-amber-600" aria-hidden />
-        ) : (
-          <ShieldCheck className="h-3.5 w-3.5 text-emerald-600" aria-hidden />
-        )}
-        本机外发记录
-      </span>
-      <p className="text-[11px] leading-relaxed text-[var(--reader-muted)]">
-        {anyOn
-          ? '以下功能正在把文档内容送出本机。关掉开关即立刻停止。'
-          : '当前没有任何功能会把文档内容送出本机 —— 三条可能的路径全部关闭。'}
-      </p>
-      <ul className="flex flex-col gap-1.5">
-        {paths.map((p) => (
-          <OutboundPathRow key={p.key} path={p} />
-        ))}
-      </ul>
-
-      <ExcludedDataList />
-    </div>
-  );
-}
-
-/**
- * 「绝不外发」清单 —— 排除清单的**界面**。
- *
- * ═══════════════════════════════════════════════════════════════
- * 为什么这一块必须存在，而且必须紧挨着上面那份「会外发」的清单
- * ═══════════════════════════════════════════════════════════════
- *
- * 只写「什么会外发」是一句**不完整**的承诺：用户看完上面那一块，
- * 仍然不知道自己导入的文件、写的批注、读到的位置算不算在内 ——
- * 而这三样恰恰是他最在意的。MinerU 的遥测声明是反过来写的：
- * 逐项枚举**不收集什么**（文件名、路径、搜索词、片段、密钥…），
- * 并且给出可操作命令。本项目的承诺比它强得多（零遥测），
- * 但表述强度一直不如它。这一块补的就是**表述形态**。
- *
- * ⚠️ 两条纪律，都体现在下面的渲染里：
- *  1. **只展示，不加开关**：这些项没有「关掉」这个动作 ——
- *     它们本来就是零外发，给它们加开关会暗示「默认是开的」。
- *  2. **边界必须同屏**：`NOT_EXCLUDED_SPECS` 一并渲染出来。
- *     一份只列「不外发」的清单，如果漏掉了「页面像素确实会外发」
- *     这件事，就从「诚实」变成了「更好看的谎」。
- *     所以下面那段「以下内容不在上面的清单里」不是免责声明，
- *     它是这份清单**可信**的前提。
- *
- * 数据源是 `lib/outboundPaths.ts` 的常量，与测试断言的是同一份 ——
- * 界面上读到的和测试钉住的在结构上不可能分叉。
- */
-export function ExcludedDataList() {
-  return (
-    <div className="flex flex-col gap-2 rounded-md border border-[var(--reader-border)] p-2.5">
-      <span className="flex items-center gap-1.5 text-xs font-medium">
-        <ShieldCheck className="h-3.5 w-3.5 text-emerald-600" aria-hidden />
-        绝不外发的内容
-      </span>
-      <p className="text-[11px] leading-relaxed text-[var(--reader-muted)]">
-        下面这些内容**在任何开关状态下**都不会离开这台机器。
-        它们没有开关可关 —— 因为默认就是零外发。
-      </p>
-      <ul className="flex flex-col gap-1.5">
-        {EXCLUDED_DATA_SPECS.map((item) => (
-          <ExcludedDataRow key={item.key} item={item} />
-        ))}
-      </ul>
-
-      <p className="border-t border-[var(--reader-border)] pt-2 text-[11px] leading-relaxed text-amber-700 dark:text-amber-300">
-        ⚠️ 以下内容**不在**上面的清单里，因为核实下来它们**确实会外发**：
-      </p>
-      <ul className="flex flex-col gap-1.5">
-        {NOT_EXCLUDED_SPECS.map((item) => (
-          <li
-            key={item.key}
-            className="rounded border border-amber-400/40 bg-amber-500/5 p-2 text-[11px] leading-relaxed"
-          >
-            <span className="font-medium">{item.title}</span>
-            <code className="ml-1.5 text-[10px] text-[var(--reader-muted)]">{item.key}</code>
-            <span className="mt-0.5 block text-[var(--reader-muted)]">{item.why}</span>
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-
-function ExcludedDataRow({ item }: { item: (typeof EXCLUDED_DATA_SPECS)[number] }) {
-  return (
-    <li className="rounded border border-[var(--reader-border)] p-2 text-[11px] leading-relaxed">
-      <span className="flex flex-wrap items-center gap-1.5">
-        <span className="font-medium text-emerald-700 dark:text-emerald-400">✓ 不外发</span>
-        <span className="font-medium">{item.title}</span>
-        <code className="text-[10px] text-[var(--reader-muted)]">{item.key}</code>
-      </span>
-      <span className="mt-0.5 block">{item.claim}</span>
-      {/*
-        依据与验证方式也显示出来 —— 这是与 MinerU 那条声明的关键差别：
-        它给的是「不收集什么」，这里还给「凭什么这么说」。
-        用户不必相信一段文案，他可以去看那条测试。
-      */}
-      <span className="mt-1 block text-[var(--reader-muted)]">
-        <span className="font-medium">依据：</span>
-        {item.basis}
-      </span>
-      <span className="mt-0.5 block text-[var(--reader-muted)]">
-        <span className="font-medium">怎么验证：</span>
-        {item.verify}
-      </span>
-    </li>
-  );
-}
-
-function OutboundPathRow({ path }: { path: OutboundPathStatus }) {
-  return (
-    <li className="rounded border border-[var(--reader-border)] p-2 text-[11px] leading-relaxed">
-      <span className="flex flex-wrap items-center gap-1.5">
-        <span
-          className={
-            path.enabled
-              ? 'font-medium text-amber-700 dark:text-amber-300'
-              : 'font-medium text-[var(--reader-muted)]'
-          }
-        >
-          {path.enabled ? '● 外发中' : '○ 不外发'}
-        </span>
-        <span className="font-medium">{path.title}</span>
-        <code className="text-[10px] text-[var(--reader-muted)]">{path.key}</code>
-        {!path.capable && (
-          <span className="text-[10px] text-[var(--reader-muted)]">（本部署未配置，不可用）</span>
-        )}
-      </span>
-      <span className="mt-0.5 block text-[var(--reader-muted)]">{path.detail}</span>
-    </li>
   );
 }

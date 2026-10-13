@@ -2,6 +2,7 @@ import { Headphones, Play, SkipBack, SkipForward, Square } from 'lucide-react';
 import { useSettingsStore, type TtsPreference } from '@/store/settingsStore';
 import { SPEECH_LANGUAGES } from '@/services/translationService';
 import { hasCloudTTSConfig, resolveTtsEngineId } from '@/services/ttsEngine';
+import { OutboundPrivacyNoticeLink } from '@/components/OutboundPrivacyNotice';
 
 interface TtsControls {
   isSpeaking: boolean;
@@ -150,16 +151,12 @@ export function TtsVoiceSelector({ controls }: { controls: TtsControls }) {
         <span>
           <span className="font-medium">允许把正文发往云端语音服务</span>
           <span className="block text-[var(--reader-muted)]">
-            打开后，正在朗读的<span className="font-medium">段落正文</span>会发到自建
-            Worker，再由它转发给 <span className="font-medium">Azure 语音服务</span>
-            换音频。需要联网，正文会离开本机。
-            {!cloudOk && '（本次构建未配置 VITE_TTS_ENDPOINT，暂时无法开启。）'}
-            <span className="block">
-              默认关闭 —— 不打开就只用浏览器原生朗读，一个字节都不会外发。
-            </span>
+            默认关闭。开启后，云端语音会处理正在朗读的段落。
+            {!cloudOk && ' 当前版本未配置云端语音服务。'}
           </span>
         </span>
       </label>
+      <div className="-mt-2 pl-6"><OutboundPrivacyNoticeLink /></div>
 
       {/*
         实际生效的引擎与下拉框写的不一致时，把真相说出来。
@@ -218,8 +215,7 @@ export function TtsVoiceSelector({ controls }: { controls: TtsControls }) {
       </label>
 
       <p className="text-[11px] leading-relaxed text-[var(--reader-muted)]">
-        浏览器原生朗读免费、离线，且<b>不会把正文发出本机</b>；音色取决于操作系统。
-        云端合成需要你显式允许（见上面的勾选框）—— 配了端点不等于同意上传正文。
+        浏览器原生朗读在本机进行，<b>不会把正文发出本机</b>；云端服务需要单独授权。
       </p>
     </section>
   );
